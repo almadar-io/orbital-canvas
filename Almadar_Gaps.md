@@ -1,5 +1,5 @@
 <!-- Gap ledger for this repo: the source of truth for its open gaps. -->
-# orbital-game-renderer — open gaps
+# orbital-canvas — open gaps
 
 Every open gap this repo owns lives here. This file is the source of truth; the monorepo's `docs/Almadar_Gaps.md` only rolls it up.
 

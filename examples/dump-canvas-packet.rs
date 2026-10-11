@@ -1,16 +1,16 @@
 //! Dump a `.orb` fixture's `canvas`/`canvas-2d` pattern to a PNG — headless
-//! visual proof of the `orbital-game-renderer` display list (the same packet
+//! visual proof of the `orbital-canvas` display list (the same packet
 //! the dioxus-native paint source composites through vello). Deterministic:
 //! no window, no compositor, no timing.
 //!
-//! Usage: `cargo run -p orbital-game-renderer --example dump-canvas-packet -- <fixture.orb> [out.png]`
+//! Usage: `cargo run -p orbital-canvas --example dump-canvas-packet -- <fixture.orb> [out.png]`
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use orbital_game_renderer::mappers::game_canvas_2d;
-use orbital_game_renderer::packet::DrawCommand;
-use orbital_game_renderer::renderer::{copy_texture_to_rgba, SharedDeviceRenderer};
+use orbital_canvas::mappers::game_canvas_2d;
+use orbital_canvas::packet::DrawCommand;
+use orbital_canvas::renderer::{copy_texture_to_rgba, SharedDeviceRenderer};
 
 /// Depth-first search for the first `canvas` / `canvas-2d` pattern node.
 fn find_canvas(n: &serde_json::Value) -> Option<serde_json::Value> {
@@ -36,7 +36,7 @@ fn find_canvas(n: &serde_json::Value) -> Option<serde_json::Value> {
     None
 }
 
-fn sprite_count(packet: &orbital_game_renderer::packet::GameRenderPacket) -> usize {
+fn sprite_count(packet: &orbital_canvas::packet::GameRenderPacket) -> usize {
     packet
         .draw_commands
         .iter()
@@ -121,7 +121,7 @@ fn main() {
                 DrawCommand::Sprite { texture, .. } => Some(texture.as_str()),
                 _ => None,
             })
-            .filter(|url| orbital_game_renderer::asset::asset_bytes(url).is_none())
+            .filter(|url| orbital_canvas::asset::asset_bytes(url).is_none())
             .count();
         if pending == 0 || Instant::now() > deadline {
             if pending > 0 {

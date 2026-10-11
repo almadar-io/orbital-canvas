@@ -1,13 +1,13 @@
 //! Android surface initialization using `ANativeWindow*` via raw-window-handle + wgpu Vulkan.
 
-use crate::{GameRenderer, RendererError, Result};
+use crate::{Canvas, RendererError, Result};
 use std::ptr::NonNull;
 
 /// Initialize a renderer bound to a raw `ANativeWindow*`.
 ///
 /// Builds a wgpu Vulkan surface via `raw-window-handle`'s `AndroidNdkWindowHandle`,
 /// configures it for `width × height`, and returns the renderer ready for
-/// `orbital_game_renderer_render` calls.
+/// `orbital_canvas_render` calls.
 ///
 /// # Safety
 /// `window` must be a valid, non-null `ANativeWindow*` that remains alive for the
@@ -17,7 +17,7 @@ pub unsafe fn init_from_native_window(
     width: u32,
     height: u32,
     _resource_base_url: &str,
-) -> Result<GameRenderer> {
+) -> Result<Canvas> {
     let nn = NonNull::new(window)
         .ok_or_else(|| RendererError::Surface("ANativeWindow pointer is null".into()))?;
 
@@ -41,7 +41,7 @@ pub unsafe fn init_from_native_window(
             .map_err(|e| RendererError::Surface(format!("create_surface: {e}")))?
     };
 
-    let mut renderer = GameRenderer::new_with_surface(instance, surface)?;
+    let mut renderer = Canvas::new_with_surface(instance, surface)?;
     renderer.configure_surface(width, height)?;
     Ok(renderer)
 }

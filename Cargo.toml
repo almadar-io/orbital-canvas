@@ -1,14 +1,13 @@
 [package]
-name = "orbital-game-renderer"
+name = "orbital-canvas"
 version = "18.0.0"
 edition = "2021"
 license = "BUSL-1.1"
-repository = "https://github.com/almadar-io/orbital-game-renderer"
-description = "Shared wgpu-based game renderer for Orbital shells"
+repository = "https://github.com/almadar-io/orbital-canvas"
+description = "GPU canvas embedded by Orbital hosts (iOS, Android, Rust)"
 
 [features]
 default = []
-desktop = ["winit"]
 # HTTP(S) asset fetching (ureq/rustls) — native-only; off on wasm32 and in
 # minimal builds. Local files (`file://`, absolute, relative) work without it.
 http = ["dep:ureq", "ureq/tls"]
@@ -43,7 +42,6 @@ raw-window-handle = "0.6"
 bytemuck = { version = "1.16", features = ["derive"] }
 ureq = { version = "2.9", default-features = false, features = ["json"], optional = true }
 
-winit = { version = "0.30", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1.4"

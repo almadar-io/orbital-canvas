@@ -319,7 +319,7 @@ mod tests {
     /// the `image` crate, fetch it as an asset, expect the bytes + dims back.
     #[test]
     fn file_asset_fetches_and_decodes_dimensions() {
-        let dir = std::env::temp_dir().join("orbital-game-renderer-asset-test");
+        let dir = std::env::temp_dir().join("orbital-canvas-asset-test");
         std::fs::create_dir_all(&dir).expect("tempdir");
         let path = dir.join("fixture.png");
         let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn svg_file_asset_is_classified_by_extension_and_reports_intrinsic_size() {
-        let dir = std::env::temp_dir().join("orbital-game-renderer-asset-test-svg");
+        let dir = std::env::temp_dir().join("orbital-canvas-asset-test-svg");
         std::fs::create_dir_all(&dir).expect("tempdir");
         let path = dir.join("sprite.svg");
         std::fs::write(&path, SVG_20X10).expect("write svg");
@@ -351,7 +351,7 @@ mod tests {
     /// the kind is declared by extension/content type, deterministically.
     #[test]
     fn svg_bytes_without_svg_extension_stay_raster() {
-        let dir = std::env::temp_dir().join("orbital-game-renderer-asset-test-svg");
+        let dir = std::env::temp_dir().join("orbital-canvas-asset-test-svg");
         std::fs::create_dir_all(&dir).expect("tempdir");
         let path = dir.join("sprite.bin");
         std::fs::write(&path, SVG_20X10).expect("write");
@@ -412,7 +412,7 @@ mod tests {
     /// ensure_asset is idempotent: a second call does not re-schedule or panic.
     #[test]
     fn ensure_asset_is_idempotent() {
-        let url = "file:///nonexistent/orbital-game-renderer/nope.png";
+        let url = "file:///nonexistent/orbital-canvas/nope.png";
         ensure_asset(url);
         ensure_asset(url);
         for _ in 0..200 {

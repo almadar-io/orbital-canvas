@@ -4,13 +4,13 @@
 //! On iOS wgpu's Metal backend is always present, so `SurfaceTargetUnsafe::CoreAnimationLayer`
 //! is unconditionally available.
 
-use crate::{GameRenderer, RendererError, Result};
+use crate::{Canvas, RendererError, Result};
 
 /// Initialize a renderer bound to a raw `CAMetalLayer*`.
 ///
 /// Builds a wgpu Metal surface from the layer pointer via
 /// `SurfaceTargetUnsafe::CoreAnimationLayer`, configures it for `width × height`, and
-/// returns a renderer ready for `orbital_game_renderer_render` calls.
+/// returns a renderer ready for `orbital_canvas_render` calls.
 ///
 /// # Safety
 /// `layer` must be a valid, non-null `CAMetalLayer*` that remains alive for the lifetime of
@@ -20,7 +20,7 @@ pub unsafe fn init_from_metal_layer(
     width: u32,
     height: u32,
     _resource_base_url: &str,
-) -> Result<GameRenderer> {
+) -> Result<Canvas> {
     if layer.is_null() {
         return Err(RendererError::Surface(
             "CAMetalLayer pointer is null".into(),
@@ -41,7 +41,7 @@ pub unsafe fn init_from_metal_layer(
             .map_err(|e| RendererError::Surface(format!("create_surface: {e}")))?
     };
 
-    let mut renderer = GameRenderer::new_with_surface(instance, surface)?;
+    let mut renderer = Canvas::new_with_surface(instance, surface)?;
     renderer.configure_surface(width, height)?;
     Ok(renderer)
 }

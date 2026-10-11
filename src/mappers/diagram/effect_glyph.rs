@@ -46,6 +46,7 @@ pub(crate) fn effect_category(head: &str) -> Option<&'static str> {
         | "behavior/catalog"
         | "behavior/describe"
         | "behavior/source"
+        | "behavior/resolve"
         | "program/read"
         | "program/print"
         | "program/eval"

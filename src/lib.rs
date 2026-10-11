@@ -51,7 +51,7 @@ pub struct InputEvent {
 }
 
 /// Shared game renderer state.
-pub struct GameRenderer {
+pub struct Canvas {
     /// Global `wgpu` instance. Lives for the lifetime of the renderer.
     pub(crate) instance: wgpu::Instance,
     /// Optional render surface (present on desktop/mobile, absent in headless/tests).
@@ -67,7 +67,7 @@ pub struct GameRenderer {
 }
 
 /// A scene host: the mapped canvas scene, its tappable/draggable regions, layout memory, clock and
-/// pointer state. [`GameRenderer`] wraps one for the mobile surfaces; the desktop clients use it directly
+/// pointer state. [`Canvas`] wraps one for the mobile surfaces; the desktop clients use it directly
 /// and paint [`SceneHost::frame_packet`] on their own device.
 pub struct SceneHost {
     /// Last submitted display-list packet.
@@ -125,7 +125,7 @@ pub(crate) struct ActiveDrag {
 /// A pointer that moves farther than this (logical points) between down and up is a drag, not a tap.
 pub const TAP_SLOP: f32 = 10.0;
 
-impl GameRenderer {
+impl Canvas {
     /// Create a headless renderer with no surface.
     ///
     /// Used on platforms where the surface is supplied later, or in tests.
@@ -199,14 +199,14 @@ impl GameRenderer {
     }
 }
 
-impl std::ops::Deref for GameRenderer {
+impl std::ops::Deref for Canvas {
     type Target = SceneHost;
     fn deref(&self) -> &SceneHost {
         &self.host
     }
 }
 
-impl std::ops::DerefMut for GameRenderer {
+impl std::ops::DerefMut for Canvas {
     fn deref_mut(&mut self) -> &mut SceneHost {
         &mut self.host
     }
@@ -562,14 +562,14 @@ mod tests {
         })
     }
 
-    fn graph_renderer() -> GameRenderer {
-        let mut r = GameRenderer::new_headless().unwrap();
+    fn graph_renderer() -> Canvas {
+        let mut r = Canvas::new_headless().unwrap();
         r.set_viewport(600, 400);
         r.set_scene(graph()).unwrap();
         r
     }
 
-    fn center_of(r: &GameRenderer, id: &str) -> (f32, f32) {
+    fn center_of(r: &Canvas, id: &str) -> (f32, f32) {
         let d = r
             .drags
             .iter()
@@ -578,7 +578,7 @@ mod tests {
         (d.rect.x + d.rect.w / 2.0, d.rect.y + d.rect.h / 2.0)
     }
 
-    fn empty_spot(r: &GameRenderer) -> (f32, f32) {
+    fn empty_spot(r: &Canvas) -> (f32, f32) {
         (0..60)
             .flat_map(|i| (0..40).map(move |j| (i as f32 * 10.0 + 5.0, j as f32 * 10.0 + 5.0)))
             .find(|&(x, y)| !r.drags.iter().any(|d| contains(&d.rect, x, y)))
@@ -703,7 +703,7 @@ mod tests {
         );
     }
 
-    fn pan_by(r: &mut GameRenderer, dx: f32) {
+    fn pan_by(r: &mut Canvas, dx: f32) {
         let (x, y) = empty_spot(r);
         r.input("touch-down", x, y, 0, None);
         r.input("touch-move", x + dx, y, 0, None);
@@ -726,7 +726,7 @@ mod tests {
         );
     }
 
-    fn drawn_texts(r: &GameRenderer) -> Vec<String> {
+    fn drawn_texts(r: &Canvas) -> Vec<String> {
         r.packet
             .as_ref()
             .unwrap()
@@ -741,7 +741,7 @@ mod tests {
 
     #[test]
     fn a_long_press_shows_a_truncated_labels_full_text_until_the_next_touch() {
-        let mut r = GameRenderer::new_headless().unwrap();
+        let mut r = Canvas::new_headless().unwrap();
         r.set_viewport(600, 400);
         let mut g = graph();
         g["nodes"][0]["label"] =
@@ -779,7 +779,7 @@ mod tests {
     #[test]
     fn headless_renderer_can_be_created() {
         // This test only runs where an adapter exists, so we ignore failures.
-        let _ = GameRenderer::new_headless();
+        let _ = Canvas::new_headless();
     }
 
     #[test]
@@ -803,7 +803,7 @@ mod tests {
     /// the device must request the adapter's real resolution limits or `Surface::configure` aborts.
     #[test]
     fn device_requests_the_adapter_texture_resolution() {
-        let mut renderer = match GameRenderer::new_headless() {
+        let mut renderer = match Canvas::new_headless() {
             Ok(r) => r,
             Err(_) => return,
         };
@@ -838,7 +838,7 @@ mod tests {
     /// Skipped when no GPU adapter is available (CI without a GPU).
     #[test]
     fn headless_rgba_golden_packet_is_non_blank() {
-        let mut renderer = match GameRenderer::new_headless() {
+        let mut renderer = match Canvas::new_headless() {
             Ok(r) => r,
             Err(_) => return, // no adapter — skip
         };
@@ -896,7 +896,7 @@ mod tests {
     /// Skipped when no GPU adapter is available.
     #[test]
     fn headless_rgba_blank_packet_stays_blank() {
-        let mut renderer = match GameRenderer::new_headless() {
+        let mut renderer = match Canvas::new_headless() {
             Ok(r) => r,
             Err(_) => return, // no adapter — SKIP
         };
@@ -939,7 +939,7 @@ mod tests {
 
     #[test]
     fn dragging_an_item_past_the_slop_queues_clamped_moves_and_suppresses_the_tap() {
-        let mut r = GameRenderer::new_headless().expect("headless");
+        let mut r = Canvas::new_headless().expect("headless");
         r.set_scene(floor_plan(true)).expect("scene");
         r.input("touch-down", 60.0, 60.0, 0, None);
         r.input("touch-move", 64.0, 60.0, 0, None);
@@ -973,7 +973,7 @@ mod tests {
 
     #[test]
     fn a_plain_tap_selects_and_a_read_only_plan_does_not_drag() {
-        let mut r = GameRenderer::new_headless().expect("headless");
+        let mut r = Canvas::new_headless().expect("headless");
         r.set_scene(floor_plan(true)).expect("scene");
         r.input("touch-down", 60.0, 60.0, 0, None);
         r.input("touch-up", 61.0, 60.0, 0, None);
@@ -990,7 +990,7 @@ mod tests {
 
     #[test]
     fn settling_assets_remaps_a_scene_whose_sprite_sheet_was_still_loading() {
-        let dir = std::env::temp_dir().join("orbital-game-renderer-settle-test");
+        let dir = std::env::temp_dir().join("orbital-canvas-settle-test");
         std::fs::create_dir_all(&dir).expect("tempdir");
         image::RgbaImage::from_pixel(32, 32, image::Rgba([10, 200, 90, 255]))
             .save(dir.join("sheet.png"))
@@ -1006,7 +1006,7 @@ mod tests {
                 "asset": {"url": format!("file://{}", dir.join("sheet.png").display()), "atlas": atlas, "sprite": "gem.png"}
             })
         };
-        let sprites = |r: &GameRenderer| {
+        let sprites = |r: &Canvas| {
             r.packet.as_ref().map_or(0, |p| {
                 p.draw_commands
                     .iter()
@@ -1014,7 +1014,7 @@ mod tests {
                     .count()
             })
         };
-        let mut r = GameRenderer::new_headless().expect("headless");
+        let mut r = Canvas::new_headless().expect("headless");
         r.set_scene(node(&format!(
             "file://{}",
             dir.join("atlas.json").display()
@@ -1026,7 +1026,7 @@ mod tests {
             1,
             "once the atlas has loaded the sprite is drawn"
         );
-        let mut missing = GameRenderer::new_headless().expect("headless");
+        let mut missing = Canvas::new_headless().expect("headless");
         missing
             .set_scene(node(&format!(
                 "file://{}",
@@ -1043,7 +1043,7 @@ mod tests {
 
     #[test]
     fn input_events_are_queued_and_drained() {
-        let mut renderer = GameRenderer::new_headless().expect("headless must construct");
+        let mut renderer = Canvas::new_headless().expect("headless must construct");
 
         assert!(renderer.input("pointerdown", 10.0, 20.0, 0, None));
         assert!(renderer.input("keydown", 0.0, 0.0, 0, Some("Space")));
@@ -1064,7 +1064,7 @@ mod tests {
 
     #[test]
     fn render_drains_input_queue() {
-        let mut renderer = GameRenderer::new_headless().expect("headless must construct");
+        let mut renderer = Canvas::new_headless().expect("headless must construct");
         renderer.input("pointermove", 5.0, 5.0, 0, None);
         assert_eq!(renderer.input_queue.len(), 1);
         // render() drains even in headless mode (no surface → no GPU call).
@@ -1214,7 +1214,7 @@ mod tests {
 
         // Fixture: a uniform-red 2×2 PNG (uniform color → filtering can't leak).
         let dir = std::env::temp_dir().join(format!(
-            "orbital-game-renderer-sprite-test-{}",
+            "orbital-canvas-sprite-test-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).expect("tempdir");
@@ -1330,7 +1330,7 @@ mod tests {
 
     #[test]
     fn an_animated_scene_asks_for_frames_and_reduced_motion_stops_them() {
-        let mut r = GameRenderer::new_headless().unwrap();
+        let mut r = Canvas::new_headless().unwrap();
         r.set_scene(pulse_scene()).unwrap();
         assert!(r.is_animated() && r.wants_frames());
         r.set_motion(false);
@@ -1341,7 +1341,7 @@ mod tests {
 
     #[test]
     fn a_static_scene_runs_no_frame_loop() {
-        let mut r = GameRenderer::new_headless().unwrap();
+        let mut r = Canvas::new_headless().unwrap();
         r.set_scene(serde_json::json!({"type": "svg-ring", "r": 30}))
             .unwrap();
         assert!(!r.is_animated());
@@ -1351,14 +1351,14 @@ mod tests {
                 "nothing animates and nothing is arriving"
             );
         }
-        let mut off = GameRenderer::new_headless().unwrap();
+        let mut off = Canvas::new_headless().unwrap();
         off.set_scene(serde_json::json!({"type": "svg-pulse", "animated": false}))
             .unwrap();
         assert!(
             !off.is_animated(),
             "control: svg-pulse with animated false declares no motion"
         );
-        let mut themed = GameRenderer::new_headless().unwrap();
+        let mut themed = Canvas::new_headless().unwrap();
         let mut node = pulse_scene();
         node["canvasTheme"] = serde_json::json!({"motion": {"enabled": false}});
         themed.set_scene(node).unwrap();
@@ -1370,7 +1370,7 @@ mod tests {
 
     #[test]
     fn the_frame_follows_the_host_clock_from_its_first_value() {
-        let mut r = GameRenderer::new_headless().unwrap();
+        let mut r = Canvas::new_headless().unwrap();
         r.set_scene(pulse_scene()).unwrap();
         r.set_clock(90_000.0);
         let first = r.frame_packet().unwrap();
@@ -1393,13 +1393,13 @@ mod tests {
         );
     }
 
-    fn first_ring_base(r: &GameRenderer) -> f32 {
+    fn first_ring_base(r: &Canvas) -> f32 {
         ring_alpha(r.packet.as_ref().unwrap())
     }
 
     #[test]
     fn a_new_scene_does_not_restart_the_clock_and_motion_off_draws_the_rest_frame() {
-        let mut r = GameRenderer::new_headless().unwrap();
+        let mut r = Canvas::new_headless().unwrap();
         r.set_scene(pulse_scene()).unwrap();
         r.set_clock(5_000.0);
         r.set_clock(5_500.0);
@@ -1423,7 +1423,7 @@ mod tests {
 
     #[test]
     fn without_a_host_clock_the_scene_draws_its_first_frame() {
-        let mut r = GameRenderer::new_headless().unwrap();
+        let mut r = Canvas::new_headless().unwrap();
         r.set_scene(pulse_scene()).unwrap();
         let unclocked = r.frame_packet().unwrap();
         r.set_clock(123.0);

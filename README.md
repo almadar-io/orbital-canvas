@@ -1,4 +1,4 @@
-# orbital-game-renderer
+# orbital-canvas
 
 Shared wgpu 2D/3D render primitives the native shells and clients paint game canvases with.
 

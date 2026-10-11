@@ -1,12 +1,12 @@
 //! Render a learning-canvas scene (props JSON with a `type`) to a PNG through
 //! the same mapper and renderer the native shells use.
 //!
-//! Usage: `cargo run -p orbital-game-renderer --example dump-learning-scene -- <scene.json> [out.png] [width] [height] [density] [light|dark]`
+//! Usage: `cargo run -p orbital-canvas --example dump-learning-scene -- <scene.json> [out.png] [width] [height] [density] [light|dark]`
 
 use std::sync::Arc;
 
-use orbital_game_renderer::mappers::scene::map_scene;
-use orbital_game_renderer::renderer::{copy_texture_to_rgba, SharedDeviceRenderer};
+use orbital_canvas::mappers::scene::map_scene;
+use orbital_canvas::renderer::{copy_texture_to_rgba, SharedDeviceRenderer};
 
 fn main() {
     let mut args = std::env::args().skip(1);

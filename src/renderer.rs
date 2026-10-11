@@ -1,7 +1,7 @@
-//! GPU pipeline and offscreen rendering for [`GameRenderer`].
+//! GPU pipeline and offscreen rendering for [`Canvas`].
 
 use crate::packet::{DrawCommand, GameRenderPacket, Rect, Vec2};
-use crate::{GameRenderer, RendererError, Result};
+use crate::{Canvas, RendererError, Result};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
@@ -71,7 +71,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 "#;
 
 /// Build the vertex-colored-quad pipeline on any device for the given target
-/// format. Shared by [`GameRenderer`] (own-device headless/surface paths) and
+/// format. Shared by [`Canvas`] (own-device headless/surface paths) and
 /// [`SharedDeviceRenderer`] (a host's device, e.g. blitz custom paint).
 pub(crate) fn build_pipeline(
     device: &wgpu::Device,
@@ -306,7 +306,7 @@ const MAX_VECTOR_LAYERS: usize = 8;
 const MAX_SVG_RASTERS_PER_URL: usize = 4;
 
 /// Renderer for hosts that own the wgpu device (e.g. dioxus-native/Blitz
-/// custom paint): same display-list pipeline as [`GameRenderer`], but built on
+/// custom paint): same display-list pipeline as [`Canvas`], but built on
 /// the host's shared device/queue and drawing into a caller-provided texture
 /// instead of an owned surface or a readback buffer. Handles the full 2D
 /// command set: `Clear` + `Quad` through the vertex-colored pipeline and
@@ -923,7 +923,7 @@ fn sprite_vertices(
     ]
 }
 
-impl GameRenderer {
+impl Canvas {
     /// Ensure a `wgpu` adapter, device, queue, and pipeline are available.
     fn ensure_device_resources(&mut self) -> Result<&DeviceResources> {
         if self.device_resources.is_none() {
@@ -940,7 +940,7 @@ impl GameRenderer {
                     required_features: wgpu::Features::empty(),
                     required_limits: wgpu::Limits::downlevel_webgl2_defaults()
                         .using_resolution(adapter.limits()),
-                    label: Some("orbital-game-renderer"),
+                    label: Some("orbital-canvas"),
                     memory_hints: wgpu::MemoryHints::Performance,
                     trace: wgpu::Trace::Off,
                 }),
@@ -1033,7 +1033,7 @@ impl GameRenderer {
     /// Render the supplied packet into an RGBA pixel buffer.
     ///
     /// The returned buffer has length `width * height * 4` and is in
-    /// top-to-bottom row order matching `egui`/image conventions.
+    /// top-to-bottom row order matching image conventions.
     pub fn render_packet_to_rgba(&mut self, packet: &GameRenderPacket) -> Result<Vec<u8>> {
         let resources = self.ensure_device_resources()?;
         let device = resources.device.clone();
@@ -1261,7 +1261,7 @@ mod svg_sprite_tests {
 
     fn fixture(name: &str, contents: &[u8]) -> String {
         let dir = std::env::temp_dir().join(format!(
-            "orbital-game-renderer-svg-sprite-{}",
+            "orbital-canvas-svg-sprite-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).expect("tempdir");
