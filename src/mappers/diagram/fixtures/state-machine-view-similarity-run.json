@@ -1,0 +1,748 @@
+{
+ "type": "state-machine-view",
+ "trait": {
+  "name": "SimilarityRun",
+  "linkedEntity": "SimilarityComparison",
+  "states": [
+   {
+    "name": "idle",
+    "isInitial": true,
+    "isTerminal": null
+   },
+   {
+    "name": "embedding",
+    "isInitial": null,
+    "isTerminal": null
+   },
+   {
+    "name": "resolved",
+    "isInitial": null,
+    "isTerminal": null
+   }
+  ],
+  "transitions": [
+   {
+    "from": "idle",
+    "to": "idle",
+    "event": "INIT",
+    "guard": null,
+    "effects": [
+     {
+      "type": "set",
+      "args": [
+       "@entity.query",
+       ""
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.candidates",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.embeddings",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.queryVector",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.candidateVectors",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.matchIndex",
+       0.0
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.matchScore",
+       0.0
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.matchMargin",
+       0.0
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.reason",
+       ""
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.request",
+       {}
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.status",
+       "idle"
+      ]
+     }
+    ],
+    "index": 0
+   },
+   {
+    "from": "idle",
+    "to": "embedding",
+    "event": "COMPARE",
+    "guard": [
+     ">",
+     [
+      "array/len",
+      "@payload.candidates"
+     ],
+     0.0
+    ],
+    "effects": [
+     {
+      "type": "set",
+      "args": [
+       "@entity.query",
+       "@payload.query"
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.candidates",
+       "@payload.candidates"
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.request",
+       "@payload.request"
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.status",
+       "embedding"
+      ]
+     },
+     {
+      "type": "llm/embed",
+      "args": [
+       [
+        "array/prepend",
+        "@payload.candidates",
+        "@payload.query"
+       ],
+       {
+        "emit": {
+         "failure": "EMBED_FAILED",
+         "success": "EMBEDDED"
+        }
+       }
+      ]
+     }
+    ],
+    "index": 1
+   },
+   {
+    "from": "idle",
+    "to": "resolved",
+    "event": "COMPARE",
+    "guard": [
+     "==",
+     [
+      "array/len",
+      "@payload.candidates"
+     ],
+     0.0
+    ],
+    "effects": [
+     {
+      "type": "set",
+      "args": [
+       "@entity.query",
+       "@payload.query"
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.candidates",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.embeddings",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.queryVector",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.candidateVectors",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.matchIndex",
+       0.0
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.matchScore",
+       0.0
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.matchMargin",
+       0.0
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.reason",
+       "empty candidate list"
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.request",
+       "@payload.request"
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.status",
+       "resolved"
+      ]
+     },
+     {
+      "type": "emit",
+      "args": [
+       "SIMILARITY_ABSTAINED",
+       {
+        "reason": "empty candidate list",
+        "request": "@entity.request"
+       }
+      ]
+     }
+    ],
+    "index": 2
+   },
+   {
+    "from": "embedding",
+    "to": "idle",
+    "event": "INIT",
+    "guard": null,
+    "effects": [
+     {
+      "type": "set",
+      "args": [
+       "@entity.query",
+       ""
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.candidates",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.embeddings",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.queryVector",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.candidateVectors",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.matchIndex",
+       0.0
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.matchScore",
+       0.0
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.matchMargin",
+       0.0
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.reason",
+       ""
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.request",
+       {}
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.status",
+       "idle"
+      ]
+     }
+    ],
+    "index": 3
+   },
+   {
+    "from": "embedding",
+    "to": "resolved",
+    "event": "EMBEDDED",
+    "guard": null,
+    "effects": [
+     {
+      "type": "set",
+      "args": [
+       "@entity.embeddings",
+       "@payload.result"
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.status",
+       "resolved"
+      ]
+     },
+     {
+      "type": "if",
+      "args": [
+       [
+        "<",
+        [
+         "array/len",
+         "@payload.result"
+        ],
+        2.0
+       ],
+       [
+        "do",
+        [
+         "set",
+         "@entity.queryVector",
+         []
+        ],
+        [
+         "set",
+         "@entity.candidateVectors",
+         []
+        ],
+        [
+         "set",
+         "@entity.matchIndex",
+         0.0
+        ],
+        [
+         "set",
+         "@entity.matchScore",
+         0.0
+        ],
+        [
+         "set",
+         "@entity.matchMargin",
+         0.0
+        ],
+        [
+         "set",
+         "@entity.reason",
+         "embedding result incomplete"
+        ],
+        [
+         "emit",
+         "SIMILARITY_ABSTAINED",
+         {
+          "reason": "embedding result incomplete",
+          "request": "@entity.request"
+         }
+        ]
+       ],
+       [
+        "do",
+        [
+         "set",
+         "@entity.queryVector",
+         [
+          "array/first",
+          "@entity.embeddings"
+         ]
+        ],
+        [
+         "set",
+         "@entity.candidateVectors",
+         [
+          "array/drop",
+          "@entity.embeddings",
+          1.0
+         ]
+        ],
+        [
+         "let",
+         [
+          [
+           "nearest",
+           [
+            "array/nearest",
+            "@entity.queryVector",
+            "@entity.candidateVectors"
+           ]
+          ]
+         ],
+         [
+          "do",
+          [
+           "set",
+           "@entity.matchIndex",
+           [
+            "object/get",
+            "@nearest",
+            "index"
+           ]
+          ],
+          [
+           "set",
+           "@entity.matchScore",
+           [
+            "object/get",
+            "@nearest",
+            "score"
+           ]
+          ],
+          [
+           "set",
+           "@entity.matchMargin",
+           [
+            "object/get",
+            "@nearest",
+            "margin"
+           ]
+          ],
+          [
+           "if",
+           [
+            "and",
+            [
+             ">=",
+             "@entity.matchScore",
+             "@config.floor"
+            ],
+            [
+             ">=",
+             "@entity.matchMargin",
+             "@config.margin"
+            ]
+           ],
+           [
+            "do",
+            [
+             "set",
+             "@entity.reason",
+             ""
+            ],
+            [
+             "emit",
+             "SIMILARITY_MATCHED",
+             {
+              "index": "@entity.matchIndex",
+              "score": "@entity.matchScore"
+             }
+            ]
+           ],
+           [
+            "do",
+            [
+             "set",
+             "@entity.reason",
+             [
+              "if",
+              [
+               "<",
+               "@entity.matchScore",
+               "@config.floor"
+              ],
+              "below floor",
+              "thin margin"
+             ]
+            ],
+            [
+             "emit",
+             "SIMILARITY_ABSTAINED",
+             {
+              "reason": "@entity.reason",
+              "request": "@entity.request"
+             }
+            ]
+           ]
+          ]
+         ]
+        ]
+       ]
+      ]
+     }
+    ],
+    "index": 4
+   },
+   {
+    "from": "embedding",
+    "to": "resolved",
+    "event": "EMBED_FAILED",
+    "guard": null,
+    "effects": [
+     {
+      "type": "set",
+      "args": [
+       "@entity.embeddings",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.queryVector",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.candidateVectors",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.matchIndex",
+       0.0
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.matchScore",
+       0.0
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.matchMargin",
+       0.0
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.reason",
+       "embedding unavailable"
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.status",
+       "resolved"
+      ]
+     },
+     {
+      "type": "emit",
+      "args": [
+       "SIMILARITY_ABSTAINED",
+       {
+        "reason": "embedding unavailable",
+        "request": "@entity.request"
+       }
+      ]
+     }
+    ],
+    "index": 5
+   },
+   {
+    "from": "resolved",
+    "to": "resolved",
+    "event": "INIT",
+    "guard": null,
+    "effects": [
+     {
+      "type": "set",
+      "args": [
+       "@entity.status",
+       "resolved"
+      ]
+     }
+    ],
+    "index": 6
+   },
+   {
+    "from": "resolved",
+    "to": "idle",
+    "event": "RESET",
+    "guard": null,
+    "effects": [
+     {
+      "type": "set",
+      "args": [
+       "@entity.query",
+       ""
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.candidates",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.embeddings",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.queryVector",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.candidateVectors",
+       []
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.matchIndex",
+       0.0
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.matchScore",
+       0.0
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.matchMargin",
+       0.0
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.reason",
+       ""
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.request",
+       {}
+      ]
+     },
+     {
+      "type": "set",
+      "args": [
+       "@entity.status",
+       "idle"
+      ]
+     }
+    ],
+    "index": 7
+   }
+  ],
+  "emittedEvents": [
+   "EMBEDDED",
+   "SIMILARITY_MATCHED",
+   "SIMILARITY_ABSTAINED"
+  ],
+  "listenedEvents": []
+ },
+ "activeState": "embedding",
+ "activeTransition": 1,
+ "visitedStates": [
+  "idle"
+ ],
+ "stateClickEvent": "STATE_CLICK",
+ "transitionClickEvent": "TRANSITION_CLICK"
+}

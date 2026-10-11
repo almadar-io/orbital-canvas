@@ -1,0 +1,900 @@
+{
+ "type": "jazari-state-machine",
+ "trait": {
+  "category": "lifecycle",
+  "config": {
+   "floor": {
+    "default": 0.82,
+    "description": "Minimum cosine score for a confident match",
+    "label": "Match floor",
+    "tier": "policy",
+    "type": "float"
+   },
+   "margin": {
+    "default": 0.05,
+    "description": "Minimum gap between the best and second-best score required to trust the match",
+    "label": "Match margin",
+    "tier": "policy",
+    "type": "float"
+   }
+  },
+  "effectRow": [
+   {
+    "kind": "emit",
+    "resource": "SIMILARITY_ABSTAINED"
+   },
+   {
+    "kind": "emit",
+    "resource": "SIMILARITY_MATCHED"
+   },
+   {
+    "kind": "llm/embed"
+   },
+   {
+    "kind": "set",
+    "resource": "@entity.candidateVectors"
+   },
+   {
+    "kind": "set",
+    "resource": "@entity.candidates"
+   },
+   {
+    "kind": "set",
+    "resource": "@entity.embeddings"
+   },
+   {
+    "kind": "set",
+    "resource": "@entity.matchIndex"
+   },
+   {
+    "kind": "set",
+    "resource": "@entity.matchMargin"
+   },
+   {
+    "kind": "set",
+    "resource": "@entity.matchScore"
+   },
+   {
+    "kind": "set",
+    "resource": "@entity.query"
+   },
+   {
+    "kind": "set",
+    "resource": "@entity.queryVector"
+   },
+   {
+    "kind": "set",
+    "resource": "@entity.reason"
+   },
+   {
+    "kind": "set",
+    "resource": "@entity.request"
+   },
+   {
+    "kind": "set",
+    "resource": "@entity.status"
+   }
+  ],
+  "emits": [
+   {
+    "description": "Raw embeddings from llm/embed \u2014 query vector at index 0, candidate vectors following in input order",
+    "event": "EMBEDDED",
+    "eventId": "evt_01KYBN0QT9WZDN3FMC3T36ACHS",
+    "payloadSchema": [
+     {
+      "name": "result",
+      "required": true,
+      "type": "[[float]]"
+     }
+    ],
+    "tier": "secondary"
+   },
+   {
+    "description": "Candidate matched with high confidence \u2014 score at or above floor, with a clear margin over the runner-up",
+    "event": "SIMILARITY_MATCHED",
+    "eventId": "evt_01KYBN0QT9KC3AMM14E9M55ACF",
+    "payloadSchema": [
+     {
+      "name": "index",
+      "required": true,
+      "type": "int"
+     },
+     {
+      "name": "score",
+      "required": true,
+      "type": "float"
+     }
+    ],
+    "scope": "external",
+    "tier": "primary"
+   },
+   {
+    "description": "No confident match \u2014 reason is one of: empty candidate list, below floor, thin margin, embedding unavailable. request echoes the originating request untouched so the next rung can project its own inputs out of it",
+    "event": "SIMILARITY_ABSTAINED",
+    "eventId": "evt_01KYBN0QT9K8NXCX7AMQ2VTNWX",
+    "payloadSchema": [
+     {
+      "name": "reason",
+      "required": true,
+      "type": "string"
+     },
+     {
+      "name": "request",
+      "properties": [
+       {
+        "name": "candidate",
+        "required": true,
+        "type": "scalar"
+       },
+       {
+        "name": "key",
+        "required": true,
+        "type": "scalar"
+       },
+       {
+        "name": "accepted",
+        "required": true,
+        "type": "[scalar]"
+       },
+       {
+        "name": "categories",
+        "required": true,
+        "type": "[string]"
+       }
+      ],
+      "type": "object"
+     }
+    ],
+    "scope": "external",
+    "tier": "primary"
+   }
+  ],
+  "entityRefIds": {
+   "SimilarityComparison": "ent_01KYBN0QT9997QBWPF6WFF1CMM"
+  },
+  "id": "trt_01KYBN0QT9C1SZTVGAG9X3YA5X",
+  "linkedEntity": "SimilarityComparison",
+  "linkedEntityId": "ent_01KYBN0QT9997QBWPF6WFF1CMM",
+  "name": "SimilarityRun",
+  "scope": "instance",
+  "stateMachine": {
+   "events": [
+    {
+     "id": "evt_01KYBN0QT9ZTTW50RCT84MH8H1",
+     "key": "INIT",
+     "name": "Initialize"
+    },
+    {
+     "id": "evt_01KYBN0QT9FX93HBXP52KRNVX6",
+     "key": "COMPARE",
+     "name": "Compare",
+     "payloadSchema": [
+      {
+       "name": "query",
+       "required": true,
+       "type": "string"
+      },
+      {
+       "name": "candidates",
+       "required": true,
+       "type": "[string]"
+      },
+      {
+       "name": "request",
+       "properties": [
+        {
+         "name": "candidate",
+         "required": true,
+         "type": "scalar"
+        },
+        {
+         "name": "key",
+         "required": true,
+         "type": "scalar"
+        },
+        {
+         "name": "accepted",
+         "required": true,
+         "type": "[scalar]"
+        },
+        {
+         "name": "categories",
+         "required": true,
+         "type": "[string]"
+        }
+       ],
+       "type": "object"
+      }
+     ]
+    },
+    {
+     "description": "Raw embeddings from llm/embed \u2014 query vector at index 0, candidate vectors following in input order",
+     "id": "evt_01KYBN0QT9WZDN3FMC3T36ACHS",
+     "key": "EMBEDDED",
+     "name": "Embedded",
+     "payloadSchema": [
+      {
+       "name": "result",
+       "required": true,
+       "type": "[[float]]"
+      }
+     ],
+     "tier": "secondary"
+    },
+    {
+     "id": "evt_01KYBN0QT9ACZNZH01MYKGTXYX",
+     "key": "EMBED_FAILED",
+     "name": "Embed Failed"
+    },
+    {
+     "id": "evt_01KYBN0QT9A6WZFFTCVGBHF2BT",
+     "key": "RESET",
+     "name": "Reset"
+    },
+    {
+     "description": "Candidate matched with high confidence \u2014 score at or above floor, with a clear margin over the runner-up",
+     "id": "evt_01KYBN0QT9KC3AMM14E9M55ACF",
+     "key": "SIMILARITY_MATCHED",
+     "name": "Similarity Matched",
+     "payloadSchema": [
+      {
+       "name": "index",
+       "required": true,
+       "type": "int"
+      },
+      {
+       "name": "score",
+       "required": true,
+       "type": "float"
+      }
+     ],
+     "tier": "primary"
+    },
+    {
+     "description": "No confident match \u2014 reason is one of: empty candidate list, below floor, thin margin, embedding unavailable. request echoes the originating request untouched so the next rung can project its own inputs out of it",
+     "id": "evt_01KYBN0QT9K8NXCX7AMQ2VTNWX",
+     "key": "SIMILARITY_ABSTAINED",
+     "name": "Similarity Abstained",
+     "payloadSchema": [
+      {
+       "name": "reason",
+       "required": true,
+       "type": "string"
+      },
+      {
+       "name": "request",
+       "properties": [
+        {
+         "name": "candidate",
+         "required": true,
+         "type": "scalar"
+        },
+        {
+         "name": "key",
+         "required": true,
+         "type": "scalar"
+        },
+        {
+         "name": "accepted",
+         "required": true,
+         "type": "[scalar]"
+        },
+        {
+         "name": "categories",
+         "required": true,
+         "type": "[string]"
+        }
+       ],
+       "type": "object"
+      }
+     ],
+     "tier": "primary"
+    }
+   ],
+   "states": [
+    {
+     "isInitial": true,
+     "name": "idle"
+    },
+    {
+     "name": "embedding"
+    },
+    {
+     "name": "resolved"
+    }
+   ],
+   "transitions": [
+    {
+     "effects": [
+      [
+       "set",
+       "@entity.query",
+       ""
+      ],
+      [
+       "set",
+       "@entity.candidates",
+       []
+      ],
+      [
+       "set",
+       "@entity.embeddings",
+       []
+      ],
+      [
+       "set",
+       "@entity.queryVector",
+       []
+      ],
+      [
+       "set",
+       "@entity.candidateVectors",
+       []
+      ],
+      [
+       "set",
+       "@entity.matchIndex",
+       0.0
+      ],
+      [
+       "set",
+       "@entity.matchScore",
+       0.0
+      ],
+      [
+       "set",
+       "@entity.matchMargin",
+       0.0
+      ],
+      [
+       "set",
+       "@entity.reason",
+       ""
+      ],
+      [
+       "set",
+       "@entity.request",
+       {}
+      ],
+      [
+       "set",
+       "@entity.status",
+       "idle"
+      ]
+     ],
+     "event": "INIT",
+     "eventId": "evt_01KYBN0QT9ZTTW50RCT84MH8H1",
+     "from": "idle",
+     "to": "idle"
+    },
+    {
+     "effects": [
+      [
+       "set",
+       "@entity.query",
+       "@payload.query"
+      ],
+      [
+       "set",
+       "@entity.candidates",
+       "@payload.candidates"
+      ],
+      [
+       "set",
+       "@entity.request",
+       "@payload.request"
+      ],
+      [
+       "set",
+       "@entity.status",
+       "embedding"
+      ],
+      [
+       "llm/embed",
+       [
+        "array/prepend",
+        "@payload.candidates",
+        "@payload.query"
+       ],
+       {
+        "emit": {
+         "failure": "EMBED_FAILED",
+         "success": "EMBEDDED"
+        }
+       }
+      ]
+     ],
+     "event": "COMPARE",
+     "eventId": "evt_01KYBN0QT9FX93HBXP52KRNVX6",
+     "from": "idle",
+     "guard": [
+      ">",
+      [
+       "array/len",
+       "@payload.candidates"
+      ],
+      0.0
+     ],
+     "to": "embedding"
+    },
+    {
+     "effects": [
+      [
+       "set",
+       "@entity.query",
+       "@payload.query"
+      ],
+      [
+       "set",
+       "@entity.candidates",
+       []
+      ],
+      [
+       "set",
+       "@entity.embeddings",
+       []
+      ],
+      [
+       "set",
+       "@entity.queryVector",
+       []
+      ],
+      [
+       "set",
+       "@entity.candidateVectors",
+       []
+      ],
+      [
+       "set",
+       "@entity.matchIndex",
+       0.0
+      ],
+      [
+       "set",
+       "@entity.matchScore",
+       0.0
+      ],
+      [
+       "set",
+       "@entity.matchMargin",
+       0.0
+      ],
+      [
+       "set",
+       "@entity.reason",
+       "empty candidate list"
+      ],
+      [
+       "set",
+       "@entity.request",
+       "@payload.request"
+      ],
+      [
+       "set",
+       "@entity.status",
+       "resolved"
+      ],
+      [
+       "emit",
+       "SIMILARITY_ABSTAINED",
+       {
+        "reason": "empty candidate list",
+        "request": "@entity.request"
+       }
+      ]
+     ],
+     "event": "COMPARE",
+     "eventId": "evt_01KYBN0QT9FX93HBXP52KRNVX6",
+     "from": "idle",
+     "guard": [
+      "==",
+      [
+       "array/len",
+       "@payload.candidates"
+      ],
+      0.0
+     ],
+     "to": "resolved"
+    },
+    {
+     "effects": [
+      [
+       "set",
+       "@entity.query",
+       ""
+      ],
+      [
+       "set",
+       "@entity.candidates",
+       []
+      ],
+      [
+       "set",
+       "@entity.embeddings",
+       []
+      ],
+      [
+       "set",
+       "@entity.queryVector",
+       []
+      ],
+      [
+       "set",
+       "@entity.candidateVectors",
+       []
+      ],
+      [
+       "set",
+       "@entity.matchIndex",
+       0.0
+      ],
+      [
+       "set",
+       "@entity.matchScore",
+       0.0
+      ],
+      [
+       "set",
+       "@entity.matchMargin",
+       0.0
+      ],
+      [
+       "set",
+       "@entity.reason",
+       ""
+      ],
+      [
+       "set",
+       "@entity.request",
+       {}
+      ],
+      [
+       "set",
+       "@entity.status",
+       "idle"
+      ]
+     ],
+     "event": "INIT",
+     "eventId": "evt_01KYBN0QT9ZTTW50RCT84MH8H1",
+     "from": "embedding",
+     "to": "idle"
+    },
+    {
+     "effects": [
+      [
+       "set",
+       "@entity.embeddings",
+       "@payload.result"
+      ],
+      [
+       "set",
+       "@entity.status",
+       "resolved"
+      ],
+      [
+       "if",
+       [
+        "<",
+        [
+         "array/len",
+         "@payload.result"
+        ],
+        2.0
+       ],
+       [
+        "do",
+        [
+         "set",
+         "@entity.queryVector",
+         []
+        ],
+        [
+         "set",
+         "@entity.candidateVectors",
+         []
+        ],
+        [
+         "set",
+         "@entity.matchIndex",
+         0.0
+        ],
+        [
+         "set",
+         "@entity.matchScore",
+         0.0
+        ],
+        [
+         "set",
+         "@entity.matchMargin",
+         0.0
+        ],
+        [
+         "set",
+         "@entity.reason",
+         "embedding result incomplete"
+        ],
+        [
+         "emit",
+         "SIMILARITY_ABSTAINED",
+         {
+          "reason": "embedding result incomplete",
+          "request": "@entity.request"
+         }
+        ]
+       ],
+       [
+        "do",
+        [
+         "set",
+         "@entity.queryVector",
+         [
+          "array/first",
+          "@entity.embeddings"
+         ]
+        ],
+        [
+         "set",
+         "@entity.candidateVectors",
+         [
+          "array/drop",
+          "@entity.embeddings",
+          1.0
+         ]
+        ],
+        [
+         "let",
+         [
+          [
+           "nearest",
+           [
+            "array/nearest",
+            "@entity.queryVector",
+            "@entity.candidateVectors"
+           ]
+          ]
+         ],
+         [
+          "do",
+          [
+           "set",
+           "@entity.matchIndex",
+           [
+            "object/get",
+            "@nearest",
+            "index"
+           ]
+          ],
+          [
+           "set",
+           "@entity.matchScore",
+           [
+            "object/get",
+            "@nearest",
+            "score"
+           ]
+          ],
+          [
+           "set",
+           "@entity.matchMargin",
+           [
+            "object/get",
+            "@nearest",
+            "margin"
+           ]
+          ],
+          [
+           "if",
+           [
+            "and",
+            [
+             ">=",
+             "@entity.matchScore",
+             "@config.floor"
+            ],
+            [
+             ">=",
+             "@entity.matchMargin",
+             "@config.margin"
+            ]
+           ],
+           [
+            "do",
+            [
+             "set",
+             "@entity.reason",
+             ""
+            ],
+            [
+             "emit",
+             "SIMILARITY_MATCHED",
+             {
+              "index": "@entity.matchIndex",
+              "score": "@entity.matchScore"
+             }
+            ]
+           ],
+           [
+            "do",
+            [
+             "set",
+             "@entity.reason",
+             [
+              "if",
+              [
+               "<",
+               "@entity.matchScore",
+               "@config.floor"
+              ],
+              "below floor",
+              "thin margin"
+             ]
+            ],
+            [
+             "emit",
+             "SIMILARITY_ABSTAINED",
+             {
+              "reason": "@entity.reason",
+              "request": "@entity.request"
+             }
+            ]
+           ]
+          ]
+         ]
+        ]
+       ]
+      ]
+     ],
+     "event": "EMBEDDED",
+     "eventId": "evt_01KYBN0QT9WZDN3FMC3T36ACHS",
+     "from": "embedding",
+     "to": "resolved"
+    },
+    {
+     "effects": [
+      [
+       "set",
+       "@entity.embeddings",
+       []
+      ],
+      [
+       "set",
+       "@entity.queryVector",
+       []
+      ],
+      [
+       "set",
+       "@entity.candidateVectors",
+       []
+      ],
+      [
+       "set",
+       "@entity.matchIndex",
+       0.0
+      ],
+      [
+       "set",
+       "@entity.matchScore",
+       0.0
+      ],
+      [
+       "set",
+       "@entity.matchMargin",
+       0.0
+      ],
+      [
+       "set",
+       "@entity.reason",
+       "embedding unavailable"
+      ],
+      [
+       "set",
+       "@entity.status",
+       "resolved"
+      ],
+      [
+       "emit",
+       "SIMILARITY_ABSTAINED",
+       {
+        "reason": "embedding unavailable",
+        "request": "@entity.request"
+       }
+      ]
+     ],
+     "event": "EMBED_FAILED",
+     "eventId": "evt_01KYBN0QT9ACZNZH01MYKGTXYX",
+     "from": "embedding",
+     "to": "resolved"
+    },
+    {
+     "effects": [
+      [
+       "set",
+       "@entity.status",
+       "resolved"
+      ]
+     ],
+     "event": "INIT",
+     "eventId": "evt_01KYBN0QT9ZTTW50RCT84MH8H1",
+     "from": "resolved",
+     "to": "resolved"
+    },
+    {
+     "effects": [
+      [
+       "set",
+       "@entity.query",
+       ""
+      ],
+      [
+       "set",
+       "@entity.candidates",
+       []
+      ],
+      [
+       "set",
+       "@entity.embeddings",
+       []
+      ],
+      [
+       "set",
+       "@entity.queryVector",
+       []
+      ],
+      [
+       "set",
+       "@entity.candidateVectors",
+       []
+      ],
+      [
+       "set",
+       "@entity.matchIndex",
+       0.0
+      ],
+      [
+       "set",
+       "@entity.matchScore",
+       0.0
+      ],
+      [
+       "set",
+       "@entity.matchMargin",
+       0.0
+      ],
+      [
+       "set",
+       "@entity.reason",
+       ""
+      ],
+      [
+       "set",
+       "@entity.request",
+       {}
+      ],
+      [
+       "set",
+       "@entity.status",
+       "idle"
+      ]
+     ],
+     "event": "RESET",
+     "eventId": "evt_01KYBN0QT9A6WZFFTCVGBHF2BT",
+     "from": "resolved",
+     "to": "idle"
+    }
+   ]
+  }
+ },
+ "entityFields": [
+  "query",
+  "candidates",
+  "embeddings",
+  "queryVector",
+  "candidateVectors",
+  "matchIndex",
+  "matchScore",
+  "matchMargin",
+  "reason",
+  "request",
+  "status"
+ ]
+}

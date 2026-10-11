@@ -1,0 +1,50 @@
+[package]
+name = "orbital-game-renderer"
+version = "18.0.0"
+edition = "2021"
+license = "BUSL-1.1"
+repository = "https://github.com/almadar-io/orbital-game-renderer"
+description = "Shared wgpu-based game renderer for Orbital shells"
+
+[features]
+default = []
+desktop = ["winit"]
+# HTTP(S) asset fetching (ureq/rustls) — native-only; off on wasm32 and in
+# minimal builds. Local files (`file://`, absolute, relative) work without it.
+http = ["dep:ureq", "ureq/tls"]
+# Desktop hosts: supply the scripts the bundled faces lack from the installed system fonts.
+system-fonts = ["dep:fontdb"]
+
+[dependencies]
+orbital-core = { git = "https://github.com/almadar-io/orbital-core", branch = "main" }
+wgpu = "26"
+pollster = "0.4"
+image = "0.25"
+# SVG sprites: rasterized at on-screen size x density (see svg.rs). `text` and
+# system fonts stay off - sprites carry no live text, and the mobile targets
+# have no font db to scan; embedded raster images in an SVG stay on.
+resvg = { version = "0.45", default-features = false, features = ["raster-images"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+# Vector layer: paths, strokes and text are rasterized on the CPU (anti-aliased,
+# dashes, joins) and composited as a texture in draw order. Same crate resvg uses.
+tiny-skia = "0.11"
+ttf-parser = "0.25"
+fontdb = { version = "0.23", default-features = false, features = ["std", "fs"], optional = true }
+# Text: rustybuzz shapes (joining, ligatures, marks), unicode-bidi orders mixed
+# directions into visual runs, unicode-script picks the font per run.
+rustybuzz = "0.20"
+unicode-bidi = "0.3"
+unicode-script = "0.5"
+raw-window-handle = "0.6"
+bytemuck = { version = "1.16", features = ["derive"] }
+ureq = { version = "2.9", default-features = false, features = ["json"], optional = true }
+
+winit = { version = "0.30", optional = true }
+
+[dev-dependencies]
+pretty_assertions = "1.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
