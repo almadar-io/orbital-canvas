@@ -47,10 +47,12 @@ pub(crate) fn effect_category(head: &str) -> Option<&'static str> {
         | "behavior/describe"
         | "behavior/source"
         | "behavior/resolve"
+        | "behavior/dependencies"
         | "program/read"
         | "program/print"
         | "program/eval"
-        | "program/compose" => "system",
+        | "program/compose"
+        | "program/step" => "system",
         other => match other.split_once('/').map(|(p, _)| p) {
             Some("agent" | "os" | "browser" | "llm" | "session" | "application") => "system",
             Some("trace") => "control",
