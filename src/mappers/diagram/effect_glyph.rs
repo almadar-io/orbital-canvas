@@ -14,10 +14,7 @@ pub(crate) fn effect_category(head: &str) -> Option<&'static str> {
         | "notify"
         | "send-server"
         | "call-service"
-        | "cancel-call"
-        | "integration/http"
-        | "integration/github-get-repo"
-        | "integration/github-create-issue" => "communication",
+        | "cancel-call" => "communication",
         "spawn" | "despawn" => "lifecycle",
         "do" | "if" | "when" | "let" | "log" | "atomic" => "control",
         "wait" | "async/delay" | "async/debounce" | "async/throttle" | "async/interval"
