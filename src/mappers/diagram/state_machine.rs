@@ -10,7 +10,7 @@ use crate::mappers::learning::theme::Rgba;
 use crate::mappers::scene::Emit;
 use crate::packet::{Easing, Keyframe, TextAlign};
 use crate::vector::{mono_text_width, text_width};
-use orbital_core::schema::{format_sexpr, SExpression};
+use orbital_core_base::schema::{format_sexpr, SExpression};
 use serde_json::{json, Value};
 use std::f32::consts::TAU;
 

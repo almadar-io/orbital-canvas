@@ -15,7 +15,7 @@ http = ["dep:ureq", "ureq/tls"]
 system-fonts = ["dep:fontdb"]
 
 [dependencies]
-orbital-core = { git = "https://github.com/almadar-io/orbital-core", branch = "main" }
+orbital-core-base = { git = "https://github.com/almadar-io/orbital-core", branch = "main" }
 wgpu = "26"
 pollster = "0.4"
 image = "0.25"
