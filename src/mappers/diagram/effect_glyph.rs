@@ -49,7 +49,10 @@ pub(crate) fn effect_category(head: &str) -> Option<&'static str> {
         | "program/print"
         | "program/eval"
         | "program/compose"
-        | "program/step" => "system",
+        | "program/step"
+        | "program/inputs"
+        | "program/dispatch"
+        | "persist/read-named" => "system",
         other => match other.split_once('/').map(|(p, _)| p) {
             Some("agent" | "os" | "browser" | "llm" | "session" | "application") => "system",
             Some("trace") => "control",
