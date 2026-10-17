@@ -48,6 +48,7 @@ pub(crate) fn effect_category(head: &str) -> Option<&'static str> {
         | "program/read"
         | "program/print"
         | "program/eval"
+        | "program/validate"
         | "program/compose"
         | "program/step"
         | "program/inputs"
