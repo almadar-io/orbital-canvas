@@ -21,20 +21,7 @@ pub(crate) fn effect_category(head: &str) -> Option<&'static str> {
         | "async/race" | "async/all" | "async/sequence" | "async/timeout" | "async/retry" => {
             "async"
         }
-        "forward"
-        | "train"
-        | "evaluate"
-        | "checkpoint/save"
-        | "checkpoint/load"
-        | "nn/setWeights"
-        | "train/loop"
-        | "train/step"
-        | "train/clipGradients"
-        | "train/clipWeights"
-        | "train/sgd"
-        | "train/adam"
-        | "prob/seed"
-        | "prob/condition" => "compute",
+        "prob/seed" | "prob/condition" => "compute",
         "workspace/write-orbital"
         | "workspace/write-file"
         | "workspace/write-schema"
