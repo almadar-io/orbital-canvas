@@ -217,7 +217,7 @@ fn graph_trait(props: &Value) -> TraitData {
                     event: props_str(t, "event").unwrap_or_default().to_string(),
                     guard: props_str(t, "guardHint").map(|g| {
                         orbital_core_base::schema::format_sexpr(
-                            &orbital_core_base::schema::SExpression::String(g.to_string()),
+                            &orbital_core_base::schema::SExpression::String(g.to_string().into()),
                         )
                     }),
                     effects: Vec::new(),
