@@ -9,14 +9,14 @@ use crate::packet::TextAlign;
 pub(crate) fn effect_category(head: &str) -> Option<&'static str> {
     Some(match head {
         "render-ui" | "navigate" | "navigate-back" => "ui",
-        "set" | "persist" | "fetch" | "fetch-stream" | "ref" | "deref" | "swap" | "watch" => "data",
+        "set" | "persist" | "fetch" | "fetch-stream" => "data",
         "emit"
         | "notify"
         | "send-server"
         | "call-service"
         | "cancel-call" => "communication",
         "spawn" | "despawn" => "lifecycle",
-        "do" | "if" | "when" | "let" | "log" | "atomic" => "control",
+        "do" | "if" | "when" | "let" | "log" => "control",
         "wait" | "async/delay" | "async/debounce" | "async/throttle" | "async/interval"
         | "async/race" | "async/all" | "async/sequence" | "async/timeout" | "async/retry" => {
             "async"
@@ -316,7 +316,7 @@ mod tests {
             "communication"
         );
         assert_eq!(
-            format!("{:?}", draw("deref")),
+            format!("{:?}", draw("fetch-stream")),
             format!("{:?}", draw("set")),
             "data"
         );
