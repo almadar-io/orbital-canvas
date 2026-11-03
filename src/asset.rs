@@ -2,14 +2,14 @@
 //! `useImageCache` + the `fetch` half of `lib/atlasSlice.ts`.
 //!
 //! One static cache maps a URL to `InFlight | Ready(bytes) | Failed`. Fetches
-//! run on spawned std threads so render paths never block: callers
+//! run asynchronously so render paths never block: callers
 //! `ensure_asset(url)` every frame and skip the drawable until
 //! `asset_bytes(url)` returns `Some` — exactly the React "draw nothing until
 //! loaded" contract (`DrawSprite.tsx:48-59`). Transports:
 //!
-//! - `http(s)://` — `ureq` (rustls), behind the `http` cargo feature
-//!   (native-only; off on wasm32 where no fetch transport exists yet).
-//! - `file://`, absolute, and `asset_base_url`-relative paths — `fs::read`.
+//! - Browser URLs — `window.fetch` on wasm32.
+//! - Native `http(s)://` — `ureq` (rustls), behind the `http` cargo feature.
+//! - Native `file://`, absolute, and `asset_base_url`-relative paths — `fs::read`.
 //! - `data:` URLs (base64 or percent-encoded) — decoded inline, no thread, so self-contained
 //!   fixtures resolve on the first frame.
 //!
@@ -58,8 +58,6 @@ impl AssetKind {
 }
 
 enum State {
-    /// Native only: the browser fetch fails at once (no transport yet, G-ORB-246).
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     InFlight,
     Ready(Arc<[u8]>, AssetKind),
     /// Fetch failed — the error is logged at fetch time (see `ensure_asset`).
@@ -118,14 +116,11 @@ pub fn ensure_asset(url: &str) {
         GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
         return;
     }
-    // The browser has no threads (`std::thread::spawn` panics on wasm32) and no transport here
-    // yet (G-ORB-246): the fetch fails, declared and logged, instead of taking the page down.
     #[cfg(target_arch = "wasm32")]
     {
-        tracing::warn!(target: NS, url = %url, "asset fetch failed: no browser transport for non-data URLs");
-        map.insert(url.to_string(), State::Failed);
-        GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
-        return;
+        map.insert(url.to_string(), State::InFlight);
+        drop(map);
+        spawn_fetch(url.to_string());
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -139,23 +134,60 @@ pub fn ensure_asset(url: &str) {
 fn spawn_fetch(owned: String) {
     std::thread::spawn(move || {
         let outcome = fetch(&owned);
-        let state = match outcome {
-            Ok((bytes, content_type)) => {
-                let kind = AssetKind::classify(&owned, content_type.as_deref());
-                tracing::info!(target: NS, url = %owned, bytes = bytes.len(), ?kind, "asset fetched");
-                State::Ready(bytes.into(), kind)
-            }
-            Err(e) => {
-                tracing::warn!(target: NS, url = %owned, error = %e, "asset fetch failed");
-                State::Failed
-            }
-        };
-        cache()
-            .write()
-            .expect("asset cache poisoned")
-            .insert(owned, state);
-        GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+        complete_fetch(owned, outcome);
     });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn spawn_fetch(owned: String) {
+    wasm_bindgen_futures::spawn_local(async move {
+        complete_fetch(owned.clone(), fetch_browser(&owned).await);
+    });
+}
+
+fn complete_fetch(url: String, outcome: Result<Fetched, String>) {
+    let state = match outcome {
+        Ok((bytes, content_type)) => {
+            let kind = AssetKind::classify(&url, content_type.as_deref());
+            tracing::info!(target: NS, url = %url, bytes = bytes.len(), ?kind, "asset fetched");
+            State::Ready(bytes.into(), kind)
+        }
+        Err(error) => {
+            tracing::warn!(target: NS, url = %url, %error, "asset fetch failed");
+            State::Failed
+        }
+    };
+    cache()
+        .write()
+        .expect("asset cache poisoned")
+        .insert(url, state);
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_browser(url: &str) -> Result<Fetched, String> {
+    use wasm_bindgen::JsCast;
+
+    let window = web_sys::window().ok_or("browser fetch requires a window")?;
+    let response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url))
+        .await
+        .map_err(|error| format!("fetch {url}: {error:?}"))?
+        .dyn_into::<web_sys::Response>()
+        .map_err(|_| format!("fetch {url}: response is not an HTTP response"))?;
+    if !response.ok() {
+        return Err(format!("fetch {url}: HTTP {}", response.status()));
+    }
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .map_err(|error| format!("fetch {url}: content-type: {error:?}"))?;
+    let buffer = response
+        .array_buffer()
+        .map_err(|error| format!("fetch {url}: body: {error:?}"))?;
+    let buffer = wasm_bindgen_futures::JsFuture::from(buffer)
+        .await
+        .map_err(|error| format!("fetch {url}: body: {error:?}"))?;
+    Ok((js_sys::Uint8Array::new(&buffer).to_vec(), content_type))
 }
 
 /// Assets whose fetch has not completed.
@@ -166,6 +198,28 @@ pub fn pending() -> usize {
         .values()
         .filter(|s| matches!(s, State::InFlight))
         .count()
+}
+
+/// A completed fetch or image decode that cannot paint; pending fetches stay false.
+pub fn image_failed(url: &str) -> bool {
+    ensure_asset(url);
+    if fetch_failed(url) {
+        return true;
+    }
+    dims()
+        .read()
+        .expect("dimension cache poisoned")
+        .get(url)
+        .is_some_and(Option::is_none)
+}
+
+/// A completed transport failure, independent of what kind of asset was requested.
+pub fn fetch_failed(url: &str) -> bool {
+    ensure_asset(url);
+    matches!(
+        cache().read().expect("asset cache poisoned").get(url),
+        Some(State::Failed)
+    )
 }
 
 fn percent_decode(s: &str) -> Result<Vec<u8>, String> {
@@ -363,6 +417,7 @@ mod tests {
             None,
             "image crate cannot decode svg bytes"
         );
+        assert!(image_failed(&url));
     }
 
     #[test]
@@ -390,6 +445,8 @@ mod tests {
             asset_bytes(bad).is_none(),
             "control: a malformed data url never becomes bytes"
         );
+        assert!(fetch_failed(bad));
+        assert!(image_failed(bad));
     }
 
     #[test]
@@ -424,5 +481,24 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("missing file must resolve to Failed, not hang InFlight");
+    }
+
+    #[test]
+    fn async_fetch_completion_updates_the_shared_cache_and_generation() {
+        let svg_url = "https://example.invalid/asset-transport-test";
+        let failed_url = "https://example.invalid/asset-transport-failure-test";
+        let before = generation();
+        complete_fetch(
+            svg_url.into(),
+            Ok((SVG_20X10.as_bytes().to_vec(), Some("image/svg+xml".into()))),
+        );
+        let after_ready = generation();
+        assert!(after_ready > before);
+        assert_eq!(asset_kind(svg_url), Some(AssetKind::Svg));
+        assert_eq!(image_info(svg_url), Some((20, 10)));
+
+        complete_fetch(failed_url.into(), Err("HTTP 404".into()));
+        assert!(generation() > after_ready);
+        assert!(fetch_failed(failed_url));
     }
 }

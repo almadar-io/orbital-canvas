@@ -11,14 +11,17 @@
 //! Regular and Bold). Scripts with no bundled face (CJK, Hebrew, Indic) draw
 //! the DejaVu `.notdef` box.
 
-use crate::packet::{DrawCommand, LineCap, LineJoin, PathSegment, Stroke, TextAlign, Vec2};
+use crate::packet::{
+    DrawCommand, FillPattern, Gradient, GradientStop, LineCap, LineJoin, PathSegment, Stroke,
+    TextAlign, Vec2,
+};
 use rustybuzz::{Direction, UnicodeBuffer};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use tiny_skia::{
-    FillRule, LineCap as SkCap, LineJoin as SkJoin, Mask, Paint, PathBuilder, Pixmap, StrokeDash,
-    Transform,
+    FillRule, GradientStop as SkGradientStop, LineCap as SkCap, LineJoin as SkJoin, LinearGradient,
+    Mask, Paint, PathBuilder, Pattern, Pixmap, RadialGradient, SpreadMode, StrokeDash, Transform,
 };
 use unicode_bidi::BidiInfo;
 use unicode_script::{Script, UnicodeScript};
@@ -282,10 +285,35 @@ pub fn is_vector(command: &DrawCommand) -> bool {
     matches!(
         command,
         DrawCommand::Path { .. }
+            | DrawCommand::GradientPath { .. }
+            | DrawCommand::PatternPath { .. }
+            | DrawCommand::Blurred { .. }
             | DrawCommand::ClippedPath { .. }
             | DrawCommand::Line { .. }
             | DrawCommand::Text { .. }
     )
+}
+
+/// Whether a vector run must be invalidated when an image asset finishes loading.
+pub fn uses_image_pattern(command: &DrawCommand) -> bool {
+    match command {
+        DrawCommand::PatternPath {
+            pattern: FillPattern::Image { .. },
+            ..
+        } => true,
+        DrawCommand::Blurred { command, .. } => uses_image_pattern(command),
+        DrawCommand::AdditiveGroup { commands } => commands.iter().any(uses_image_pattern),
+        _ => false,
+    }
+}
+
+pub fn uses_text(command: &DrawCommand) -> bool {
+    match command {
+        DrawCommand::Text { .. } => true,
+        DrawCommand::Blurred { command, .. } => uses_text(command),
+        DrawCommand::AdditiveGroup { commands } => commands.iter().any(uses_text),
+        _ => false,
+    }
 }
 
 /// Advance width of `text` at `size`, in the same units as `size`.
@@ -324,6 +352,180 @@ fn paint(c: [f32; 4]) -> Paint<'static> {
     p.set_color(color(c));
     p.anti_alias = true;
     p
+}
+
+fn sk_gradient_stops(stops: &[GradientStop]) -> Vec<SkGradientStop> {
+    stops
+        .iter()
+        .map(|stop| SkGradientStop::new(stop.offset.clamp(0.0, 1.0), color(stop.color)))
+        .collect()
+}
+
+fn conic_color(stops: &[GradientStop], progress: f32) -> [f32; 4] {
+    let Some(first) = stops.first() else {
+        return [0.0; 4];
+    };
+    let mut previous = first;
+    for next in stops.iter().skip(1) {
+        if progress <= next.offset {
+            let span = (next.offset - previous.offset).max(f32::EPSILON);
+            let t = ((progress - previous.offset) / span).clamp(0.0, 1.0);
+            return std::array::from_fn(|i| {
+                previous.color[i] + (next.color[i] - previous.color[i]) * t
+            });
+        }
+        previous = next;
+    }
+    previous.color
+}
+
+fn conic_pixmap(
+    width: u32,
+    height: u32,
+    center: Vec2,
+    angle: f32,
+    stops: &[GradientStop],
+    ts: Transform,
+) -> Option<Pixmap> {
+    let mut pixmap = Pixmap::new(width, height)?;
+    let mut ordered = stops.to_vec();
+    ordered.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+    let center = Vec2 {
+        x: center.x * ts.sx + ts.tx,
+        y: center.y * ts.sy + ts.ty,
+    };
+    for (index, pixel) in pixmap.pixels_mut().iter_mut().enumerate() {
+        let x = (index % width as usize) as f32 + 0.5;
+        let y = (index / width as usize) as f32 + 0.5;
+        let turn = ((x - center.x).atan2(center.y - y) - angle).rem_euclid(std::f32::consts::TAU)
+            / std::f32::consts::TAU;
+        *pixel = color(conic_color(&ordered, turn))
+            .premultiply()
+            .to_color_u8();
+    }
+    Some(pixmap)
+}
+
+fn paint_gradient_path(
+    pixmap: &mut Pixmap,
+    path: &tiny_skia::Path,
+    gradient: &Gradient,
+    ts: Transform,
+    stroke: Option<&tiny_skia::Stroke>,
+) {
+    let mut p = Paint::default();
+    p.anti_alias = true;
+    match gradient {
+        Gradient::Linear { from, to, stops } => {
+            let Some(shader) = LinearGradient::new(
+                tiny_skia::Point::from_xy(from.x, from.y),
+                tiny_skia::Point::from_xy(to.x, to.y),
+                sk_gradient_stops(stops),
+                SpreadMode::Pad,
+                Transform::identity(),
+            ) else {
+                return;
+            };
+            p.shader = shader;
+        }
+        Gradient::Radial {
+            center,
+            radius,
+            stops,
+        } => {
+            let point = tiny_skia::Point::from_xy(center.x, center.y);
+            let Some(shader) = RadialGradient::new(
+                point,
+                point,
+                *radius,
+                sk_gradient_stops(stops),
+                SpreadMode::Pad,
+                Transform::identity(),
+            ) else {
+                return;
+            };
+            p.shader = shader;
+        }
+        Gradient::Conic {
+            center,
+            angle,
+            stops,
+        } => {
+            let Some(texture) =
+                conic_pixmap(pixmap.width(), pixmap.height(), *center, *angle, stops, ts)
+            else {
+                return;
+            };
+            p.shader = Pattern::new(
+                texture.as_ref(),
+                SpreadMode::Pad,
+                tiny_skia::FilterQuality::Nearest,
+                1.0,
+                Transform::identity(),
+            );
+            if let Some(stroke) = stroke {
+                pixmap.stroke_path(path, &p, stroke, ts, None);
+            } else {
+                pixmap.fill_path(path, &p, FillRule::Winding, ts, None);
+            }
+            return;
+        }
+    }
+    if let Some(stroke) = stroke {
+        pixmap.stroke_path(path, &p, stroke, ts, None);
+    } else {
+        pixmap.fill_path(path, &p, FillRule::Winding, ts, None);
+    }
+}
+
+fn pattern_tile(pattern: &FillPattern) -> Option<Pixmap> {
+    match pattern {
+        FillPattern::Noise {
+            alpha, color: tint, ..
+        } => {
+            let mut pixmap = Pixmap::new(32, 32)?;
+            for y in 0..32 {
+                for x in 0..32 {
+                    let s = ((x as f64 * 12.9898 + y as f64 * 78.233).sin() * 43758.5453).fract();
+                    let noise = if s < 0.0 { s + 1.0 } else { s };
+                    let mut color = *tint;
+                    color[3] *= (noise as f32 * alpha).clamp(0.0, 1.0);
+                    pixmap.pixels_mut()[(y * 32 + x) as usize] = premultiplied_color(color);
+                }
+            }
+            Some(pixmap)
+        }
+        FillPattern::Image { url, .. } => {
+            let bytes = crate::asset::asset_bytes(url)?;
+            let image = match crate::asset::asset_kind(url)? {
+                crate::asset::AssetKind::Raster => {
+                    image::load_from_memory(&bytes).ok()?.into_rgba8()
+                }
+                crate::asset::AssetKind::Svg => {
+                    let (width, height) = crate::svg::intrinsic_size(url, &bytes)?;
+                    let raster = crate::svg::rasterize(url, &bytes, width, height)?;
+                    image::RgbaImage::from_raw(width, height, raster.rgba)?
+                }
+            };
+            let (width, height) = image.dimensions();
+            let mut pixmap = Pixmap::new(width, height)?;
+            for (target, source) in pixmap.pixels_mut().iter_mut().zip(image.pixels()) {
+                *target = tiny_skia::ColorU8::from_rgba(source[0], source[1], source[2], source[3])
+                    .premultiply();
+            }
+            Some(pixmap)
+        }
+    }
+}
+
+fn premultiplied_color(color: [f32; 4]) -> tiny_skia::PremultipliedColorU8 {
+    tiny_skia::ColorU8::from_rgba(
+        (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+    )
+    .premultiply()
 }
 
 fn sk_stroke(stroke: &Stroke) -> tiny_skia::Stroke {
@@ -541,6 +743,84 @@ fn draw_command(pixmap: &mut Pixmap, command: &DrawCommand, ts: Transform) {
                 pixmap.stroke_path(&path, &paint(s.color), &sk_stroke(s), ts, None);
             }
         }
+        DrawCommand::GradientPath {
+            segments,
+            fill,
+            stroke,
+            fill_gradient,
+            stroke_gradient,
+        } => {
+            let Some(path) = build_path(segments) else {
+                return;
+            };
+            if let Some(gradient) = fill_gradient {
+                paint_gradient_path(pixmap, &path, gradient, ts, None);
+            } else if let Some(color) = fill {
+                pixmap.fill_path(&path, &paint(*color), FillRule::Winding, ts, None);
+            }
+            if let Some(stroke) = stroke {
+                let style = sk_stroke(stroke);
+                if let Some(gradient) = stroke_gradient {
+                    paint_gradient_path(pixmap, &path, gradient, ts, Some(&style));
+                } else {
+                    pixmap.stroke_path(&path, &paint(stroke.color), &style, ts, None);
+                }
+            }
+        }
+        DrawCommand::PatternPath {
+            segments,
+            pattern,
+            opacity,
+        } => {
+            let Some(path) = build_path(segments) else {
+                return;
+            };
+            let Some(tile) = pattern_tile(pattern) else {
+                return;
+            };
+            let scale = match pattern {
+                FillPattern::Noise { scale, .. } | FillPattern::Image { scale, .. } => *scale,
+            };
+            if !scale.is_finite() || scale <= 0.0 {
+                return;
+            }
+            let mut paint = Paint::default();
+            paint.anti_alias = true;
+            paint.shader = Pattern::new(
+                tile.as_ref(),
+                SpreadMode::Repeat,
+                tiny_skia::FilterQuality::Nearest,
+                opacity.clamp(0.0, 1.0),
+                Transform::from_scale(scale, scale),
+            );
+            pixmap.fill_path(&path, &paint, FillRule::Winding, ts, None);
+        }
+        DrawCommand::Blurred { command, radius } => {
+            let (width, height) = (pixmap.width(), pixmap.height());
+            let Some(mut layer) = Pixmap::new(width, height) else {
+                return;
+            };
+            draw_command(&mut layer, command, ts);
+            let Some(image) = image::RgbaImage::from_raw(width, height, layer.take()) else {
+                return;
+            };
+            let sigma = radius.max(0.0) * (ts.sx.abs() + ts.sy.abs()) / 2.0;
+            let blurred = image::imageops::blur(&image, sigma);
+            let Some(size) = tiny_skia::IntSize::from_wh(width, height) else {
+                return;
+            };
+            let Some(result) = Pixmap::from_vec(blurred.into_raw(), size) else {
+                return;
+            };
+            pixmap.draw_pixmap(
+                0,
+                0,
+                result.as_ref(),
+                &tiny_skia::PixmapPaint::default(),
+                Transform::identity(),
+                None,
+            );
+        }
         DrawCommand::ClippedPath {
             segments,
             fill,
@@ -652,6 +932,28 @@ fn region_mask(
     Some(mask)
 }
 
+/// Rasterize one authored clip path to an RGBA coverage texture for GPU masking.
+pub fn rasterize_clip_mask(
+    segments: &[PathSegment],
+    width: u32,
+    height: u32,
+    scale_x: f32,
+    scale_y: f32,
+) -> Option<Vec<u8>> {
+    let mask = region_mask(
+        width,
+        height,
+        &[segments.to_vec()],
+        &[],
+        Transform::from_scale(scale_x, scale_y),
+    )?;
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+    for alpha in mask.data() {
+        rgba.extend_from_slice(&[255, 255, 255, *alpha]);
+    }
+    Some(rgba)
+}
+
 /// Rasterize `commands` (vector commands only; others are ignored) onto a
 /// transparent `px_w` x `px_h` surface, scaling packet units by `sx`/`sy`.
 /// Returns straight-alpha RGBA8, or `None` when the surface cannot be allocated.
@@ -710,6 +1012,85 @@ mod tests {
         let data = rasterize(&[&cmd], 40, 40, 1.0, 1.0).unwrap();
         assert_eq!(at(&data, 40, 20, 20), [255, 0, 0, 255]);
         assert_eq!(at(&data, 40, 5, 5)[3], 0);
+    }
+
+    #[test]
+    fn gradient_path_samples_linear_radial_and_conic_fills() {
+        let red = GradientStop {
+            offset: 0.0,
+            color: [1.0, 0.0, 0.0, 1.0],
+        };
+        let blue = GradientStop {
+            offset: 1.0,
+            color: [0.0, 0.0, 1.0, 1.0],
+        };
+        let command = |gradient| DrawCommand::GradientPath {
+            segments: rect(0.0, 0.0, 40.0, 40.0),
+            fill: None,
+            stroke: None,
+            fill_gradient: Some(gradient),
+            stroke_gradient: None,
+        };
+        let linear = rasterize(
+            &[&command(Gradient::Linear {
+                from: Vec2 { x: 0.0, y: 0.0 },
+                to: Vec2 { x: 40.0, y: 0.0 },
+                stops: vec![red.clone(), blue.clone()],
+            })],
+            40,
+            40,
+            1.0,
+            1.0,
+        )
+        .unwrap();
+        assert!(at(&linear, 40, 5, 20)[0] > at(&linear, 40, 35, 20)[0]);
+        assert!(at(&linear, 40, 35, 20)[2] > at(&linear, 40, 5, 20)[2]);
+
+        let radial = rasterize(
+            &[&command(Gradient::Radial {
+                center: Vec2 { x: 20.0, y: 20.0 },
+                radius: 20.0,
+                stops: vec![red.clone(), blue.clone()],
+            })],
+            40,
+            40,
+            1.0,
+            1.0,
+        )
+        .unwrap();
+        assert!(at(&radial, 40, 20, 20)[0] > at(&radial, 40, 35, 20)[0]);
+        assert!(at(&radial, 40, 35, 20)[2] > at(&radial, 40, 20, 20)[2]);
+
+        let conic = rasterize(
+            &[&command(Gradient::Conic {
+                center: Vec2 { x: 20.0, y: 20.0 },
+                angle: 0.0,
+                stops: vec![red, blue],
+            })],
+            40,
+            40,
+            1.0,
+            1.0,
+        )
+        .unwrap();
+        assert!(at(&conic, 40, 20, 5)[0] > at(&conic, 40, 5, 20)[0]);
+        assert!(at(&conic, 40, 5, 20)[2] > at(&conic, 40, 20, 5)[2]);
+    }
+
+    #[test]
+    fn noise_pattern_path_overlays_only_inside_its_shape() {
+        let command = DrawCommand::PatternPath {
+            segments: rect(5.0, 5.0, 20.0, 20.0),
+            pattern: FillPattern::Noise {
+                scale: 2.0,
+                alpha: 0.8,
+                color: [1.0, 0.0, 0.0, 1.0],
+            },
+            opacity: 1.0,
+        };
+        let data = rasterize(&[&command], 30, 30, 1.0, 1.0).unwrap();
+        assert_eq!(at(&data, 30, 2, 2)[3], 0);
+        assert!((6..24).any(|y| (6..24).any(|x| at(&data, 30, x, y)[3] > 0)));
     }
 
     #[test]

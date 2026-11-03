@@ -21,7 +21,8 @@ use crate::atlas;
 use crate::mappers::learning::shape::parse_path_data;
 use crate::mappers::learning::Xf;
 use crate::packet::{
-    DrawCommand, GameRenderPacket, LineCap, LineJoin, PathSegment, Rect, Stroke, TextAlign, Vec2,
+    DrawCommand, FillPattern, GameRenderPacket, Gradient, GradientStop, LineCap, LineJoin,
+    PathSegment, Rect, Stroke, TextAlign, Vec2,
 };
 use crate::projector::{Anchor, Projection, Projector, ScenePos, TILE_WIDTH};
 use serde_json::Value;
@@ -32,6 +33,8 @@ const NS: &str = "almadar::game_renderer::mapper";
 
 /// `isometric.ts` BACKGROUND_FALLBACK_COLOR (`#1a1a2e`).
 const BACKGROUND_FALLBACK: [f32; 4] = [26.0 / 255.0, 26.0 / 255.0, 46.0 / 255.0, 1.0];
+const SPRITE_FALLBACK_FILL: [f32; 4] = [155.0 / 255.0, 143.0 / 255.0, 127.0 / 255.0, 1.0];
+const SPRITE_FALLBACK_STROKE: [f32; 4] = [94.0 / 255.0, 86.0 / 255.0, 75.0 / 255.0, 1.0];
 
 /// Segments used to approximate an ellipse fill with a polygon fan.
 const ELLIPSE_SEGMENTS: usize = 24;
@@ -156,20 +159,14 @@ pub fn from_props_at(props: &Value, epoch_now_ms: f64) -> GameRenderPacket {
     let mut draw_commands = Vec::new();
 
     // Background — drawn pre-camera (Canvas2D 359-383).
-    match props.get("backgroundImage") {
-        Some(bg) if !bg.is_null() => {
-            if let Some(cmd) = background_sprite(bg, width, height) {
-                draw_commands.push(cmd);
-            }
-        }
-        _ => {
-            let color = props
-                .get("bgColor")
-                .and_then(Value::as_str)
-                .and_then(parse_css_color)
-                .unwrap_or(BACKGROUND_FALLBACK);
-            draw_commands.push(DrawCommand::Clear { color });
-        }
+    let color = props
+        .get("bgColor")
+        .and_then(Value::as_str)
+        .and_then(parse_css_color)
+        .unwrap_or(BACKGROUND_FALLBACK);
+    draw_commands.push(DrawCommand::Clear { color });
+    if let Some(bg) = props.get("backgroundImage").filter(|bg| !bg.is_null()) {
+        draw_commands.extend(background_sprites(bg, width, height, cam));
     }
 
     for node in &drawables {
@@ -211,6 +208,8 @@ pub enum CanvasSceneError {
     UnsupportedMode(String),
     #[error("`{0}` has nothing the Rust renderer can draw")]
     NothingToDraw(String),
+    #[error("3D canvas contract is unsupported: {0}")]
+    Unsupported3DContract(String),
 }
 
 /// Build a display-list packet from a `canvas` / `canvas-2d` render-ui node.
@@ -296,7 +295,7 @@ fn canvas_node_props(node: &Value) -> Result<serde_json::Map<String, Value>, Can
 
 /// `UISlotRenderer.toDrawableNodes`: each object child becomes its fields
 /// (nested `props` when present, else the flat siblings) plus its `type`.
-fn to_drawable_nodes(children: &Value) -> Vec<Value> {
+pub(crate) fn to_drawable_nodes(children: &Value) -> Vec<Value> {
     let list: Vec<&Value> = match children {
         Value::Array(items) => items.iter().collect(),
         other => vec![other],
@@ -333,17 +332,24 @@ fn walk(
     out: &mut Vec<DrawCommand>,
 ) {
     match node.get("type").and_then(Value::as_str) {
-        Some("draw-sprite") => paint_sprite(node, projector, to_screen, zoom, out),
-        Some("draw-shape") => paint_shape(node, projector, to_screen, zoom, out),
+        Some("draw-sprite") => paint_sprite(node, projector, to_screen, zoom, epoch_now_ms, out),
+        Some("draw-shape") => paint_shape(node, projector, to_screen, zoom, epoch_now_ms, out),
         Some("draw-text") => paint_text(node, projector, to_screen, zoom, out),
+        Some("draw-skinned-mesh") => {
+            match super::skinned_mesh_2d::paint(node, projector, to_screen) {
+                Ok(Some(commands)) => out.extend(commands),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(target: NS, %error, "draw-skinned-mesh skipped"),
+            }
+        }
         Some("draw-sprite-layer") => {
             for item in items(node) {
-                paint_sprite(item, projector, to_screen, zoom, out);
+                paint_sprite(item, projector, to_screen, zoom, epoch_now_ms, out);
             }
         }
         Some("draw-shape-layer") => {
             for item in items(node) {
-                paint_shape(item, projector, to_screen, zoom, out);
+                paint_shape(item, projector, to_screen, zoom, epoch_now_ms, out);
             }
         }
         Some("draw-text-layer") => {
@@ -432,12 +438,43 @@ fn items(node: &Value) -> &[Value] {
 /// A live world FX layer needs the host's paint clock even when no authored
 /// packet keyframe animation is present.
 pub fn has_active_fx(node: &Value) -> bool {
+    let animated_sprite = |sprite: &Value| {
+        sprite.get("animation").and_then(Value::as_str).is_some()
+            && sprite
+                .get("asset")
+                .and_then(|asset| asset.get("atlas"))
+                .and_then(Value::as_str)
+                .is_some()
+    };
+    if node.get("type").and_then(Value::as_str) == Some("draw-sprite") && animated_sprite(node) {
+        return true;
+    }
+    if node.get("type").and_then(Value::as_str) == Some("draw-sprite-layer")
+        && items(node).iter().any(animated_sprite)
+    {
+        return true;
+    }
     if node.get("type").and_then(Value::as_str) == Some("draw-fx-layer")
         && node
             .get("items")
             .and_then(Value::as_array)
             .is_some_and(|items| !items.is_empty())
     {
+        return true;
+    }
+    if matches!(
+        node.get("type").and_then(Value::as_str),
+        Some("draw-shape" | "draw-group")
+    ) && node.get("animation").is_some_and(|animation| {
+        animation
+            .get("durationMs")
+            .and_then(Value::as_f64)
+            .is_some_and(|v| v > 0.0)
+            && animation
+                .get("keyframes")
+                .and_then(Value::as_array)
+                .is_some_and(|v| !v.is_empty())
+    }) {
         return true;
     }
     ["props", "drawables", "children", "items"]
@@ -462,28 +499,29 @@ fn paint_group(
         gap_once("group-position", "draw-group without position");
         return;
     };
-    if node
-        .get("clip")
-        .and_then(Value::as_str)
-        .is_some_and(|clip| !clip.is_empty())
-        || node.get("animation").is_some_and(|value| !value.is_null())
-    {
-        gap_once(
-            "group-transform",
-            "draw-group clip/animation needs a scoped Canvas packet command",
-        );
-        return;
-    }
     let (gx, gy) = projector.project(position);
     let (zero_x, zero_y) = to_screen(0.0, 0.0);
-    let (group_x, group_y) = to_screen(gx, gy);
+    let animation = (epoch_now_ms > 0.0)
+        .then(|| node.get("animation"))
+        .flatten();
+    let animated_number = |key: &str, default: f32| {
+        animation
+            .and_then(|animation| crate::animate::drawable_track(animation, epoch_now_ms, key))
+            .and_then(|value| value.as_f64())
+            .map(|value| value as f32)
+            .unwrap_or(default)
+    };
+    let (group_x, group_y) = to_screen(
+        gx + animated_number("offsetX", 0.0) * projector.tile_width,
+        gy + animated_number("offsetY", 0.0) * projector.tile_width,
+    );
     let rotation_z = node
         .get("rotation")
         .and_then(Value::as_array)
         .and_then(|angles| angles.get(2))
         .and_then(Value::as_f64)
         .unwrap_or(0.0) as f32;
-    let radians = get_f32(node, "rotate", 0.0) + rotation_z;
+    let radians = get_f32(node, "rotate", 0.0) + rotation_z + animated_number("rotateZ", 0.0);
     let start = out.len();
     for child in items(node) {
         walk(child, projector, to_screen, zoom, epoch_now_ms, out);
@@ -500,6 +538,29 @@ fn paint_group(
         );
         return;
     }
+    if let Some(clip) = node
+        .get("clip")
+        .and_then(Value::as_str)
+        .filter(|clip| !clip.is_empty())
+    {
+        let Some(segments) = parse_path_data(
+            clip,
+            Xf {
+                s: projector.tile_width * zoom,
+                ox: zero_x,
+                oy: zero_y,
+            },
+        ) else {
+            out.truncate(start);
+            gap_once("group-clip-path", "malformed draw-group SVG clip path");
+            return;
+        };
+        let commands = out.drain(start..).collect();
+        out.push(DrawCommand::ClipGroup {
+            clip: segments,
+            commands,
+        });
+    }
     crate::animate::transform_group_commands(
         &mut out[start..],
         Vec2 {
@@ -510,9 +571,9 @@ fn paint_group(
             x: group_x - zero_x,
             y: group_y - zero_y,
         },
-        get_f32(node, "scale", 1.0),
+        get_f32(node, "scale", 1.0) * animated_number("scale", 1.0),
         radians,
-        get_f32(node, "opacity", 1.0),
+        get_f32(node, "opacity", 1.0) * animated_number("opacity", 1.0),
     );
 }
 
@@ -641,7 +702,10 @@ fn collect_positions_from(node: &Value, origin: ScenePos, sink: &mut dyn FnMut(S
         y: p.y + origin.y,
     };
     match node.get("type").and_then(Value::as_str) {
-        Some("draw-sprite") | Some("draw-shape") | Some("draw-text") => {
+        Some("draw-sprite")
+        | Some("draw-shape")
+        | Some("draw-text")
+        | Some("draw-skinned-mesh") => {
             if let Some(p) = node.get("position").and_then(parse_scene_pos) {
                 sink(add(p));
             }
@@ -670,6 +734,7 @@ fn paint_sprite(
     projector: &Projector,
     to_screen: &dyn Fn(f32, f32) -> (f32, f32),
     zoom: f32,
+    epoch_now_ms: f64,
     out: &mut Vec<DrawCommand>,
 ) {
     let Some(position) = node.get("position").and_then(parse_scene_pos) else {
@@ -683,24 +748,86 @@ fn paint_sprite(
         .or_else(|| asset.and_then(Value::as_str));
     let Some(url) = url else {
         gap_once("sprite-asset", "draw-sprite without a resolvable asset.url");
+        fallback_sprite(node, position, projector, to_screen, zoom, out);
         return;
     };
+    let _ = asset::image_info(url);
+    if asset::image_failed(url) {
+        fallback_sprite(node, position, projector, to_screen, zoom, out);
+        return;
+    }
+    if node.get("shadow").is_some_and(|shadow| !shadow.is_null()) {
+        gap_once(
+            "sprite-shadow",
+            "draw-sprite shadow needs a GPU silhouette blur pass",
+        );
+        return;
+    }
 
     // Source rect resolution order (DrawSprite.tsx 49-59): explicit frame →
     // atlas sub-rect → whole image. Unresolved = resource in-flight → skip.
     let src = if let Some(frame) = node.get("frame").and_then(parse_xywh) {
         frame
+    } else if let (Some(animation), Some(atlas_url)) = (
+        node.get("animation").and_then(Value::as_str),
+        asset.and_then(|a| a.get("atlas")).and_then(Value::as_str),
+    ) {
+        let Some(atlas) = atlas::parsed_atlas(atlas_url) else {
+            if asset::fetch_failed(atlas_url) || asset::asset_bytes(atlas_url).is_some() {
+                fallback_sprite(node, position, projector, to_screen, zoom, out);
+            }
+            return;
+        };
+        if matches!(&*atlas, atlas::ParsedAtlas::SpriteSheet(_)) {
+            let time_ms = node
+                .get("clockMs")
+                .and_then(Value::as_f64)
+                .unwrap_or(epoch_now_ms);
+            let frame = atlas::sprite_sheet_frame(
+                &atlas,
+                animation,
+                node.get("loop").and_then(Value::as_bool),
+                time_ms,
+            );
+            let Some(frame) = frame else {
+                fallback_sprite(node, position, projector, to_screen, zoom, out);
+                return;
+            };
+            frame
+        } else if let Some(sprite) = asset.and_then(|a| a.get("sprite")).and_then(Value::as_str) {
+            let Some(frame) = atlas::sub_rect_for(&atlas, sprite) else {
+                fallback_sprite(node, position, projector, to_screen, zoom, out);
+                return;
+            };
+            frame
+        } else {
+            let Some((w, h)) = asset::image_info(url) else {
+                return;
+            };
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                w: w as f32,
+                h: h as f32,
+            }
+        }
     } else if let (Some(atlas_url), Some(sprite)) = (
         asset.and_then(|a| a.get("atlas")).and_then(Value::as_str),
         asset.and_then(|a| a.get("sprite")).and_then(Value::as_str),
     ) {
         asset::ensure_asset(atlas_url);
         let Some(r) = atlas::resolve_atlas_rect(atlas_url, sprite) else {
+            if asset::fetch_failed(atlas_url) || asset::asset_bytes(atlas_url).is_some() {
+                fallback_sprite(node, position, projector, to_screen, zoom, out);
+            }
             return;
         };
         r
     } else {
         let Some((w, h)) = asset::image_info(url) else {
+            if asset::image_failed(url) {
+                fallback_sprite(node, position, projector, to_screen, zoom, out);
+            }
             return;
         };
         Rect {
@@ -713,51 +840,299 @@ fn paint_sprite(
 
     // `spriteRect` (lib/drawable/contract.ts): an omitted width/height is one
     // cell on tile grids and the source's native px on world-pixel `free` boards.
+    out.push(DrawCommand::Sprite {
+        texture: url.to_string(),
+        src,
+        dst: sprite_dst(node, position, projector, to_screen, zoom, src),
+        rotation: get_f32(node, "rotation", 0.0),
+        opacity: get_f32(node, "opacity", 1.0),
+        flip_x: node.get("flipX").and_then(Value::as_bool).unwrap_or(false),
+        flip_y: false,
+    });
+}
+
+fn sprite_dst(
+    node: &Value,
+    position: ScenePos,
+    projector: &Projector,
+    to_screen: &dyn Fn(f32, f32) -> (f32, f32),
+    zoom: f32,
+    source: Rect,
+) -> Rect {
     let tw = projector.tile_width;
     let free = projector.layout == Projection::Free;
     let w = node
         .get("width")
         .and_then(Value::as_f64)
-        .map(|v| v as f32 * tw)
-        .unwrap_or(if free { src.w } else { tw });
+        .map(|value| value as f32 * tw)
+        .unwrap_or(if free { source.w } else { tw });
     let h = node
         .get("height")
         .and_then(Value::as_f64)
-        .map(|v| v as f32 * tw)
-        .unwrap_or(if free { src.h } else { tw });
-
+        .map(|value| value as f32 * tw)
+        .unwrap_or(if free { source.h } else { tw });
     let anchor = node
         .get("anchor")
         .and_then(Value::as_str)
         .and_then(Anchor::from_str)
         .unwrap_or(Anchor::TopLeft);
     let (px, py) = projector.anchor_point(position, anchor);
-    let dx = if anchor == Anchor::TopLeft {
+    let x = if anchor == Anchor::TopLeft {
         px
     } else {
         px - w / 2.0
     };
-    let dy = match anchor {
+    let y = match anchor {
         Anchor::Ground => py - h,
         Anchor::Center => py - h / 2.0,
         Anchor::TopLeft => py,
     };
+    let (x, y) = to_screen(x, y);
+    Rect {
+        x,
+        y,
+        w: w * zoom,
+        h: h * zoom,
+    }
+}
 
-    let (sx, sy) = to_screen(dx, dy);
-    out.push(DrawCommand::Sprite {
-        texture: url.to_string(),
-        src,
-        dst: Rect {
-            x: sx,
-            y: sy,
-            w: w * zoom,
-            h: h * zoom,
+fn fallback_sprite(
+    node: &Value,
+    position: ScenePos,
+    projector: &Projector,
+    to_screen: &dyn Fn(f32, f32) -> (f32, f32),
+    zoom: f32,
+    out: &mut Vec<DrawCommand>,
+) {
+    let dst = sprite_dst(
+        node,
+        position,
+        projector,
+        to_screen,
+        zoom,
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 32.0,
+            h: 32.0,
         },
-        rotation: get_f32(node, "rotation", 0.0),
-        opacity: get_f32(node, "opacity", 1.0),
-        flip_x: node.get("flipX").and_then(Value::as_bool).unwrap_or(false),
-        flip_y: false,
+    );
+    let opacity = get_f32(node, "opacity", 1.0);
+    let mut fill = SPRITE_FALLBACK_FILL;
+    fill[3] *= opacity;
+    out.push(DrawCommand::Quad {
+        rect: dst,
+        color: fill,
     });
+    let mut color = SPRITE_FALLBACK_STROKE;
+    color[3] *= opacity;
+    push_shape_stroke(
+        &[
+            Vec2 { x: dst.x, y: dst.y },
+            Vec2 {
+                x: dst.x + dst.w,
+                y: dst.y,
+            },
+            Vec2 {
+                x: dst.x + dst.w,
+                y: dst.y + dst.h,
+            },
+            Vec2 {
+                x: dst.x,
+                y: dst.y + dst.h,
+            },
+        ],
+        Some(Stroke {
+            color,
+            width: (projector.tile_width / 32.0).max(1.0) * zoom,
+            dash: Vec::new(),
+            dash_offset: 0.0,
+            cap: LineCap::Butt,
+            join: LineJoin::Miter,
+        }),
+        out,
+    );
+}
+
+fn animated_shape(node: &Value, epoch_now_ms: f64) -> Option<Value> {
+    if epoch_now_ms <= 0.0 {
+        return None;
+    }
+    let animation = node.get("animation")?;
+    let mut animated = node.clone();
+    let object = animated.as_object_mut()?;
+    for key in [
+        "offsetX",
+        "offsetY",
+        "rotate",
+        "opacity",
+        "radiusX",
+        "radiusY",
+        "width",
+        "height",
+        "strokeWidth",
+        "strokeDashOffset",
+        "blur",
+        "fill",
+        "stroke",
+    ] {
+        if let Some(value) = crate::animate::drawable_track(animation, epoch_now_ms, key) {
+            object.insert(key.to_owned(), value);
+        }
+    }
+    if let Some(color) = crate::animate::drawable_track(animation, epoch_now_ms, "shadow.color") {
+        let shadow = object
+            .entry("shadow")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(shadow) = shadow.as_object_mut() {
+            shadow.insert("color".into(), color);
+        }
+    }
+    if let Some(blur) = crate::animate::drawable_track(animation, epoch_now_ms, "shadow.blur") {
+        let shadow = object
+            .entry("shadow")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(shadow) = shadow.as_object_mut() {
+            shadow.insert("blur".into(), blur);
+        }
+    }
+    Some(animated)
+}
+
+fn shape_gradient(
+    source: &Value,
+    position: ScenePos,
+    projector: &Projector,
+    to_screen: &dyn Fn(f32, f32) -> (f32, f32),
+    zoom: f32,
+    opacity: f32,
+) -> Option<Gradient> {
+    let stops = source
+        .get("stops")?
+        .as_array()?
+        .iter()
+        .map(|stop| {
+            let offset = stop.get("offset")?.as_f64()? as f32;
+            let mut color = parse_css_color(stop.get("color")?.as_str()?)?;
+            color[3] *= opacity;
+            Some(GradientStop { offset, color })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if stops.is_empty() {
+        return None;
+    }
+    let (origin_x, origin_y) = projector.project(position);
+    let point = |key: &str| -> Option<Vec2> {
+        let value = source.get(key)?;
+        let x = value.get("x")?.as_f64()? as f32;
+        let y = value.get("y")?.as_f64()? as f32;
+        let (x, y) = to_screen(
+            origin_x + x * projector.tile_width,
+            origin_y + y * projector.tile_width,
+        );
+        Some(Vec2 { x, y })
+    };
+    match source.get("kind")?.as_str()? {
+        "linear" => Some(Gradient::Linear {
+            from: point("from")?,
+            to: point("to")?,
+            stops,
+        }),
+        "radial" => Some(Gradient::Radial {
+            center: point("center")?,
+            radius: source.get("radius")?.as_f64()? as f32 * projector.tile_width * zoom,
+            stops,
+        }),
+        "conic" => Some(Gradient::Conic {
+            center: point("center")?,
+            angle: source.get("angle").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+            stops,
+        }),
+        _ => None,
+    }
+}
+
+fn polygon_segments(points: &[Vec2]) -> Vec<PathSegment> {
+    let Some(first) = points.first() else {
+        return Vec::new();
+    };
+    let mut segments = vec![PathSegment::MoveTo {
+        x: first.x,
+        y: first.y,
+    }];
+    segments.extend(points.iter().skip(1).map(|point| PathSegment::LineTo {
+        x: point.x,
+        y: point.y,
+    }));
+    segments.push(PathSegment::Close);
+    segments
+}
+
+fn shape_fill_pattern(source: &Value) -> Option<FillPattern> {
+    match source.get("kind")?.as_str()? {
+        "noise" => Some(FillPattern::Noise {
+            scale: get_f32(source, "scale", 2.0),
+            alpha: get_f32(source, "alpha", 0.12),
+            color: source
+                .get("color")
+                .and_then(Value::as_str)
+                .and_then(parse_css_color)
+                .unwrap_or([0.0, 0.0, 0.0, 1.0]),
+        }),
+        "image" => Some(FillPattern::Image {
+            url: source.get("url")?.as_str()?.to_string(),
+            scale: get_f32(source, "scale", 1.0),
+        }),
+        _ => None,
+    }
+}
+
+fn push_styled_path(
+    segments: Vec<PathSegment>,
+    fill: Option<[f32; 4]>,
+    stroke: Option<Stroke>,
+    fill_gradient: Option<Gradient>,
+    stroke_gradient: Option<Gradient>,
+    pattern: Option<FillPattern>,
+    opacity: f32,
+    separate_paint: bool,
+    out: &mut Vec<DrawCommand>,
+) {
+    if pattern.is_some() || separate_paint {
+        if fill.is_some() || fill_gradient.is_some() {
+            out.push(DrawCommand::GradientPath {
+                segments: segments.clone(),
+                fill,
+                stroke: None,
+                fill_gradient,
+                stroke_gradient: None,
+            });
+        }
+        if let Some(pattern) = pattern {
+            out.push(DrawCommand::PatternPath {
+                segments: segments.clone(),
+                pattern,
+                opacity,
+            });
+        }
+        if stroke.is_some() || stroke_gradient.is_some() {
+            out.push(DrawCommand::GradientPath {
+                segments,
+                fill: None,
+                stroke,
+                fill_gradient: None,
+                stroke_gradient,
+            });
+        }
+    } else {
+        out.push(DrawCommand::GradientPath {
+            segments,
+            fill,
+            stroke,
+            fill_gradient,
+            stroke_gradient,
+        });
+    }
 }
 
 /// Project one world shape through the shared Canvas vector commands.
@@ -766,8 +1141,11 @@ fn paint_shape(
     projector: &Projector,
     to_screen: &dyn Fn(f32, f32) -> (f32, f32),
     zoom: f32,
+    epoch_now_ms: f64,
     out: &mut Vec<DrawCommand>,
 ) {
+    let animated = animated_shape(node, epoch_now_ms);
+    let node = animated.as_ref().unwrap_or(node);
     let Some(shape) = node.get("shape").and_then(Value::as_str) else {
         gap_once("shape-kind", "draw-shape without shape");
         return;
@@ -776,7 +1154,36 @@ fn paint_shape(
         gap_once("shape-position", "draw-shape without position");
         return;
     };
+    let blend_mode = node.get("blendMode").and_then(Value::as_str);
+    if blend_mode.is_some_and(|mode| !matches!(mode, "source-over" | "lighter")) {
+        gap_once(
+            "shape-blend",
+            "draw-shape blendMode needs scoped GPU compositing",
+        );
+        return;
+    }
+    let blur = get_f32(node, "blur", 0.0).max(0.0);
+    let additive = blend_mode == Some("lighter");
+    if node.get("shadow").is_some_and(|shadow| !shadow.is_null()) {
+        gap_once(
+            "shape-shadow",
+            "draw-shape shadow needs a GPU silhouette blur pass",
+        );
+        return;
+    }
     let opacity = get_f32(node, "opacity", 1.0);
+    let fill_gradient = node
+        .get("gradient")
+        .and_then(|source| shape_gradient(source, position, projector, to_screen, zoom, opacity));
+    let stroke_gradient = node
+        .get("strokeGradient")
+        .and_then(|source| shape_gradient(source, position, projector, to_screen, zoom, opacity));
+    let pattern = node.get("fillPattern").and_then(shape_fill_pattern);
+    let uses_vector_style = fill_gradient.is_some()
+        || stroke_gradient.is_some()
+        || pattern.is_some()
+        || blur > 0.0
+        || additive;
     let fill = node
         .get("fill")
         .and_then(Value::as_str)
@@ -789,6 +1196,7 @@ fn paint_shape(
         .get("stroke")
         .and_then(Value::as_str)
         .and_then(parse_css_color)
+        .or_else(|| stroke_gradient.as_ref().map(|_| [1.0, 1.0, 1.0, 1.0]))
         .map(|mut color| {
             color[3] *= opacity;
             Stroke {
@@ -809,7 +1217,7 @@ fn paint_shape(
                 join: LineJoin::Miter,
             }
         });
-    if fill.is_none() && stroke.is_none() {
+    if fill.is_none() && stroke.is_none() && fill_gradient.is_none() && pattern.is_none() {
         return;
     }
 
@@ -825,13 +1233,27 @@ fn paint_shape(
                     Vec2 { x: sx, y: sy }
                 })
                 .collect();
-            if let Some(color) = fill {
-                out.push(DrawCommand::Poly {
-                    points: points.clone(),
-                    color,
-                });
+            if uses_vector_style {
+                push_styled_path(
+                    polygon_segments(&points),
+                    fill,
+                    stroke,
+                    fill_gradient,
+                    stroke_gradient,
+                    pattern,
+                    opacity,
+                    blur > 0.0,
+                    out,
+                );
+            } else {
+                if let Some(color) = fill {
+                    out.push(DrawCommand::Poly {
+                        points: points.clone(),
+                        color,
+                    });
+                }
+                push_shape_stroke(&points, stroke, out);
             }
-            push_shape_stroke(&points, stroke, out);
         }
         "rect" => {
             let anchor = node
@@ -851,31 +1273,42 @@ fn paint_shape(
                 w: w * zoom,
                 h: h * zoom,
             };
-            if let Some(color) = fill {
-                out.push(DrawCommand::Quad { rect, color });
+            let points = [
+                Vec2 {
+                    x: rect.x,
+                    y: rect.y,
+                },
+                Vec2 {
+                    x: rect.x + rect.w,
+                    y: rect.y,
+                },
+                Vec2 {
+                    x: rect.x + rect.w,
+                    y: rect.y + rect.h,
+                },
+                Vec2 {
+                    x: rect.x,
+                    y: rect.y + rect.h,
+                },
+            ];
+            if uses_vector_style {
+                push_styled_path(
+                    polygon_segments(&points),
+                    fill,
+                    stroke,
+                    fill_gradient,
+                    stroke_gradient,
+                    pattern,
+                    opacity,
+                    blur > 0.0,
+                    out,
+                );
+            } else {
+                if let Some(color) = fill {
+                    out.push(DrawCommand::Quad { rect, color });
+                }
+                push_shape_stroke(&points, stroke, out);
             }
-            push_shape_stroke(
-                &[
-                    Vec2 {
-                        x: rect.x,
-                        y: rect.y,
-                    },
-                    Vec2 {
-                        x: rect.x + rect.w,
-                        y: rect.y,
-                    },
-                    Vec2 {
-                        x: rect.x + rect.w,
-                        y: rect.y + rect.h,
-                    },
-                    Vec2 {
-                        x: rect.x,
-                        y: rect.y + rect.h,
-                    },
-                ],
-                stroke,
-                out,
-            );
         }
         "ellipse" => {
             let anchor = node
@@ -900,30 +1333,47 @@ fn paint_shape(
                 let (sx, sy) = to_screen(cx + rx * a.cos(), cy + ry * a.sin());
                 points.push(Vec2 { x: sx, y: sy });
             }
-            if let Some(color) = fill {
-                out.push(DrawCommand::Poly { points, color });
-            }
-            if let Some(stroke) = stroke {
-                let (cx, cy) = to_screen(cx, cy);
-                out.push(DrawCommand::Path {
-                    segments: vec![
-                        PathSegment::Arc {
-                            cx,
-                            cy,
-                            rx: rx * zoom,
-                            ry: ry * zoom,
-                            start: 0.0,
-                            end: std::f32::consts::TAU,
-                        },
-                        PathSegment::Close,
-                    ],
-                    fill: None,
-                    stroke: Some(stroke),
-                });
+            let (cx, cy) = to_screen(cx, cy);
+            let arc = vec![
+                PathSegment::Arc {
+                    cx,
+                    cy,
+                    rx: rx * zoom,
+                    ry: ry * zoom,
+                    start: 0.0,
+                    end: std::f32::consts::TAU,
+                },
+                PathSegment::Close,
+            ];
+            if uses_vector_style {
+                push_styled_path(
+                    arc,
+                    fill,
+                    stroke,
+                    fill_gradient,
+                    stroke_gradient,
+                    pattern,
+                    opacity,
+                    blur > 0.0,
+                    out,
+                );
+            } else {
+                if let Some(color) = fill {
+                    out.push(DrawCommand::Poly { points, color });
+                }
+                if let Some(stroke) = stroke {
+                    out.push(DrawCommand::Path {
+                        segments: arc,
+                        fill: None,
+                        stroke: Some(stroke),
+                    });
+                }
             }
         }
         "poly" => {
             let (bx, by) = projector.project(position);
+            let offset_x = get_f32(node, "offsetX", 0.0);
+            let offset_y = get_f32(node, "offsetY", 0.0);
             let points: Vec<Vec2> = node
                 .get("points")
                 .and_then(Value::as_array)
@@ -932,19 +1382,34 @@ fn paint_shape(
                         .filter_map(|pt| {
                             let x = pt.get("x").and_then(Value::as_f64)? as f32;
                             let y = pt.get("y").and_then(Value::as_f64)? as f32;
-                            let (sx, sy) = to_screen(bx + x * tw, by + y * tw);
+                            let (sx, sy) =
+                                to_screen(bx + (offset_x + x) * tw, by + (offset_y + y) * tw);
                             Some(Vec2 { x: sx, y: sy })
                         })
                         .collect()
                 })
                 .unwrap_or_default();
-            if let Some(color) = fill {
-                out.push(DrawCommand::Poly {
-                    points: points.clone(),
-                    color,
-                });
+            if uses_vector_style {
+                push_styled_path(
+                    polygon_segments(&points),
+                    fill,
+                    stroke,
+                    fill_gradient,
+                    stroke_gradient,
+                    pattern,
+                    opacity,
+                    blur > 0.0,
+                    out,
+                );
+            } else {
+                if let Some(color) = fill {
+                    out.push(DrawCommand::Poly {
+                        points: points.clone(),
+                        color,
+                    });
+                }
+                push_shape_stroke(&points, stroke, out);
             }
-            push_shape_stroke(&points, stroke, out);
         }
         "path" => {
             let Some(d) = node.get("d").and_then(Value::as_str) else {
@@ -966,13 +1431,37 @@ fn paint_shape(
                 gap_once("shape-path-data", "malformed draw-shape SVG path");
                 return;
             };
-            out.push(DrawCommand::Path {
-                segments,
-                fill,
-                stroke,
-            });
+            if uses_vector_style {
+                push_styled_path(
+                    segments,
+                    fill,
+                    stroke,
+                    fill_gradient,
+                    stroke_gradient,
+                    pattern,
+                    opacity,
+                    blur > 0.0,
+                    out,
+                );
+            } else {
+                out.push(DrawCommand::Path {
+                    segments,
+                    fill,
+                    stroke,
+                });
+            }
         }
         _ => gap_once("shape-kind-unknown", "unknown draw-shape kind"),
+    }
+    if blur > 0.0 {
+        let filtered: Vec<_> = out
+            .drain(start..)
+            .map(|command| DrawCommand::Blurred {
+                command: Box::new(command),
+                radius: blur,
+            })
+            .collect();
+        out.extend(filtered);
     }
     let radians = get_f32(node, "rotate", 0.0);
     if radians != 0.0 {
@@ -1001,6 +1490,10 @@ fn paint_shape(
             1.0,
         );
     }
+    if additive && out.len() > start {
+        let commands = out.drain(start..).collect();
+        out.push(DrawCommand::AdditiveGroup { commands });
+    }
 }
 
 fn push_shape_stroke(points: &[Vec2], stroke: Option<Stroke>, out: &mut Vec<DrawCommand>) {
@@ -1024,51 +1517,90 @@ fn push_shape_stroke(points: &[Vec2], stroke: Option<Stroke>, out: &mut Vec<Draw
     });
 }
 
-/// Background image → cover-scaled sprite (Canvas2D 362-368). Whole-image
-/// (non-atlas) backgrounds are camera-TILED in React; that is deferred and
-/// cover-scale is used instead (logged once).
-fn background_sprite(bg: &Value, width: f32, height: f32) -> Option<DrawCommand> {
+/// Background image: atlas slices cover the viewport; whole images tile at
+/// native pixel size with the camera phase, as in the existing web painter.
+fn background_sprites(bg: &Value, width: f32, height: f32, cam: (f32, f32)) -> Vec<DrawCommand> {
     let url = match bg {
         Value::String(s) => s.as_str(),
-        Value::Object(_) => bg.get("url").and_then(Value::as_str)?,
-        _ => return None,
+        Value::Object(_) => match bg.get("url").and_then(Value::as_str) {
+            Some(url) => url,
+            None => return Vec::new(),
+        },
+        _ => return Vec::new(),
     };
-    let src = if let (Some(atlas_url), Some(sprite)) = (
+    let atlas_slice = if let (Some(atlas_url), Some(sprite)) = (
         bg.get("atlas").and_then(Value::as_str),
         bg.get("sprite").and_then(Value::as_str),
     ) {
         asset::ensure_asset(atlas_url);
-        atlas::resolve_atlas_rect(atlas_url, sprite)?
+        atlas::resolve_atlas_rect(atlas_url, sprite)
     } else {
-        gap_once(
-            "tiled-background",
-            "camera-tiled whole-image background deferred — cover-scaled",
-        );
-        let (w, h) = asset::image_info(url)?;
-        Rect {
-            x: 0.0,
-            y: 0.0,
-            w: w as f32,
-            h: h as f32,
-        }
+        None
     };
-    let k = (width / src.w).max(height / src.h);
-    let dw = src.w * k;
-    let dh = src.h * k;
-    Some(DrawCommand::Sprite {
-        texture: url.to_string(),
-        src,
-        dst: Rect {
-            x: (width - dw) / 2.0,
-            y: (height - dh) / 2.0,
-            w: dw,
-            h: dh,
-        },
-        rotation: 0.0,
-        opacity: 1.0,
-        flip_x: false,
-        flip_y: false,
-    })
+    if let Some(src) = atlas_slice {
+        if src.w <= 0.0 || src.h <= 0.0 {
+            return Vec::new();
+        }
+        let scale = (width / src.w).max(height / src.h);
+        let w = src.w * scale;
+        let h = src.h * scale;
+        return vec![DrawCommand::Sprite {
+            texture: url.to_string(),
+            src,
+            dst: Rect {
+                x: (width - w) / 2.0,
+                y: (height - h) / 2.0,
+                w,
+                h,
+            },
+            rotation: 0.0,
+            opacity: 1.0,
+            flip_x: false,
+            flip_y: false,
+        }];
+    }
+    if bg.get("atlas").is_some() && bg.get("sprite").is_some() {
+        return Vec::new();
+    }
+    let Some((image_w, image_h)) = asset::image_info(url) else {
+        return Vec::new();
+    };
+    let (image_w, image_h) = (image_w as f32, image_h as f32);
+    if image_w <= 0.0 || image_h <= 0.0 {
+        return Vec::new();
+    }
+    let src = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: image_w,
+        h: image_h,
+    };
+    let mut sprites = Vec::new();
+    let start_x = -cam.0.rem_euclid(image_w);
+    let start_y = -cam.1.rem_euclid(image_h);
+    let mut y = start_y - image_h;
+    while y < height {
+        let mut x = start_x - image_w;
+        while x < width {
+            sprites.push(DrawCommand::Sprite {
+                texture: url.to_string(),
+                src,
+                dst: Rect {
+                    x,
+                    y,
+                    w: image_w,
+                    h: image_h,
+                },
+                rotation: 0.0,
+                opacity: 1.0,
+                flip_x: false,
+                flip_y: false,
+            });
+            x += image_w;
+        }
+        y += image_h;
+    }
+    sprites
 }
 
 fn parse_scene_pos(v: &Value) -> Option<ScenePos> {
@@ -1167,6 +1699,137 @@ mod tests {
         );
         assert_eq!(parse_css_color("#ff000080").unwrap()[3], 128.0 / 255.0);
         assert!(parse_css_color("rebeccapurple").is_none());
+    }
+
+    #[test]
+    fn shape_gradients_use_shared_vector_commands_and_world_coordinates() {
+        let gradient = json!({
+            "kind": "linear", "from": {"x": 0, "y": 0}, "to": {"x": 1, "y": 0},
+            "stops": [{"offset": 0, "color": "#ff0000"}, {"offset": 1, "color": "#0000ff"}]
+        });
+        let p = packet_for(json!({
+            "projection": "free", "scale": 1.0,
+            "drawables": [
+                {"type": "draw-shape", "shape": "rect", "position": {"x": 1, "y": 1}, "width": 1, "height": 1, "gradient": gradient},
+                {"type": "draw-shape", "shape": "ellipse", "position": {"x": 2, "y": 1}, "radiusX": 0.5, "radiusY": 0.5, "gradient": gradient},
+                {"type": "draw-shape", "shape": "poly", "position": {"x": 3, "y": 1}, "points": [{"x": 0, "y": 0}, {"x": 1, "y": 0}, {"x": 0, "y": 1}], "gradient": gradient},
+                {"type": "draw-shape", "shape": "path", "position": {"x": 4, "y": 1}, "d": "M0 0 L1 0 L1 1 Z", "gradient": gradient}
+            ]
+        }));
+        let gradients: Vec<_> = p
+            .draw_commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                DrawCommand::GradientPath {
+                    fill_gradient: Some(Gradient::Linear { from, to, .. }),
+                    ..
+                } => Some((*from, *to)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gradients.len(), 4);
+        assert!((gradients[0].1.x - gradients[0].0.x - TILE_WIDTH).abs() < 0.01);
+    }
+
+    #[test]
+    fn shape_fill_pattern_paints_between_fill_and_stroke() {
+        let p = packet_for(json!({
+            "projection": "free", "scale": 1.0,
+            "drawables": [{"type": "draw-shape", "shape": "rect",
+                "position": {"x": 0, "y": 0}, "width": 1, "height": 1,
+                "fill": "#ffffff", "stroke": "#ff0000",
+                "fillPattern": {"kind": "noise", "alpha": 0.5, "color": "#000000"}}]
+        }));
+        let styles: Vec<_> = p
+            .draw_commands
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::GradientPath { fill, .. } if fill.is_some() => Some("fill"),
+                DrawCommand::PatternPath { .. } => Some("pattern"),
+                DrawCommand::GradientPath { fill, stroke, .. }
+                    if fill.is_none() && stroke.is_some() =>
+                {
+                    Some("stroke")
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(styles, ["fill", "pattern", "stroke"]);
+    }
+
+    #[test]
+    fn draw_sprite_sheet_uses_host_clock_and_authored_clock_override() {
+        let data_url = |mime: &str, data: &str| {
+            format!(
+                "data:{mime},{}",
+                data.bytes()
+                    .map(|byte| format!("%{byte:02X}"))
+                    .collect::<String>()
+            )
+        };
+        let sheet = data_url(
+            "image/svg+xml",
+            "<svg xmlns='http://www.w3.org/2000/svg' width='32' height='36'/>",
+        );
+        let manifest = data_url(
+            "application/json",
+            r#"{
+            "frameWidth": 8, "frameHeight": 12, "columns": 4,
+            "animations": {"walk": {"row": 2, "frames": 3, "frameRate": 10, "loop": true}}
+        }"#,
+        );
+        let mut scene = json!({
+            "projection": "free", "scale": 1.0,
+            "drawables": [{"type": "draw-sprite", "position": {"x": 0, "y": 0},
+                "asset": {"url": sheet, "atlas": manifest}, "animation": "walk"}]
+        });
+        assert!(has_active_fx(&scene));
+        let frame = |scene: &Value, time| {
+            from_props_at(scene, time)
+                .draw_commands
+                .into_iter()
+                .find_map(|command| match command {
+                    DrawCommand::Sprite { src, .. } => Some(src),
+                    _ => None,
+                })
+                .expect("sprite frame")
+        };
+        assert_eq!(frame(&scene, 150.0).x, 8.0);
+        scene["drawables"][0]["clockMs"] = json!(350.0);
+        scene["drawables"][0]["loop"] = json!(false);
+        let stopped = frame(&scene, 150.0);
+        assert_eq!(
+            (stopped.x, stopped.y, stopped.w, stopped.h),
+            (16.0, 24.0, 8.0, 12.0)
+        );
+        scene["drawables"][0]["loop"] = json!(true);
+        assert_eq!(frame(&scene, 150.0).x, 0.0);
+    }
+
+    #[test]
+    fn blur_is_scoped_and_unsupported_shadow_and_blend_do_not_paint_base() {
+        let scene = json!({
+            "projection": "free", "scale": 1.0,
+            "drawables": [
+                {"type": "draw-shape", "shape": "rect", "position": {"x": 0, "y": 0},
+                    "width": 1, "height": 1, "fill": "#ffffff", "blur": 4},
+                {"type": "draw-shape", "shape": "rect", "position": {"x": 1, "y": 0},
+                    "width": 1, "height": 1, "fill": "#ffffff", "blendMode": "multiply"},
+                {"type": "draw-shape", "shape": "rect", "position": {"x": 2, "y": 0},
+                    "width": 1, "height": 1, "fill": "#ffffff",
+                    "shadow": {"color": "#000000", "blur": 1}},
+                {"type": "draw-sprite", "position": {"x": 3, "y": 0},
+                    "asset": {"url": "data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%271%27%20height%3D%271%27%2F%3E"},
+                    "shadow": {"color": "#000000", "blur": 1}}
+            ]
+        });
+        let packet = packet_for(scene);
+        assert_eq!(packet.draw_commands.len(), 2);
+        assert!(matches!(packet.draw_commands[0], DrawCommand::Clear { .. }));
+        assert!(matches!(
+            packet.draw_commands[1],
+            DrawCommand::Blurred { .. }
+        ));
     }
 
     #[test]
@@ -1282,6 +1945,114 @@ mod tests {
     }
 
     #[test]
+    fn draw_poly_offsets_are_world_units_like_path_offsets() {
+        let p = packet_for(json!({
+            "projection": "free", "scale": 1.0,
+            "drawables": [{"type": "draw-shape", "shape": "poly",
+                "position": {"x": 0, "y": 0},
+                "points": [{"x": 0, "y": 0}, {"x": 1, "y": 0}, {"x": 0, "y": 1}],
+                "offsetX": 0.25, "offsetY": -0.5, "fill": "#ff0000"}]
+        }));
+        let points = p
+            .draw_commands
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Poly { points, .. } => Some(points),
+                _ => None,
+            })
+            .expect("filled polygon");
+        assert_eq!(points[0].x, 0.25 * TILE_WIDTH);
+        assert_eq!(points[0].y, -0.5 * TILE_WIDTH);
+    }
+
+    #[test]
+    fn draw_shape_animation_repaints_authored_geometry_and_color() {
+        let scene = json!({
+            "projection": "free", "scale": 1.0,
+            "drawables": [{"type": "draw-shape", "shape": "rect",
+                "position": {"x": 0, "y": 0}, "height": 1,
+                "width": 0, "fill": "#ff0000",
+                "animation": {"durationMs": 1000, "loop": false,
+                    "keyframes": [
+                        {"at": 0, "width": 0, "fill": "#ff0000"},
+                        {"at": 1, "width": 2, "fill": "#0000ff"}
+                    ]}}]
+        });
+        assert!(has_active_fx(&scene));
+        let halfway = from_props_at(&scene, 500.0);
+        let finished = from_props_at(&scene, 1500.0);
+        let quad = |packet: &GameRenderPacket| {
+            packet
+                .draw_commands
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::Quad { rect, color } => Some((*rect, *color)),
+                    _ => None,
+                })
+                .expect("animated rectangle")
+        };
+        let (half_rect, half_color) = quad(&halfway);
+        let (final_rect, final_color) = quad(&finished);
+        assert_eq!(half_rect.w, TILE_WIDTH);
+        assert_eq!(final_rect.w, 2.0 * TILE_WIDTH);
+        assert_eq!(half_color[0], 1.0);
+        assert_eq!(final_color[2], 1.0);
+    }
+
+    #[test]
+    fn unresolved_sprite_paints_the_shared_fallback_square() {
+        let scene = json!({
+            "projection": "free", "scale": 1.0,
+            "drawables": [{"type": "draw-sprite", "position": {"x": 0, "y": 0},
+                "width": 1, "height": 0.5, "opacity": 0.5}]
+        });
+        let packet = from_props(&scene);
+        let (rect, color) = packet
+            .draw_commands
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::Quad { rect, color } => Some((rect, color)),
+                _ => None,
+            })
+            .expect("missing asset fallback quad");
+        assert_eq!(rect.w, TILE_WIDTH);
+        assert_eq!(rect.h, TILE_WIDTH / 2.0);
+        assert_eq!(color[0], SPRITE_FALLBACK_FILL[0]);
+        assert_eq!(color[3], 0.5);
+        assert!(packet.draw_commands.iter().any(|command| matches!(
+            command,
+            DrawCommand::Path {
+                stroke: Some(_),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn background_color_remains_under_camera_tiled_whole_image() {
+        let background = "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2230%22%20height%3D%2210%22%2F%3E";
+        let packet = packet_for(json!({
+            "width": 60, "height": 20, "bgColor": "#112233",
+            "backgroundImage": background, "drawables": []
+        }));
+        assert!(
+            matches!(packet.draw_commands.first(), Some(DrawCommand::Clear { color }) if color[0] == 17.0 / 255.0)
+        );
+        let tiles: Vec<_> = packet
+            .draw_commands
+            .iter()
+            .filter_map(|command| match command {
+                DrawCommand::Sprite { dst, .. } => Some(dst),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tiles.len(), 9);
+        assert!(tiles.iter().all(|tile| tile.w == 30.0 && tile.h == 10.0));
+        assert_eq!(tiles[0].x, -30.0);
+        assert_eq!(tiles[0].y, -10.0);
+    }
+
+    #[test]
     fn draw_group_translates_nested_2d_items_and_multiplies_alpha() {
         let plain = packet_for(json!({
             "projection": "free", "scale": 1.0,
@@ -1314,7 +2085,40 @@ mod tests {
     }
 
     #[test]
-    fn draw_group_with_unrepresented_clip_does_not_paint_wrong_scene() {
+    fn draw_group_animation_moves_children_on_the_host_clock() {
+        let scene = json!({
+            "projection": "free", "scale": 1.0,
+            "drawables": [{"type": "draw-group", "position": {"x": 0, "y": 0},
+                "animation": {"durationMs": 1000, "loop": false,
+                    "keyframes": [
+                        {"at": 0, "offsetX": 0, "opacity": 1},
+                        {"at": 1, "offsetX": 1, "opacity": 0.5}
+                    ]},
+                "items": [{"type": "draw-shape", "shape": "rect",
+                    "position": {"x": 0, "y": 0}, "width": 1, "height": 1,
+                    "fill": "#ff0000"}]}]
+        });
+        assert!(has_active_fx(&scene));
+        let initial = from_props_at(&scene, 0.0);
+        let final_frame = from_props_at(&scene, 1000.0);
+        let quad = |packet: &GameRenderPacket| {
+            packet
+                .draw_commands
+                .iter()
+                .find_map(|command| match command {
+                    DrawCommand::Quad { rect, color } => Some((*rect, *color)),
+                    _ => None,
+                })
+                .expect("grouped rectangle")
+        };
+        let (initial_rect, _) = quad(&initial);
+        let (final_rect, final_color) = quad(&final_frame);
+        assert!((final_rect.x - initial_rect.x - TILE_WIDTH).abs() < 0.1);
+        assert_eq!(final_color[3], 0.5);
+    }
+
+    #[test]
+    fn draw_group_clip_scopes_mixed_child_commands() {
         let p = packet_for(json!({
             "projection": "free", "scale": 1.0,
             "drawables": [{"type": "draw-group", "position": {"x": 2, "y": 3},
@@ -1322,10 +2126,23 @@ mod tests {
                     "shape": "rect", "position": {"x": 0, "y": 0},
                     "width": 1, "height": 1, "fill": "#ff0000"}]}]
         }));
+        let group = p
+            .draw_commands
+            .iter()
+            .find_map(|command| match command {
+                DrawCommand::ClipGroup { clip, commands } => Some((clip, commands)),
+                _ => None,
+            })
+            .expect("scoped clip group");
+        assert!(group.0.len() >= 4);
+        assert!(group
+            .1
+            .iter()
+            .any(|command| matches!(command, DrawCommand::Quad { .. })));
         assert!(!p
             .draw_commands
             .iter()
-            .any(|cmd| matches!(cmd, DrawCommand::Quad { .. })));
+            .any(|command| matches!(command, DrawCommand::Quad { .. })));
     }
 
     #[test]
@@ -1367,6 +2184,19 @@ mod tests {
                     stroke: Some(stroke),
                     ..
                 } => Some(stroke.color[3]),
+                DrawCommand::AdditiveGroup { commands } => {
+                    commands.iter().find_map(|inner| match inner {
+                        DrawCommand::Path {
+                            stroke: Some(stroke),
+                            ..
+                        }
+                        | DrawCommand::GradientPath {
+                            stroke: Some(stroke),
+                            ..
+                        } => Some(stroke.color[3]),
+                        _ => None,
+                    })
+                }
                 _ => None,
             })
             .expect("ring stroke");
@@ -1376,10 +2206,10 @@ mod tests {
             .iter()
             .any(|cmd| matches!(cmd, DrawCommand::Text { text, .. } if text == "-2")));
         let expired = from_props_at(&props, 3000.0);
-        assert!(!expired
-            .draw_commands
-            .iter()
-            .any(|cmd| matches!(cmd, DrawCommand::Text { .. } | DrawCommand::Path { .. })));
+        assert!(!expired.draw_commands.iter().any(|cmd| matches!(
+            cmd,
+            DrawCommand::Text { .. } | DrawCommand::Path { .. } | DrawCommand::AdditiveGroup { .. }
+        )));
     }
 
     #[test]
@@ -1692,7 +2522,7 @@ mod tests {
     fn sprite_scene(projection: &str, extra: Value) -> Value {
         let mut sprite = json!({
             "type": "draw-sprite", "position": { "x": 0, "y": 0 },
-            "asset": { "url": "t://sprite.svg" },
+            "asset": { "url": "data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%2764%27%20height%3D%2764%27%2F%3E" },
             "frame": { "x": 0, "y": 0, "w": 64, "h": 64 }
         });
         if let (Some(dst), Some(src)) = (sprite.as_object_mut(), extra.as_object()) {

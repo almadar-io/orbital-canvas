@@ -4,10 +4,86 @@
 //! not elapsed and a finished animation all draw it unchanged.
 
 use crate::packet::{
-    Animation, DrawCommand, Easing, GameRenderPacket, Halo, PathSegment, Stroke, Vec2,
+    Animation, DrawCommand, Easing, FillPattern, GameRenderPacket, Gradient, Halo, PathSegment,
+    Stroke, Vec2,
 };
+use serde_json::Value;
 use std::borrow::Cow;
 use std::f32::consts::TAU;
+
+/// One authored drawable animation track at the host paint clock. Shape,
+/// group, and mesh descriptors use the same keyframe contract.
+pub fn drawable_track(animation: &Value, time_ms: f64, key: &str) -> Option<Value> {
+    let duration = animation.get("durationMs")?.as_f64()?;
+    let frames = animation.get("keyframes")?.as_array()?;
+    if !duration.is_finite() || duration <= 0.0 || frames.is_empty() {
+        return None;
+    }
+    let cycle = time_ms / duration;
+    let progress = if animation.get("loop").and_then(Value::as_bool) == Some(false) {
+        cycle.min(1.0)
+    } else {
+        cycle - cycle.floor()
+    };
+    let mut defined: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| {
+            let value = key
+                .split('.')
+                .try_fold(frame, |value, part| value.get(part))?;
+            Some((frame.get("at")?.as_f64()?, value))
+        })
+        .collect();
+    defined.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let first = defined.first()?;
+    let previous = defined.iter().rev().find(|(at, _)| *at <= progress);
+    let Some((at, value)) = previous else {
+        return Some(first.1.clone());
+    };
+    let Some((next_at, next_value)) = defined.iter().find(|(next_at, _)| *next_at > progress)
+    else {
+        return Some((*value).clone());
+    };
+    match (value.as_f64(), next_value.as_f64()) {
+        (Some(a), Some(b)) => {
+            let span = next_at - at;
+            let fraction = if span > 0.0 {
+                (progress - at) / span
+            } else {
+                1.0
+            };
+            serde_json::Number::from_f64(a + (b - a) * fraction).map(Value::Number)
+        }
+        _ => Some((*value).clone()),
+    }
+}
+
+#[cfg(test)]
+mod drawable_track_tests {
+    use super::drawable_track;
+    use serde_json::json;
+
+    #[test]
+    fn drawable_tracks_interpolate_numbers_and_hold_colors() {
+        let animation = json!({
+            "durationMs": 1000, "loop": false,
+            "keyframes": [
+                {"at": 0, "width": 0, "fill": "#ff0000", "shadow": {"blur": 1}},
+                {"at": 1, "width": 2, "fill": "#0000ff", "shadow": {"blur": 5}}
+            ]
+        });
+        assert_eq!(drawable_track(&animation, 500.0, "width"), Some(json!(1.0)));
+        assert_eq!(
+            drawable_track(&animation, 500.0, "fill"),
+            Some(json!("#ff0000"))
+        );
+        assert_eq!(
+            drawable_track(&animation, 500.0, "shadow.blur"),
+            Some(json!(3.0))
+        );
+        assert_eq!(drawable_track(&animation, 1500.0, "width"), Some(json!(2)));
+    }
+}
 
 /// The properties of one animation sampled at one time.
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -183,6 +259,47 @@ impl Xform {
         }
     }
 
+    fn gradient(&self, gradient: &Gradient) -> Gradient {
+        let stops = |stops: &[crate::packet::GradientStop]| {
+            stops
+                .iter()
+                .map(|stop| crate::packet::GradientStop {
+                    offset: stop.offset,
+                    color: self.color(stop.color),
+                })
+                .collect()
+        };
+        match gradient {
+            Gradient::Linear {
+                from,
+                to,
+                stops: colors,
+            } => Gradient::Linear {
+                from: self.point(*from),
+                to: self.point(*to),
+                stops: stops(colors),
+            },
+            Gradient::Radial {
+                center,
+                radius,
+                stops: colors,
+            } => Gradient::Radial {
+                center: self.point(*center),
+                radius: radius * self.scale,
+                stops: stops(colors),
+            },
+            Gradient::Conic {
+                center,
+                angle,
+                stops: colors,
+            } => Gradient::Conic {
+                center: self.point(*center),
+                angle: angle + self.sin.atan2(self.cos),
+                stops: stops(colors),
+            },
+        }
+    }
+
     fn segments(&self, segments: &[PathSegment]) -> Vec<PathSegment> {
         let mut out = Vec::with_capacity(segments.len());
         for seg in segments {
@@ -267,6 +384,66 @@ impl Xform {
                 segments: self.segments(segments),
                 fill: fill.map(|c| self.color(c)),
                 stroke: stroke.as_ref().map(|s| self.stroke(s)),
+            },
+            DrawCommand::GradientPath {
+                segments,
+                fill,
+                stroke,
+                fill_gradient,
+                stroke_gradient,
+            } => DrawCommand::GradientPath {
+                segments: self.segments(segments),
+                fill: fill.map(|color| self.color(color)),
+                stroke: stroke.as_ref().map(|stroke| self.stroke(stroke)),
+                fill_gradient: fill_gradient
+                    .as_ref()
+                    .map(|gradient| self.gradient(gradient)),
+                stroke_gradient: stroke_gradient
+                    .as_ref()
+                    .map(|gradient| self.gradient(gradient)),
+            },
+            DrawCommand::PatternPath {
+                segments,
+                pattern,
+                opacity,
+            } => {
+                let scale = match pattern {
+                    FillPattern::Noise {
+                        scale,
+                        alpha,
+                        color,
+                    } => FillPattern::Noise {
+                        scale: *scale / self.scale.abs().max(f32::EPSILON),
+                        alpha: *alpha,
+                        color: *color,
+                    },
+                    FillPattern::Image { url, scale } => FillPattern::Image {
+                        url: url.clone(),
+                        scale: *scale / self.scale.abs().max(f32::EPSILON),
+                    },
+                };
+                DrawCommand::PatternPath {
+                    segments: self.segments(segments),
+                    pattern: scale,
+                    opacity: *opacity * self.opacity,
+                }
+            }
+            DrawCommand::Blurred { command, radius } => DrawCommand::Blurred {
+                command: Box::new(self.command(command)),
+                radius: *radius,
+            },
+            DrawCommand::AdditiveGroup { commands } => DrawCommand::AdditiveGroup {
+                commands: commands
+                    .iter()
+                    .map(|command| self.command(command))
+                    .collect(),
+            },
+            DrawCommand::ClipGroup { clip, commands } => DrawCommand::ClipGroup {
+                clip: self.segments(clip),
+                commands: commands
+                    .iter()
+                    .map(|command| self.command(command))
+                    .collect(),
             },
             DrawCommand::ClippedPath {
                 segments,
@@ -355,6 +532,19 @@ impl Xform {
             DrawCommand::Poly { points, color } => DrawCommand::Poly {
                 points: points.iter().map(|p| self.point(*p)).collect(),
                 color: self.color(*color),
+            },
+            DrawCommand::TexturedTriangle {
+                texture,
+                points,
+                uv,
+                uv_in_pixels,
+                opacity,
+            } => DrawCommand::TexturedTriangle {
+                texture: texture.clone(),
+                points: points.map(|point| self.point(point)),
+                uv: *uv,
+                uv_in_pixels: *uv_in_pixels,
+                opacity: opacity * self.opacity,
             },
             DrawCommand::Sprite {
                 texture,

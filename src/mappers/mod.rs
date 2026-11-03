@@ -8,3 +8,4 @@ pub mod learning;
 pub mod mini_map;
 pub mod platformer_canvas;
 pub mod scene;
+pub mod skinned_mesh_2d;

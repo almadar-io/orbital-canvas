@@ -1,6 +1,6 @@
 //! GPU pipeline and offscreen rendering for [`Canvas`].
 
-use crate::packet::{DrawCommand, GameRenderPacket, MeshVertex, Rect, Vec2};
+use crate::packet::{DrawCommand, GameRenderPacket, MeshVertex, Rect, TexturedMeshVertex, Vec2};
 use crate::{Canvas, RendererError, Result};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -32,6 +32,79 @@ struct MeshGpuVertex {
     position: [f32; 3],
     color: [f32; 4],
 }
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct TexturedMeshGpuVertex {
+    position: [f32; 3],
+    uv_over_depth: [f32; 2],
+    inverse_depth: f32,
+    color: [f32; 4],
+}
+
+impl TexturedMeshGpuVertex {
+    const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: 12,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            wgpu::VertexAttribute {
+                offset: 20,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32,
+            },
+            wgpu::VertexAttribute {
+                offset: 24,
+                shader_location: 3,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+        ],
+    };
+}
+
+const TEXTURED_MESH_SHADER_SOURCE: &str = r#"
+@group(0) @binding(0) var t_diffuse: texture_2d<f32>;
+@group(0) @binding(1) var s_diffuse: sampler;
+
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) uv_over_depth: vec2<f32>,
+    @location(2) inverse_depth: f32,
+    @location(3) color: vec4<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv_over_depth: vec2<f32>,
+    @location(1) inverse_depth: f32,
+    @location(2) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(in: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    out.clip_position = vec4<f32>(in.position, 1.0);
+    out.uv_over_depth = in.uv_over_depth;
+    out.inverse_depth = in.inverse_depth;
+    out.color = in.color;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let uv = in.uv_over_depth / in.inverse_depth;
+    return textureSample(t_diffuse, s_diffuse, uv) * in.color;
+}
+"#;
 
 impl MeshGpuVertex {
     const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
@@ -94,6 +167,57 @@ fn build_mesh_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wg
             module: &shader,
             entry_point: Some("vs_main"),
             buffers: &[MeshGpuVertex::LAYOUT],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    })
+}
+
+fn build_textured_mesh_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    texture_layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("game textured mesh shader"),
+        source: wgpu::ShaderSource::Wgsl(TEXTURED_MESH_SHADER_SOURCE.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("game textured mesh pipeline layout"),
+        bind_group_layouts: &[texture_layout],
+        push_constant_ranges: &[],
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("game textured mesh pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[TexturedMeshGpuVertex::LAYOUT],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -285,6 +409,82 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+const MASKED_SPRITE_SHADER_SOURCE: &str = r#"
+struct VertexInput {
+    @location(0) position: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+};
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+@vertex
+fn vs_main(in: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
+    out.uv = in.uv;
+    return out;
+}
+@group(0) @binding(0) var t_content: texture_2d<f32>;
+@group(0) @binding(1) var t_mask: texture_2d<f32>;
+@group(0) @binding(2) var s_surface: sampler;
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let content = textureSample(t_content, s_surface, in.uv);
+    let coverage = textureSample(t_mask, s_surface, in.uv).a;
+    let rgb = select(vec3<f32>(0.0), content.rgb / max(content.a, 0.000001), content.a > 0.0);
+    return vec4<f32>(rgb, content.a * coverage);
+}
+"#;
+
+fn textured_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    layout: &wgpu::BindGroupLayout,
+    source: &str,
+    blend: wgpu::BlendState,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("game textured shader"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("game textured pipeline layout"),
+        bind_group_layouts: &[layout],
+        push_constant_ranges: &[],
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("game textured pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[SpriteVertex::LAYOUT],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    })
+}
+
 /// Build the textured-sprite pipeline + its texture/sampler bind-group layout.
 fn build_sprite_pipeline(
     device: &wgpu::Device,
@@ -312,51 +512,50 @@ fn build_sprite_pipeline(
         ],
     });
 
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("game sprite shader"),
-        source: wgpu::ShaderSource::Wgsl(SPRITE_SHADER_SOURCE.into()),
-    });
+    let pipeline = textured_pipeline(
+        device,
+        format,
+        &layout,
+        SPRITE_SHADER_SOURCE,
+        wgpu::BlendState::ALPHA_BLENDING,
+    );
+    (pipeline, layout)
+}
 
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("game sprite pipeline layout"),
-        bind_group_layouts: &[&layout],
-        push_constant_ranges: &[],
-    });
-
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("game sprite pipeline"),
-        layout: Some(&pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            buffers: &[SpriteVertex::LAYOUT],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+fn build_masked_sprite_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+    let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
         },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
-            polygon_mode: wgpu::PolygonMode::Fill,
-            unclipped_depth: false,
-            conservative: false,
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview: None,
-        cache: None,
+        count: None,
+    };
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("game masked sprite layout"),
+        entries: &[
+            texture_entry(0),
+            texture_entry(1),
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
     });
-
+    let pipeline = textured_pipeline(
+        device,
+        format,
+        &layout,
+        MASKED_SPRITE_SHADER_SOURCE,
+        wgpu::BlendState::ALPHA_BLENDING,
+    );
     (pipeline, layout)
 }
 
@@ -376,6 +575,7 @@ struct GpuSprite {
     width: u32,
     height: u32,
     bind_group: wgpu::BindGroup,
+    repeat_bind_group: wgpu::BindGroup,
     /// Value of `SharedDeviceRenderer::use_clock` at the last draw request;
     /// orders eviction (smallest = least recently used).
     last_used: u64,
@@ -385,8 +585,17 @@ struct GpuSprite {
 enum Draw {
     Quads(Vec<Vertex>),
     Mesh3D(Vec<MeshGpuVertex>),
+    TexturedMesh3D {
+        key: SpriteKey,
+        verts: Vec<TexturedMeshGpuVertex>,
+    },
     Sprite {
         key: SpriteKey,
+        verts: Vec<SpriteVertex>,
+        additive: bool,
+    },
+    MaskedSprite {
+        bind_group: wgpu::BindGroup,
         verts: [SpriteVertex; 6],
     },
 }
@@ -416,15 +625,21 @@ pub struct SharedDeviceRenderer {
     queue: Arc<wgpu::Queue>,
     pipeline: wgpu::RenderPipeline,
     mesh_pipeline: wgpu::RenderPipeline,
+    textured_mesh_pipeline: wgpu::RenderPipeline,
     sprite_pipeline: wgpu::RenderPipeline,
+    additive_sprite_pipeline: wgpu::RenderPipeline,
     sprite_layout: wgpu::BindGroupLayout,
+    masked_sprite_pipeline: wgpu::RenderPipeline,
+    masked_sprite_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    repeat_sampler: wgpu::Sampler,
     sprites: std::collections::HashMap<SpriteKey, GpuSprite>,
     /// Bumped on every sprite request; stamps `GpuSprite::last_used`.
     use_clock: u64,
     /// `use_clock` when the current frame began: sprites stamped after it are
     /// referenced by this frame's draw list and must not be evicted.
     frame_epoch: u64,
+    render_depth: usize,
 }
 
 impl SharedDeviceRenderer {
@@ -438,8 +653,37 @@ impl SharedDeviceRenderer {
         let pipeline = build_pipeline(&device, format);
         let mesh_pipeline = build_mesh_pipeline(&device, format);
         let (sprite_pipeline, sprite_layout) = build_sprite_pipeline(&device, format);
+        let additive_sprite_pipeline = textured_pipeline(
+            &device,
+            format,
+            &sprite_layout,
+            SPRITE_SHADER_SOURCE,
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
+        );
+        let textured_mesh_pipeline = build_textured_mesh_pipeline(&device, format, &sprite_layout);
+        let (masked_sprite_pipeline, masked_sprite_layout) =
+            build_masked_sprite_pipeline(&device, format);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("game sprite sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let repeat_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("game mesh repeat sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
@@ -450,12 +694,18 @@ impl SharedDeviceRenderer {
             queue,
             pipeline,
             mesh_pipeline,
+            textured_mesh_pipeline,
             sprite_pipeline,
+            additive_sprite_pipeline,
             sprite_layout,
+            masked_sprite_pipeline,
+            masked_sprite_layout,
             sampler,
+            repeat_sampler,
             sprites: std::collections::HashMap::new(),
             use_clock: 0,
             frame_epoch: 0,
+            render_depth: 0,
         }
     }
 
@@ -574,6 +824,20 @@ impl SharedDeviceRenderer {
                 },
             ],
         });
+        let repeat_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("game textured mesh bind group"),
+            layout: &self.sprite_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.repeat_sampler),
+                },
+            ],
+        });
         tracing::info!(target: "almadar::game_renderer", url, width, height, sheet_w = sheet.0, sheet_h = sheet.1, "sprite uploaded");
         if key.raster.is_some() {
             self.evict_stale_svg_rasters(url);
@@ -584,6 +848,7 @@ impl SharedDeviceRenderer {
                 width: sheet.0,
                 height: sheet.1,
                 bind_group,
+                repeat_bind_group,
                 last_used: now,
             },
         );
@@ -600,6 +865,17 @@ impl SharedDeviceRenderer {
         target: &wgpu::Texture,
         draws: &mut Vec<Draw>,
     ) {
+        self.flush_vector_run_with_blend(run, packet, target, draws, false);
+    }
+
+    fn flush_vector_run_with_blend(
+        &mut self,
+        run: &mut Vec<&DrawCommand>,
+        packet: &GameRenderPacket,
+        target: &wgpu::Texture,
+        draws: &mut Vec<Draw>,
+        additive: bool,
+    ) {
         if run.is_empty() {
             return;
         }
@@ -612,8 +888,18 @@ impl SharedDeviceRenderer {
             return;
         }
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        // A host face added since the layer was drawn changes how its text shapes.
-        std::hash::Hash::hash(&crate::vector::font_generation(), &mut hasher);
+        if commands
+            .iter()
+            .any(|command| crate::vector::uses_text(command))
+        {
+            std::hash::Hash::hash(&crate::vector::font_generation(), &mut hasher);
+        }
+        if commands
+            .iter()
+            .any(|command| crate::vector::uses_image_pattern(command))
+        {
+            std::hash::Hash::hash(&crate::asset::generation(), &mut hasher);
+        }
         for command in &commands {
             match serde_json::to_string(command) {
                 Ok(json) => std::hash::Hash::hash(&json, &mut hasher),
@@ -669,7 +955,11 @@ impl SharedDeviceRenderer {
             width,
             height,
         );
-        draws.push(Draw::Sprite { key, verts });
+        draws.push(Draw::Sprite {
+            key,
+            verts: verts.to_vec(),
+            additive,
+        });
     }
 
     fn evict_stale_vector_layers(&mut self) {
@@ -708,8 +998,7 @@ impl SharedDeviceRenderer {
             .count()
     }
 
-    /// Upload straight-alpha RGBA8 as a sampled texture with its bind group.
-    fn upload_rgba(&self, rgba: &[u8], width: u32, height: u32, now: u64) -> GpuSprite {
+    fn upload_rgba_texture(&self, rgba: &[u8], width: u32, height: u32) -> wgpu::Texture {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("game vector layer"),
             size: wgpu::Extent3d {
@@ -743,6 +1032,12 @@ impl SharedDeviceRenderer {
                 depth_or_array_layers: 1,
             },
         );
+        texture
+    }
+
+    /// Upload straight-alpha RGBA8 as a sampled texture with its bind group.
+    fn upload_rgba(&self, rgba: &[u8], width: u32, height: u32, now: u64) -> GpuSprite {
+        let texture = self.upload_rgba_texture(rgba, width, height);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("game vector layer bind group"),
@@ -758,10 +1053,25 @@ impl SharedDeviceRenderer {
                 },
             ],
         });
+        let repeat_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("game vector repeat bind group"),
+            layout: &self.sprite_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.repeat_sampler),
+                },
+            ],
+        });
         GpuSprite {
             width,
             height,
             bind_group,
+            repeat_bind_group,
             last_used: now,
         }
     }
@@ -809,12 +1119,94 @@ impl SharedDeviceRenderer {
     /// [`Self::new`]. Draw commands execute in packet order (z-order); quads
     /// batch between sprites. Returns `false` when nothing drawable was
     /// emitted (the target is still cleared).
+    fn masked_group_draw(
+        &mut self,
+        packet: &GameRenderPacket,
+        target: &wgpu::Texture,
+        clip: &[crate::packet::PathSegment],
+        commands: &[DrawCommand],
+    ) -> Option<Draw> {
+        let (tw, th) = (target.width(), target.height());
+        if tw > self.device.limits().max_texture_dimension_2d
+            || th > self.device.limits().max_texture_dimension_2d
+        {
+            return None;
+        }
+        let sx = tw as f32 / packet.width.max(1.0);
+        let sy = th as f32 / packet.height.max(1.0);
+        let mask = crate::vector::rasterize_clip_mask(clip, tw, th, sx, sy)?;
+        let layer = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("game clipped group surface"),
+            size: wgpu::Extent3d {
+                width: tw,
+                height: th,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: target.format(),
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let child = GameRenderPacket {
+            pattern: packet.pattern.clone(),
+            width: packet.width,
+            height: packet.height,
+            draw_commands: commands.to_vec(),
+            ..GameRenderPacket::default()
+        };
+        if !self.render_packet_to_texture(&child, &layer) {
+            return None;
+        }
+        let mask_texture = self.upload_rgba_texture(&mask, tw, th);
+        let layer_view = layer.create_view(&wgpu::TextureViewDescriptor::default());
+        let mask_view = mask_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("game clipped group bind group"),
+            layout: &self.masked_sprite_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&layer_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&mask_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        let width = packet.width.max(1.0) as u32;
+        let height = packet.height.max(1.0) as u32;
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: tw as f32,
+            h: th as f32,
+        };
+        let dst = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: width as f32,
+            h: height as f32,
+        };
+        let verts = sprite_vertices(&rect, &dst, tw, th, 0.0, 1.0, false, false, width, height);
+        Some(Draw::MaskedSprite { bind_group, verts })
+    }
+
     pub fn render_packet_to_texture(
         &mut self,
         packet: &GameRenderPacket,
         target: &wgpu::Texture,
     ) -> bool {
-        self.frame_epoch = self.use_clock;
+        if self.render_depth == 0 {
+            self.frame_epoch = self.use_clock;
+        }
+        self.render_depth += 1;
         let width = packet.width.max(1.0) as u32;
         let height = packet.height.max(1.0) as u32;
         let density = target.width() as f32 / packet.width.max(1.0);
@@ -864,7 +1256,39 @@ impl SharedDeviceRenderer {
                         draws.push(Draw::Mesh3D(vertices));
                     }
                 }
+                DrawCommand::TexturedMesh3D { texture, vertices } => {
+                    self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
+                    let Some((sheet_w, sheet_h)) = crate::asset::image_info(texture) else {
+                        continue;
+                    };
+                    let mut target_scale = density;
+                    for triangle in vertices.chunks_exact(3) {
+                        for i in 0..3 {
+                            let j = (i + 1) % 3;
+                            let dst = (triangle[j].x - triangle[i].x)
+                                .hypot(triangle[j].y - triangle[i].y);
+                            let src = ((triangle[j].uv[0] - triangle[i].uv[0]) * sheet_w as f32)
+                                .hypot((triangle[j].uv[1] - triangle[i].uv[1]) * sheet_h as f32);
+                            if src > f32::EPSILON {
+                                target_scale = target_scale.max(dst * density / src);
+                            }
+                        }
+                    }
+                    let Some((key, _)) = self.ensure_sprite(texture, target_scale) else {
+                        continue;
+                    };
+                    if !quad_batch.is_empty() {
+                        draws.push(Draw::Quads(std::mem::take(&mut quad_batch)));
+                    }
+                    let verts = textured_mesh_gpu_vertices(vertices, width, height);
+                    if !verts.is_empty() {
+                        draws.push(Draw::TexturedMesh3D { key, verts });
+                    }
+                }
                 DrawCommand::Path { .. }
+                | DrawCommand::PatternPath { .. }
+                | DrawCommand::GradientPath { .. }
+                | DrawCommand::Blurred { .. }
                 | DrawCommand::ClippedPath { .. }
                 | DrawCommand::Line { .. }
                 | DrawCommand::Text { .. } => {
@@ -872,6 +1296,79 @@ impl SharedDeviceRenderer {
                         draws.push(Draw::Quads(std::mem::take(&mut quad_batch)));
                     }
                     vector_run.push(command);
+                }
+                DrawCommand::AdditiveGroup { commands } => {
+                    self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
+                    if !quad_batch.is_empty() {
+                        draws.push(Draw::Quads(std::mem::take(&mut quad_batch)));
+                    }
+                    let mut layer: Vec<&DrawCommand> = commands.iter().collect();
+                    self.flush_vector_run_with_blend(&mut layer, packet, target, &mut draws, true);
+                }
+                DrawCommand::ClipGroup { clip, commands } => {
+                    self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
+                    if !quad_batch.is_empty() {
+                        draws.push(Draw::Quads(std::mem::take(&mut quad_batch)));
+                    }
+                    if let Some(draw) = self.masked_group_draw(packet, target, clip, commands) {
+                        draws.push(draw);
+                    }
+                }
+                DrawCommand::TexturedTriangle {
+                    texture,
+                    points,
+                    uv,
+                    uv_in_pixels,
+                    opacity,
+                } => {
+                    self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
+                    let Some((sheet_w, sheet_h)) = crate::asset::image_info(texture) else {
+                        continue;
+                    };
+                    let pixel_uv = uv.map(|coords| {
+                        if *uv_in_pixels {
+                            coords
+                        } else {
+                            [coords[0] * sheet_w as f32, coords[1] * sheet_h as f32]
+                        }
+                    });
+                    let area = (pixel_uv[1][0] - pixel_uv[0][0])
+                        * (pixel_uv[2][1] - pixel_uv[0][1])
+                        - (pixel_uv[1][1] - pixel_uv[0][1]) * (pixel_uv[2][0] - pixel_uv[0][0]);
+                    if area.abs() < f32::EPSILON {
+                        continue;
+                    }
+                    let mut target_scale = density;
+                    for i in 0..3 {
+                        let j = (i + 1) % 3;
+                        let dst = (points[j].x - points[i].x).hypot(points[j].y - points[i].y);
+                        let src = (pixel_uv[j][0] - pixel_uv[i][0])
+                            .hypot(pixel_uv[j][1] - pixel_uv[i][1]);
+                        if src > f32::EPSILON {
+                            target_scale = target_scale.max(dst * density / src);
+                        }
+                    }
+                    let Some((key, sprite)) = self.ensure_sprite(texture, target_scale) else {
+                        continue;
+                    };
+                    if !quad_batch.is_empty() {
+                        draws.push(Draw::Quads(std::mem::take(&mut quad_batch)));
+                    }
+                    let verts = textured_triangle_vertices(
+                        *points,
+                        *uv,
+                        *uv_in_pixels,
+                        sprite.width,
+                        sprite.height,
+                        *opacity,
+                        width,
+                        height,
+                    );
+                    draws.push(Draw::Sprite {
+                        key,
+                        verts: verts.to_vec(),
+                        additive: false,
+                    });
                 }
                 DrawCommand::Sprite {
                     texture,
@@ -906,7 +1403,11 @@ impl SharedDeviceRenderer {
                         width,
                         height,
                     );
-                    draws.push(Draw::Sprite { key, verts });
+                    draws.push(Draw::Sprite {
+                        key,
+                        verts: verts.to_vec(),
+                        additive: false,
+                    });
                 }
                 _ => {}
             }
@@ -918,7 +1419,7 @@ impl SharedDeviceRenderer {
 
         let depth_texture = draws
             .iter()
-            .any(|draw| matches!(draw, Draw::Mesh3D(_)))
+            .any(|draw| matches!(draw, Draw::Mesh3D(_) | Draw::TexturedMesh3D { .. }))
             .then(|| {
                 self.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("game mesh depth"),
@@ -980,6 +1481,23 @@ impl SharedDeviceRenderer {
                         pass.draw(0..vertices.len() as u32, 0..1);
                         drew = true;
                     }
+                    Draw::TexturedMesh3D { key, verts } => {
+                        let Some(sprite) = self.sprites.get(key) else {
+                            continue;
+                        };
+                        let buffer =
+                            self.device
+                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: Some("game textured mesh vertices"),
+                                    contents: bytemuck::cast_slice(verts),
+                                    usage: wgpu::BufferUsages::VERTEX,
+                                });
+                        pass.set_pipeline(&self.textured_mesh_pipeline);
+                        pass.set_bind_group(0, &sprite.repeat_bind_group, &[]);
+                        pass.set_vertex_buffer(0, buffer.slice(..));
+                        pass.draw(0..verts.len() as u32, 0..1);
+                        drew = true;
+                    }
                     Draw::Quads(vertices) => {
                         let buffer =
                             self.device
@@ -993,7 +1511,11 @@ impl SharedDeviceRenderer {
                         pass.draw(0..vertices.len() as u32, 0..1);
                         drew = true;
                     }
-                    Draw::Sprite { key, verts } => {
+                    Draw::Sprite {
+                        key,
+                        verts,
+                        additive,
+                    } => {
                         let Some(sprite) = self.sprites.get(key) else {
                             continue;
                         };
@@ -1004,8 +1526,26 @@ impl SharedDeviceRenderer {
                                     contents: bytemuck::cast_slice(verts),
                                     usage: wgpu::BufferUsages::VERTEX,
                                 });
-                        pass.set_pipeline(&self.sprite_pipeline);
+                        pass.set_pipeline(if *additive {
+                            &self.additive_sprite_pipeline
+                        } else {
+                            &self.sprite_pipeline
+                        });
                         pass.set_bind_group(0, &sprite.bind_group, &[]);
+                        pass.set_vertex_buffer(0, buffer.slice(..));
+                        pass.draw(0..verts.len() as u32, 0..1);
+                        drew = true;
+                    }
+                    Draw::MaskedSprite { bind_group, verts } => {
+                        let buffer =
+                            self.device
+                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: Some("game clipped group vertices"),
+                                    contents: bytemuck::cast_slice(verts),
+                                    usage: wgpu::BufferUsages::VERTEX,
+                                });
+                        pass.set_pipeline(&self.masked_sprite_pipeline);
+                        pass.set_bind_group(0, bind_group, &[]);
                         pass.set_vertex_buffer(0, buffer.slice(..));
                         pass.draw(0..6, 0..1);
                         drew = true;
@@ -1015,6 +1555,7 @@ impl SharedDeviceRenderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+        self.render_depth -= 1;
         drew
     }
 }
@@ -1078,6 +1619,33 @@ fn sprite_vertices(
         v(corners[1], uvs[1]),
         v(corners[3], uvs[3]),
     ]
+}
+
+fn textured_triangle_vertices(
+    points: [Vec2; 3],
+    uv: [[f32; 2]; 3],
+    uv_in_pixels: bool,
+    sheet_w: u32,
+    sheet_h: u32,
+    opacity: f32,
+    target_w: u32,
+    target_h: u32,
+) -> [SpriteVertex; 3] {
+    let scale_u = if uv_in_pixels {
+        sheet_w.max(1) as f32
+    } else {
+        1.0
+    };
+    let scale_v = if uv_in_pixels {
+        sheet_h.max(1) as f32
+    } else {
+        1.0
+    };
+    std::array::from_fn(|i| SpriteVertex {
+        position: to_ndc(points[i].x, points[i].y, target_w, target_h),
+        uv: [uv[i][0] / scale_u, uv[i][1] / scale_v],
+        color: [1.0, 1.0, 1.0, opacity.clamp(0.0, 1.0)],
+    })
 }
 
 impl Canvas {
@@ -1335,6 +1903,38 @@ fn mesh_gpu_vertices(vertices: &[MeshVertex], width: u32, height: u32) -> Vec<Me
     result
 }
 
+fn textured_mesh_gpu_vertices(
+    vertices: &[TexturedMeshVertex],
+    width: u32,
+    height: u32,
+) -> Vec<TexturedMeshGpuVertex> {
+    let mut result = Vec::with_capacity(vertices.len() / 3 * 3);
+    for triangle in vertices.chunks_exact(3) {
+        if triangle.iter().any(|v| {
+            !v.x.is_finite()
+                || !v.y.is_finite()
+                || !v.z.is_finite()
+                || !(0.0..=1.0).contains(&v.z)
+                || !v.inverse_depth.is_finite()
+                || v.inverse_depth <= 0.0
+                || v.uv.iter().any(|value| !value.is_finite())
+                || v.color.iter().any(|value| !value.is_finite())
+        }) {
+            continue;
+        }
+        result.extend(triangle.iter().map(|v| {
+            let [x, y] = to_ndc(v.x, v.y, width, height);
+            TexturedMeshGpuVertex {
+                position: [x, y, v.z],
+                uv_over_depth: [v.uv[0] * v.inverse_depth, v.uv[1] * v.inverse_depth],
+                inverse_depth: v.inverse_depth,
+                color: v.color,
+            }
+        }));
+    }
+    result
+}
+
 #[cfg(test)]
 mod mesh_depth_tests {
     use super::*;
@@ -1438,6 +2038,196 @@ mod mesh_depth_tests {
         let pixels = super::svg_sprite_tests::draw(&mut renderer, &packet, 64).expect("readback");
         let painted = pixels.chunks_exact(4).filter(|pixel| pixel[3] > 0).count();
         assert!(painted > 100, "box should cover visible pixels: {painted}");
+    }
+
+    #[test]
+    fn authored_3d_canvas_scene_paints_box_pixels_on_the_gpu() {
+        let Some(mut renderer) = super::svg_sprite_tests::renderer() else {
+            return;
+        };
+        let node = serde_json::json!({
+            "type": "canvas", "mode": "3d", "backgroundColor": "#000000",
+            "camera": {"pos": {"x": 0, "y": 5, "z": 2},
+                "target": {"x": 0, "y": 0, "z": 0}, "fov": 60},
+            "drawables": [{"type": "draw-mesh", "shape": "box",
+                "position": {"x": 0, "y": 0, "z": 0},
+                "material": {"kind": "basic", "side": "double", "color": "#ff0000"}}]
+        });
+        let mapped =
+            crate::mappers::scene::map_scene(&node, Some((64.0, 64.0))).expect("authored 3D scene");
+        let pixels =
+            super::svg_sprite_tests::draw(&mut renderer, &mapped.packet, 64).expect("GPU readback");
+        let red = pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[0] > 150 && pixel[1] < 60 && pixel[2] < 60)
+            .count();
+        assert!(
+            red > 20,
+            "authored box must cover visible red pixels: {red}"
+        );
+    }
+
+    #[test]
+    fn textured_mesh_samples_authored_uvs_and_keeps_depth() {
+        let Some(mut renderer) = super::svg_sprite_tests::renderer() else {
+            return;
+        };
+        let texture = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'><rect width='2' height='4' fill='red'/><rect x='2' width='2' height='4' fill='lime'/></svg>";
+        let vertex = |x, y, z, u, v| TexturedMeshVertex {
+            x,
+            y,
+            z,
+            uv: [u, v],
+            inverse_depth: 1.0,
+            color: [1.0; 4],
+        };
+        let packet = GameRenderPacket {
+            pattern: "textured-mesh-probe".into(),
+            width: 64.0,
+            height: 64.0,
+            draw_commands: vec![
+                DrawCommand::TexturedMesh3D {
+                    texture: texture.into(),
+                    vertices: vec![
+                        vertex(8.0, 8.0, 0.2, 0.0, 0.0),
+                        vertex(56.0, 8.0, 0.2, 1.0, 0.0),
+                        vertex(56.0, 56.0, 0.2, 1.0, 1.0),
+                        vertex(8.0, 8.0, 0.2, 0.0, 0.0),
+                        vertex(56.0, 56.0, 0.2, 1.0, 1.0),
+                        vertex(8.0, 56.0, 0.2, 0.0, 1.0),
+                    ],
+                },
+                DrawCommand::Mesh3D {
+                    vertices: vec![
+                        MeshVertex {
+                            x: 8.0,
+                            y: 8.0,
+                            z: 0.8,
+                            color: [0.0, 0.0, 1.0, 1.0],
+                        },
+                        MeshVertex {
+                            x: 56.0,
+                            y: 8.0,
+                            z: 0.8,
+                            color: [0.0, 0.0, 1.0, 1.0],
+                        },
+                        MeshVertex {
+                            x: 56.0,
+                            y: 56.0,
+                            z: 0.8,
+                            color: [0.0, 0.0, 1.0, 1.0],
+                        },
+                    ],
+                },
+            ],
+            ..Default::default()
+        };
+        let pixels = super::svg_sprite_tests::draw(&mut renderer, &packet, 64).expect("readback");
+        let left = &pixels[(32 * 64 + 20) * 4..(32 * 64 + 20) * 4 + 4];
+        let right = &pixels[(32 * 64 + 44) * 4..(32 * 64 + 44) * 4 + 4];
+        assert!(
+            left[0] > 150 && left[1] < 100 && left[2] < 100,
+            "left UV: {left:?}"
+        );
+        assert!(
+            right[1] > 150 && right[0] < 100 && right[2] < 100,
+            "right UV: {right:?}"
+        );
+    }
+
+    #[test]
+    fn authored_parametric_plane_map_paints_both_texture_halves() {
+        let Some(mut renderer) = super::svg_sprite_tests::renderer() else {
+            return;
+        };
+        let texture = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'><rect width='2' height='4' fill='red'/><rect x='2' width='2' height='4' fill='lime'/></svg>";
+        let node = serde_json::json!({
+            "type": "canvas", "mode": "3d", "backgroundColor": "#000000",
+            "camera": {"pos": {"x": 0, "y": 1, "z": 4},
+                "target": {"x": 0, "y": 0, "z": 0}, "fov": 60},
+            "drawables": [{"type": "draw-mesh", "shape": "plane",
+                "width": 2, "depth": 2,
+                "position": {"x": 0, "y": 0, "z": 0},
+                "material": {"kind": "basic", "side": "double", "map": texture}}]
+        });
+        let packet =
+            crate::mappers::game_canvas_3d::from_canvas_node_in_viewport(&node, 64.0, 64.0)
+                .expect("parametric plane scene");
+        let pixels = super::svg_sprite_tests::draw(&mut renderer, &packet, 64).expect("readback");
+        let red = pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[0] > 150 && pixel[1] < 100)
+            .count();
+        let green = pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[1] > 150 && pixel[0] < 100)
+            .count();
+        assert!(
+            red > 50 && green > 50,
+            "authored plane UV map must show both halves: red={red} green={green}"
+        );
+    }
+
+    #[test]
+    fn derived_face_normals_visualize_distinct_sides_on_gpu() {
+        let Some(mut renderer) = super::svg_sprite_tests::renderer() else {
+            return;
+        };
+        let camera = crate::mappers::game_canvas_3d::Camera3D {
+            eye: [0.0, 0.0, 5.0],
+            target: [0.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0],
+            fov_y_degrees: 60.0,
+            near: 0.1,
+            far: 20.0,
+        };
+        let mut commands = Vec::new();
+        for (vertices, face) in [
+            (
+                [[-1.5, 0.0, -0.5], [-0.5, 0.0, -0.5], [-1.0, 0.0, 0.5]],
+                [0, 1, 2],
+            ),
+            (
+                [[0.5, 0.0, -0.5], [1.5, 0.0, -0.5], [1.0, 0.0, 0.5]],
+                [0, 2, 1],
+            ),
+        ] {
+            let normals = crate::mappers::game_canvas_3d::mesh_normals(&vertices, &[face])
+                .expect("authored face normal");
+            let normal = normals.faces[0];
+            let color = [
+                (normal[0] + 1.0) * 0.5,
+                (normal[1] + 1.0) * 0.5,
+                (normal[2] + 1.0) * 0.5,
+                1.0,
+            ];
+            commands.push(
+                crate::mappers::game_canvas_3d::project_polyhedron(
+                    &vertices,
+                    &[face],
+                    camera,
+                    64.0,
+                    64.0,
+                    color,
+                )
+                .expect("normal visualization projection"),
+            );
+        }
+        let packet = GameRenderPacket {
+            pattern: "mesh-normal-probe".into(),
+            width: 64.0,
+            height: 64.0,
+            draw_commands: commands,
+            ..Default::default()
+        };
+        let pixels = super::svg_sprite_tests::draw(&mut renderer, &packet, 64).expect("readback");
+        let left = &pixels[(32 * 64 + 21) * 4..(32 * 64 + 21) * 4 + 4];
+        let right = &pixels[(32 * 64 + 43) * 4..(32 * 64 + 43) * 4 + 4];
+        assert!(left[0] > 80 && left[1] < 30, "negative normal: {left:?}");
+        assert!(
+            right[0] > 80 && right[1] > 200,
+            "positive normal: {right:?}"
+        );
     }
 }
 
@@ -1545,7 +2335,7 @@ mod svg_sprite_tests {
         ))
     }
 
-    fn fixture(name: &str, contents: &[u8]) -> String {
+    pub(super) fn fixture(name: &str, contents: &[u8]) -> String {
         let dir =
             std::env::temp_dir().join(format!("orbital-canvas-svg-sprite-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tempdir");
@@ -1856,12 +2646,175 @@ mod vector_layer_tests {
     }
 
     #[test]
+    fn gpu_clip_group_masks_mixed_quad_and_vector_children() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let group = DrawCommand::ClipGroup {
+            clip: rect(0.0, 0.0, 8.0, 16.0),
+            commands: vec![
+                DrawCommand::Quad {
+                    rect: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 16.0,
+                        h: 16.0,
+                    },
+                    color: BLUE,
+                },
+                filled(2.0, RED),
+            ],
+        };
+        let Some(rgba) = draw(&mut renderer, &packet(vec![group]), 16) else {
+            return;
+        };
+        assert_eq!(px(&rgba, 16, 4, 8), [255, 0, 0, 255]);
+        assert_eq!(px(&rgba, 16, 1, 8), [0, 0, 255, 255]);
+        assert_eq!(px(&rgba, 16, 12, 8)[3], 0);
+    }
+
+    #[test]
+    fn authored_shape_pivot_and_group_stroke_width_reach_gpu_pixels() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let rotated = crate::mappers::game_canvas_2d::from_props(&serde_json::json!({
+            "width": 64, "height": 64, "scale": 1.0, "projection": "free", "bgColor": "#00000000",
+            "drawables": [{"type": "draw-shape", "shape": "rect",
+                "position": {"x": 16, "y": 16}, "width": 0.125, "height": 0.0625,
+                "fill": "#00ff00", "rotate": 1.5707963267948966,
+                "pivot": {"x": 0, "y": 0}}]
+        }));
+        let pixels = draw(&mut renderer, &rotated, 64).expect("rotated shape GPU frame");
+        assert!(
+            px(&pixels, 64, 8, 24)[1] > 200,
+            "pivot rotates fill into left side"
+        );
+        assert_eq!(
+            px(&pixels, 64, 24, 24)[3],
+            0,
+            "old unrotated area stays clear"
+        );
+
+        let stroked = crate::mappers::game_canvas_2d::from_props(&serde_json::json!({
+            "width": 64, "height": 64, "scale": 1.0, "projection": "free", "bgColor": "#00000000",
+            "drawables": [{"type": "draw-group", "position": {"x": 0, "y": 0}, "scale": 2,
+                "items": [{"type": "draw-shape", "shape": "rect",
+                    "position": {"x": 8, "y": 8}, "width": 0.0625, "height": 0.0625,
+                    "stroke": "#ff0000", "strokeWidth": 2}]}]
+        }));
+        let pixels = draw(&mut renderer, &stroked, 64).expect("group stroke GPU frame");
+        assert!(
+            px(&pixels, 64, 16, 32)[0] > 200,
+            "stroke reaches transformed edge"
+        );
+        assert_eq!(
+            px(&pixels, 64, 20, 32)[3],
+            0,
+            "group scale leaves stroke width in pixels"
+        );
+    }
+
+    #[test]
+    fn authored_shape_blur_softens_edges_on_wgpu_target() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let packet = crate::mappers::game_canvas_2d::from_props(&serde_json::json!({
+            "width": 64, "height": 64, "scale": 1.0,
+            "projection": "free", "bgColor": "#00000000",
+            "drawables": [{"type": "draw-shape", "shape": "rect",
+                "position": {"x": 16, "y": 16}, "width": 0.0625, "height": 0.0625,
+                "fill": "#ff0000", "blur": 4}]
+        }));
+        assert!(packet
+            .draw_commands
+            .iter()
+            .any(|command| matches!(command, DrawCommand::Blurred { .. })));
+        let pixels = draw(&mut renderer, &packet, 64).expect("blurred shape GPU frame");
+        assert!(
+            px(&pixels, 64, 13, 24)[3] > 0,
+            "blur reaches beyond the rect edge"
+        );
+        assert!(px(&pixels, 64, 24, 24)[0] > 150, "the center remains red");
+        assert_eq!(px(&pixels, 64, 3, 24)[3], 0, "far outside remains clear");
+    }
+
+    #[test]
+    fn authored_lighter_shapes_add_color_on_wgpu_target() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let shape = serde_json::json!({"type": "draw-shape", "shape": "rect",
+            "position": {"x": 16, "y": 16}, "width": 0.0625, "height": 0.0625,
+            "fill": "#ff0000", "opacity": 0.5, "blendMode": "lighter"});
+        let scene = |drawables| {
+            crate::mappers::game_canvas_2d::from_props(&serde_json::json!({
+                "width": 64, "height": 64, "scale": 1.0, "projection": "free",
+                "bgColor": "#00000000", "drawables": drawables,
+            }))
+        };
+        let one = draw(&mut renderer, &scene(vec![shape.clone()]), 64).unwrap();
+        let two = draw(&mut renderer, &scene(vec![shape.clone(), shape]), 64).unwrap();
+        let single = px(&one, 64, 24, 24);
+        let doubled = px(&two, 64, 24, 24);
+        assert!(
+            doubled[0] > single[0] && doubled[3] > single[3],
+            "lighter adds overlapping red and alpha: {single:?} -> {doubled:?}"
+        );
+    }
+
+    #[test]
+    fn skinned_triangle_samples_authored_uvs_on_gpu() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let mut pixels = image::RgbaImage::new(4, 4);
+        for y in 0..4 {
+            for x in 0..4 {
+                pixels.put_pixel(
+                    x,
+                    y,
+                    if x < 2 {
+                        image::Rgba([255, 0, 0, 255])
+                    } else {
+                        image::Rgba([0, 0, 255, 255])
+                    },
+                );
+            }
+        }
+        let mut png = std::io::Cursor::new(Vec::new());
+        pixels.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let texture = super::svg_sprite_tests::fixture("skinned-uv.png", png.get_ref());
+        let triangle = DrawCommand::TexturedTriangle {
+            texture,
+            points: [
+                Vec2 { x: 0.0, y: 0.0 },
+                Vec2 { x: 16.0, y: 0.0 },
+                Vec2 { x: 0.0, y: 16.0 },
+            ],
+            uv: [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            uv_in_pixels: false,
+            opacity: 1.0,
+        };
+        let Some(rgba) = draw(&mut renderer, &packet(vec![triangle]), 16) else {
+            return;
+        };
+        assert!(px(&rgba, 16, 2, 2)[0] > 200, "left UV samples red");
+        assert!(px(&rgba, 16, 10, 2)[2] > 200, "right UV samples blue");
+        assert_eq!(px(&rgba, 16, 15, 15)[3], 0, "outside mesh stays clear");
+    }
+
+    #[test]
     fn an_identical_packet_reuses_the_cached_layer_and_a_changed_one_adds_one() {
         let Some(mut r) = renderer() else { return };
         let _font = crate::vector::FONT_GENERATION_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _ = draw(&mut r, &packet(vec![filled(4.0, RED)]), 16);
+        let _ = crate::asset::asset_bytes(
+            "data:text/plain,cache-generation-must-not-change-solid-path",
+        );
         let _ = draw(&mut r, &packet(vec![filled(4.0, RED)]), 16);
         assert_eq!(r.vector_layer_count(), 1);
         let _ = draw(&mut r, &packet(vec![filled(2.0, RED)]), 16);

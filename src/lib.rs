@@ -1434,6 +1434,19 @@ mod tests {
                         stroke: Some(stroke),
                         ..
                     } => Some(stroke.color[3]),
+                    packet::DrawCommand::AdditiveGroup { commands } => {
+                        commands.iter().find_map(|inner| match inner {
+                            packet::DrawCommand::Path {
+                                stroke: Some(stroke),
+                                ..
+                            }
+                            | packet::DrawCommand::GradientPath {
+                                stroke: Some(stroke),
+                                ..
+                            } => Some(stroke.color[3]),
+                            _ => None,
+                        })
+                    }
                     _ => None,
                 })
                 .expect("ring stroke")
