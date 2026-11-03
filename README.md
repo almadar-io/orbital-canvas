@@ -9,7 +9,7 @@
 
 </div>
 
-<p align="center"><sub>Part of <a href="https://github.com/almadar-io/orb"><b>Orb</b></a>: the language where the rule is the program. <a href="https://orb.almadar.io">orb.almadar.io</a></sub></p>
+<p align="center"><sub>Part of <a href="https://github.com/almadar-io/orb"><b>Orb</b></a>: a programming language of composable state machines. <a href="https://orb.almadar.io">orb.almadar.io</a></sub></p>
 
 One GPU renderer for Rust desktop, Android and iOS, reached through a small C ABI. The server or runtime sends a JSON `GameRenderPacket` (a display list); this crate turns it into draw calls. It also rasterizes SVG sprites and vector paths and shapes text (joining, bidi, per-script fonts).
 
