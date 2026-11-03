@@ -125,8 +125,7 @@ Cargo features (all off by default): `http` (HTTP(S) asset fetching, native only
 
 ## Docs
 
-- [Orbital Canvas](https://github.com/itechdom/kflow.ai/blob/main/docs/Almadar_Orbital_Canvas.md)
-- [Execution Semantics](https://github.com/itechdom/kflow.ai/blob/main/docs/Almadar_Execution_Semantics.md)
+- [Orb documentation](https://orb.almadar.io/docs): the language, the `orb` CLI and how the pieces fit
 
 ## License
 
