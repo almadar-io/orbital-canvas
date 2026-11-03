@@ -298,6 +298,17 @@ pub fn mono_text_width(text: &str, size: f32) -> f32 {
     shape(text, size, false, true).width
 }
 
+/// The Latin face's ascent and descent in packet units. The vector text path
+/// uses this same face for its anchor, so drawable baselines can map to it.
+pub fn text_font_metrics(size: f32) -> Option<(f32, f32)> {
+    let base = face()?;
+    let scale = size / base.units_per_em() as f32;
+    Some((
+        base.ascender() as f32 * scale,
+        base.descender() as f32 * scale,
+    ))
+}
+
 fn color(c: [f32; 4]) -> tiny_skia::Color {
     tiny_skia::Color::from_rgba(
         c[0].clamp(0.0, 1.0),

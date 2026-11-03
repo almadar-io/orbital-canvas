@@ -12,13 +12,17 @@
 //! - shape paint: `DrawShape.tsx` `paintShape` (cell/rect/ellipse/poly; fills)
 //!
 //! Gaps skip + log once per kind (namespace `almadar::game_renderer::mapper`):
-//! strokes, draw-text (glyph pipeline), camera-tiled whole-image backgrounds
-//! (cover-scale used instead). Unknown drawable types skip silently — React
-//! parity (`paintDispatch`).
+//! custom text fonts/baselines, shape gradients/effects, and camera-tiled
+//! whole-image backgrounds (cover-scale used instead). Unknown drawable types
+//! skip silently — React parity (`paintDispatch`).
 
 use crate::asset;
 use crate::atlas;
-use crate::packet::{DrawCommand, GameRenderPacket, Rect, Vec2};
+use crate::mappers::learning::shape::parse_path_data;
+use crate::mappers::learning::Xf;
+use crate::packet::{
+    DrawCommand, GameRenderPacket, LineCap, LineJoin, PathSegment, Rect, Stroke, TextAlign, Vec2,
+};
 use crate::projector::{Anchor, Projection, Projector, ScenePos, TILE_WIDTH};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -60,6 +64,12 @@ fn fit_zoom(projection: Projection, w: f32, h: f32, vw: f32, vh: f32) -> f32 {
 
 /// Build a display-list packet from `canvas-2d` props (kernel-resolved).
 pub fn from_props(props: &Value) -> GameRenderPacket {
+    from_props_at(props, 0.0)
+}
+
+/// The same scene at one epoch paint instant; FX descriptors expand at this
+/// clock while `std-fx-particles` keeps the authoritative ttl/removal state.
+pub fn from_props_at(props: &Value, epoch_now_ms: f64) -> GameRenderPacket {
     let width = get_f32(props, "width", 800.0);
     let height = get_f32(props, "height", 600.0);
     let scale = get_f32(props, "scale", 0.4);
@@ -163,7 +173,14 @@ pub fn from_props(props: &Value) -> GameRenderPacket {
     }
 
     for node in &drawables {
-        walk(node, &projector, &to_screen, zoom, &mut draw_commands);
+        walk(
+            node,
+            &projector,
+            &to_screen,
+            zoom,
+            epoch_now_ms,
+            &mut draw_commands,
+        );
     }
 
     GameRenderPacket {
@@ -206,7 +223,14 @@ pub enum CanvasSceneError {
 /// `camera.pos` → `cameraPos`, `backgroundColor` → `bgColor`). The result feeds
 /// [`from_props`] — the one drawable walk. `mode: "3d"` is refused, not drawn flat.
 pub fn from_canvas_node(node: &Value) -> Result<GameRenderPacket, CanvasSceneError> {
-    canvas_node_props(node).map(|props| from_props(&Value::Object(props)))
+    from_canvas_node_at(node, 0.0)
+}
+
+pub fn from_canvas_node_at(
+    node: &Value,
+    epoch_now_ms: f64,
+) -> Result<GameRenderPacket, CanvasSceneError> {
+    canvas_node_props(node).map(|props| from_props_at(&Value::Object(props), epoch_now_ms))
 }
 
 /// [`from_canvas_node`] laid out in the host's own viewport. `Canvas2D.tsx`
@@ -218,10 +242,19 @@ pub fn from_canvas_node_in_viewport(
     width: f32,
     height: f32,
 ) -> Result<GameRenderPacket, CanvasSceneError> {
+    from_canvas_node_in_viewport_at(node, width, height, 0.0)
+}
+
+pub fn from_canvas_node_in_viewport_at(
+    node: &Value,
+    width: f32,
+    height: f32,
+    epoch_now_ms: f64,
+) -> Result<GameRenderPacket, CanvasSceneError> {
     let mut props = canvas_node_props(node)?;
     props.insert("width".into(), Value::from(width.max(1.0)));
     props.insert("height".into(), Value::from(height.max(1.0)));
-    Ok(from_props(&Value::Object(props)))
+    Ok(from_props_at(&Value::Object(props), epoch_now_ms))
 }
 
 fn canvas_node_props(node: &Value) -> Result<serde_json::Map<String, Value>, CanvasSceneError> {
@@ -296,12 +329,13 @@ fn walk(
     projector: &Projector,
     to_screen: &dyn Fn(f32, f32) -> (f32, f32),
     zoom: f32,
+    epoch_now_ms: f64,
     out: &mut Vec<DrawCommand>,
 ) {
     match node.get("type").and_then(Value::as_str) {
         Some("draw-sprite") => paint_sprite(node, projector, to_screen, zoom, out),
         Some("draw-shape") => paint_shape(node, projector, to_screen, zoom, out),
-        Some("draw-text") => gap_once("draw-text", "glyph pipeline (glyphon) deferred"),
+        Some("draw-text") => paint_text(node, projector, to_screen, zoom, out),
         Some("draw-sprite-layer") => {
             for item in items(node) {
                 paint_sprite(item, projector, to_screen, zoom, out);
@@ -312,11 +346,23 @@ fn walk(
                 paint_shape(item, projector, to_screen, zoom, out);
             }
         }
-        Some("draw-text-layer") => gap_once("draw-text", "glyph pipeline (glyphon) deferred"),
-        Some("draw-fx-layer") => gap_once(
-            "draw-fx-layer",
-            "fx expander deferred — native painter pending (docs/Almadar_Compiler_Gaps.md C-GAME-FX-LAYER)",
-        ),
+        Some("draw-text-layer") => {
+            for item in items(node) {
+                paint_text(item, projector, to_screen, zoom, out);
+            }
+        }
+        Some("draw-group") => paint_group(node, projector, to_screen, zoom, epoch_now_ms, out),
+        Some("draw-fx-layer") => {
+            for drawable in orbital_core_base::fx_projection::expand_layer(
+                node,
+                epoch_now_ms,
+                "2d",
+                Some(f64::from(projector.tile_width)),
+                None,
+            ) {
+                walk(&drawable, projector, to_screen, zoom, epoch_now_ms, out);
+            }
+        }
         _ => {} // unknown types skipped silently — React parity
     }
 }
@@ -336,7 +382,7 @@ pub fn paint_drawables(
         .iter()
         .map(|n| resolve_drawable_colors(n, resolve))
     {
-        walk(&node, projector, to_screen, zoom, &mut out);
+        walk(&node, projector, to_screen, zoom, 0.0, &mut out);
     }
     out
 }
@@ -383,19 +429,234 @@ fn items(node: &Value) -> &[Value] {
         .unwrap_or(&[])
 }
 
+/// A live world FX layer needs the host's paint clock even when no authored
+/// packet keyframe animation is present.
+pub fn has_active_fx(node: &Value) -> bool {
+    if node.get("type").and_then(Value::as_str) == Some("draw-fx-layer")
+        && node
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+    {
+        return true;
+    }
+    ["props", "drawables", "children", "items"]
+        .into_iter()
+        .filter_map(|key| node.get(key))
+        .any(|child| match child {
+            Value::Array(items) => items.iter().any(has_active_fx),
+            Value::Object(_) => has_active_fx(child),
+            _ => false,
+        })
+}
+
+fn paint_group(
+    node: &Value,
+    projector: &Projector,
+    to_screen: &dyn Fn(f32, f32) -> (f32, f32),
+    zoom: f32,
+    epoch_now_ms: f64,
+    out: &mut Vec<DrawCommand>,
+) {
+    let Some(position) = node.get("position").and_then(parse_scene_pos) else {
+        gap_once("group-position", "draw-group without position");
+        return;
+    };
+    if node
+        .get("clip")
+        .and_then(Value::as_str)
+        .is_some_and(|clip| !clip.is_empty())
+        || node.get("animation").is_some_and(|value| !value.is_null())
+    {
+        gap_once(
+            "group-transform",
+            "draw-group clip/animation needs a scoped Canvas packet command",
+        );
+        return;
+    }
+    let (gx, gy) = projector.project(position);
+    let (zero_x, zero_y) = to_screen(0.0, 0.0);
+    let (group_x, group_y) = to_screen(gx, gy);
+    let rotation_z = node
+        .get("rotation")
+        .and_then(Value::as_array)
+        .and_then(|angles| angles.get(2))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0) as f32;
+    let radians = get_f32(node, "rotate", 0.0) + rotation_z;
+    let start = out.len();
+    for child in items(node) {
+        walk(child, projector, to_screen, zoom, epoch_now_ms, out);
+    }
+    if radians != 0.0
+        && out[start..]
+            .iter()
+            .any(|cmd| matches!(cmd, DrawCommand::Text { .. }))
+    {
+        out.truncate(start);
+        gap_once(
+            "group-rotated-text",
+            "draw-group rotating text needs a vector glyph path",
+        );
+        return;
+    }
+    crate::animate::transform_group_commands(
+        &mut out[start..],
+        Vec2 {
+            x: zero_x,
+            y: zero_y,
+        },
+        Vec2 {
+            x: group_x - zero_x,
+            y: group_y - zero_y,
+        },
+        get_f32(node, "scale", 1.0),
+        radians,
+        get_f32(node, "opacity", 1.0),
+    );
+}
+
+/// The canvas's 2D text painter maps through the same vector font pipeline as
+/// other Canvas labels. Unsupported CSS fonts/baselines are reported rather
+/// than silently given a different face or anchor.
+fn paint_text(
+    node: &Value,
+    projector: &Projector,
+    to_screen: &dyn Fn(f32, f32) -> (f32, f32),
+    zoom: f32,
+    out: &mut Vec<DrawCommand>,
+) {
+    let Some(position) = node.get("position").and_then(parse_scene_pos) else {
+        gap_once("text-position", "draw-text without position");
+        return;
+    };
+    let Some(text) = node.get("text").and_then(Value::as_str) else {
+        gap_once("text-value", "draw-text without text");
+        return;
+    };
+    let Some(mut color) = node
+        .get("color")
+        .and_then(Value::as_str)
+        .and_then(parse_css_color)
+    else {
+        gap_once("text-color", "draw-text color is not a supported CSS color");
+        return;
+    };
+    let (size, weight, mono) = match parse_text_font(node.get("font").and_then(Value::as_str)) {
+        Some(font) => font,
+        None => {
+            gap_once(
+                "text-font",
+                "draw-text CSS font is not carried by the native font pack",
+            );
+            return;
+        }
+    };
+    let align = match node.get("align").and_then(Value::as_str).unwrap_or("left") {
+        "left" | "start" => TextAlign::Left,
+        "center" => TextAlign::Center,
+        "right" | "end" => TextAlign::Right,
+        _ => {
+            gap_once("text-align", "draw-text alignment is not supported");
+            return;
+        }
+    };
+    let anchor = node
+        .get("anchor")
+        .and_then(Value::as_str)
+        .and_then(Anchor::from_str)
+        .unwrap_or(Anchor::Center);
+    let (x, y) = projector.anchor_point(position, anchor);
+    let x = x + get_f32(node, "offsetX", 0.0);
+    let y = y + get_f32(node, "offsetY", 0.0);
+    let (sx, sy) = to_screen(x, y);
+    let size = size * zoom;
+    let Some((asc, desc)) = crate::vector::text_font_metrics(size) else {
+        gap_once("text-face", "native text face is unavailable");
+        return;
+    };
+    let mid = (asc + desc) / 2.0;
+    let sy = match node
+        .get("baseline")
+        .and_then(Value::as_str)
+        .unwrap_or("alphabetic")
+    {
+        "alphabetic" => sy - mid,
+        "middle" => sy,
+        "top" => sy + asc - mid,
+        "bottom" => sy + desc - mid,
+        _ => {
+            gap_once(
+                "text-baseline",
+                "draw-text baseline is not carried by the native font pack",
+            );
+            return;
+        }
+    };
+    color[3] *= get_f32(node, "opacity", 1.0);
+    out.push(DrawCommand::Text {
+        text: text.to_owned(),
+        pos: Vec2 { x: sx, y: sy },
+        size,
+        color,
+        align,
+        weight,
+        halo: None,
+        mono,
+    });
+}
+
+fn parse_text_font(font: Option<&str>) -> Option<(f32, u16, bool)> {
+    let Some(font) = font else {
+        return Some((10.0, 400, false));
+    };
+    let mut tokens = font.split_whitespace();
+    let first = tokens.next()?;
+    let (weight, size) = if first == "bold" {
+        (700, tokens.next()?)
+    } else {
+        (400, first)
+    };
+    let size = size.strip_suffix("px")?.parse::<f32>().ok()?;
+    if !size.is_finite() || size <= 0.0 {
+        return None;
+    }
+    let family = tokens.collect::<Vec<_>>().join(" ");
+    match family.as_str() {
+        "sans-serif" | "system-ui" | "system-ui, sans-serif" => Some((size, weight, false)),
+        "monospace" => Some((size, weight, true)),
+        _ => None,
+    }
+}
+
 /// Collect every drawable's scene position (atoms directly; layers via `items`)
 /// — `hitTest.collectDrawnItems`.
 fn collect_positions(node: &Value, sink: &mut dyn FnMut(ScenePos)) {
+    collect_positions_from(node, ScenePos { x: 0.0, y: 0.0 }, sink);
+}
+
+fn collect_positions_from(node: &Value, origin: ScenePos, sink: &mut dyn FnMut(ScenePos)) {
+    let add = |p: ScenePos| ScenePos {
+        x: p.x + origin.x,
+        y: p.y + origin.y,
+    };
     match node.get("type").and_then(Value::as_str) {
         Some("draw-sprite") | Some("draw-shape") | Some("draw-text") => {
             if let Some(p) = node.get("position").and_then(parse_scene_pos) {
-                sink(p);
+                sink(add(p));
             }
         }
         Some("draw-sprite-layer") | Some("draw-shape-layer") | Some("draw-text-layer") => {
             for item in items(node) {
                 if let Some(p) = item.get("position").and_then(parse_scene_pos) {
-                    sink(p);
+                    sink(add(p));
+                }
+            }
+        }
+        Some("draw-group") => {
+            if let Some(p) = node.get("position").and_then(parse_scene_pos) {
+                for item in items(node) {
+                    collect_positions_from(item, add(p), sink);
                 }
             }
         }
@@ -499,7 +760,7 @@ fn paint_sprite(
     });
 }
 
-/// `DrawShape.tsx paintShape` (fills; strokes are a logged gap).
+/// Project one world shape through the shared Canvas vector commands.
 fn paint_shape(
     node: &Value,
     projector: &Projector,
@@ -515,33 +776,62 @@ fn paint_shape(
         gap_once("shape-position", "draw-shape without position");
         return;
     };
-    if node.get("stroke").is_some() {
-        gap_once("shape-stroke", "strokes deferred — fill-only pass");
-    }
     let opacity = get_f32(node, "opacity", 1.0);
-    let Some(mut color) = node
+    let fill = node
         .get("fill")
         .and_then(Value::as_str)
         .and_then(parse_css_color)
-    else {
-        return; // fill-only pass: no fill → nothing to emit
-    };
-    color[3] *= opacity;
+        .map(|mut color| {
+            color[3] *= opacity;
+            color
+        });
+    let stroke = node
+        .get("stroke")
+        .and_then(Value::as_str)
+        .and_then(parse_css_color)
+        .map(|mut color| {
+            color[3] *= opacity;
+            Stroke {
+                color,
+                width: get_f32(node, "strokeWidth", 1.0) * zoom,
+                dash: node
+                    .get("strokeDash")
+                    .and_then(Value::as_array)
+                    .map(|dash| {
+                        dash.iter()
+                            .filter_map(Value::as_f64)
+                            .map(|length| length as f32 * zoom)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                dash_offset: get_f32(node, "strokeDashOffset", 0.0) * zoom,
+                cap: LineCap::Butt,
+                join: LineJoin::Miter,
+            }
+        });
+    if fill.is_none() && stroke.is_none() {
+        return;
+    }
 
+    let start = out.len();
     let tw = projector.tile_width;
     match shape {
         "cell" => {
             let pts = projector.cell_path(position);
-            out.push(DrawCommand::Poly {
-                points: pts
-                    .iter()
-                    .map(|&(x, y)| {
-                        let (sx, sy) = to_screen(x, y);
-                        Vec2 { x: sx, y: sy }
-                    })
-                    .collect(),
-                color,
-            });
+            let points: Vec<Vec2> = pts
+                .iter()
+                .map(|&(x, y)| {
+                    let (sx, sy) = to_screen(x, y);
+                    Vec2 { x: sx, y: sy }
+                })
+                .collect();
+            if let Some(color) = fill {
+                out.push(DrawCommand::Poly {
+                    points: points.clone(),
+                    color,
+                });
+            }
+            push_shape_stroke(&points, stroke, out);
         }
         "rect" => {
             let anchor = node
@@ -555,15 +845,37 @@ fn paint_shape(
             let w = get_f32(node, "width", 0.0) * tw;
             let h = get_f32(node, "height", 0.0) * tw;
             let (sx, sy) = to_screen(x, y);
-            out.push(DrawCommand::Quad {
-                rect: Rect {
-                    x: sx,
-                    y: sy,
-                    w: w * zoom,
-                    h: h * zoom,
-                },
-                color,
-            });
+            let rect = Rect {
+                x: sx,
+                y: sy,
+                w: w * zoom,
+                h: h * zoom,
+            };
+            if let Some(color) = fill {
+                out.push(DrawCommand::Quad { rect, color });
+            }
+            push_shape_stroke(
+                &[
+                    Vec2 {
+                        x: rect.x,
+                        y: rect.y,
+                    },
+                    Vec2 {
+                        x: rect.x + rect.w,
+                        y: rect.y,
+                    },
+                    Vec2 {
+                        x: rect.x + rect.w,
+                        y: rect.y + rect.h,
+                    },
+                    Vec2 {
+                        x: rect.x,
+                        y: rect.y + rect.h,
+                    },
+                ],
+                stroke,
+                out,
+            );
         }
         "ellipse" => {
             let anchor = node
@@ -588,7 +900,27 @@ fn paint_shape(
                 let (sx, sy) = to_screen(cx + rx * a.cos(), cy + ry * a.sin());
                 points.push(Vec2 { x: sx, y: sy });
             }
-            out.push(DrawCommand::Poly { points, color });
+            if let Some(color) = fill {
+                out.push(DrawCommand::Poly { points, color });
+            }
+            if let Some(stroke) = stroke {
+                let (cx, cy) = to_screen(cx, cy);
+                out.push(DrawCommand::Path {
+                    segments: vec![
+                        PathSegment::Arc {
+                            cx,
+                            cy,
+                            rx: rx * zoom,
+                            ry: ry * zoom,
+                            start: 0.0,
+                            end: std::f32::consts::TAU,
+                        },
+                        PathSegment::Close,
+                    ],
+                    fill: None,
+                    stroke: Some(stroke),
+                });
+            }
         }
         "poly" => {
             let (bx, by) = projector.project(position);
@@ -606,10 +938,90 @@ fn paint_shape(
                         .collect()
                 })
                 .unwrap_or_default();
-            out.push(DrawCommand::Poly { points, color });
+            if let Some(color) = fill {
+                out.push(DrawCommand::Poly {
+                    points: points.clone(),
+                    color,
+                });
+            }
+            push_shape_stroke(&points, stroke, out);
+        }
+        "path" => {
+            let Some(d) = node.get("d").and_then(Value::as_str) else {
+                gap_once("shape-path", "draw-shape path without d");
+                return;
+            };
+            let (bx, by) = projector.project(position);
+            let x = bx + get_f32(node, "offsetX", 0.0) * tw;
+            let y = by + get_f32(node, "offsetY", 0.0) * tw;
+            let (ox, oy) = to_screen(x, y);
+            let Some(segments) = parse_path_data(
+                d,
+                Xf {
+                    s: tw * zoom,
+                    ox,
+                    oy,
+                },
+            ) else {
+                gap_once("shape-path-data", "malformed draw-shape SVG path");
+                return;
+            };
+            out.push(DrawCommand::Path {
+                segments,
+                fill,
+                stroke,
+            });
         }
         _ => gap_once("shape-kind-unknown", "unknown draw-shape kind"),
     }
+    let radians = get_f32(node, "rotate", 0.0);
+    if radians != 0.0 {
+        let pivot = node.get("pivot");
+        let (origin_x, origin_y) = projector.project(position);
+        let (x, y) = to_screen(
+            origin_x
+                + pivot
+                    .and_then(|p| p.get("x"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.5) as f32
+                    * tw,
+            origin_y
+                + pivot
+                    .and_then(|p| p.get("y"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.5) as f32
+                    * tw,
+        );
+        crate::animate::transform_group_commands(
+            &mut out[start..],
+            Vec2 { x, y },
+            Vec2 { x: 0.0, y: 0.0 },
+            1.0,
+            radians,
+            1.0,
+        );
+    }
+}
+
+fn push_shape_stroke(points: &[Vec2], stroke: Option<Stroke>, out: &mut Vec<DrawCommand>) {
+    let Some(stroke) = stroke else { return };
+    let Some(first) = points.first() else { return };
+    let mut segments = vec![PathSegment::MoveTo {
+        x: first.x,
+        y: first.y,
+    }];
+    segments.extend(
+        points
+            .iter()
+            .skip(1)
+            .map(|p| PathSegment::LineTo { x: p.x, y: p.y }),
+    );
+    segments.push(PathSegment::Close);
+    out.push(DrawCommand::Path {
+        segments,
+        fill: None,
+        stroke: Some(stroke),
+    });
 }
 
 /// Background image → cover-scaled sprite (Canvas2D 362-368). Whole-image
@@ -755,6 +1167,219 @@ mod tests {
         );
         assert_eq!(parse_css_color("#ff000080").unwrap()[3], 128.0 / 255.0);
         assert!(parse_css_color("rebeccapurple").is_none());
+    }
+
+    #[test]
+    fn text_atom_and_layer_use_the_shared_vector_font_pipeline() {
+        let p = packet_for(json!({
+            "projection": "free",
+            "scale": 1.0,
+            "drawables": [
+                { "type": "draw-text", "text": "one", "position": {"x": 1, "y": 2},
+                  "color": "#ffffff", "font": "bold 14px monospace", "align": "center",
+                  "baseline": "middle", "opacity": 0.5 },
+                { "type": "draw-text-layer", "items": [
+                    { "type": "draw-text", "text": "two", "position": {"x": 2, "y": 3},
+                      "color": "#000000" }
+                ] }
+            ]
+        }));
+        let texts: Vec<_> = p
+            .draw_commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                DrawCommand::Text {
+                    text,
+                    size,
+                    color,
+                    align,
+                    weight,
+                    mono,
+                    ..
+                } => Some((text.as_str(), *size, color[3], *align, *weight, *mono)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 2);
+        assert_eq!(texts[0], ("one", 14.0, 0.5, TextAlign::Center, 700, true));
+        assert_eq!(texts[1], ("two", 10.0, 1.0, TextAlign::Left, 400, false));
+    }
+
+    #[test]
+    fn unsupported_text_font_and_baseline_do_not_silently_change_contract() {
+        let p = packet_for(json!({
+            "projection": "free",
+            "scale": 1.0,
+            "drawables": [
+                { "type": "draw-text", "text": "custom", "position": {"x": 1, "y": 2},
+                  "color": "#ffffff", "font": "12px Custom" },
+                { "type": "draw-text", "text": "hanging", "position": {"x": 1, "y": 2},
+                  "color": "#ffffff", "baseline": "hanging" }
+            ]
+        }));
+        assert!(!p
+            .draw_commands
+            .iter()
+            .any(|cmd| matches!(cmd, DrawCommand::Text { .. })));
+    }
+
+    #[test]
+    fn stroke_only_shapes_and_svg_paths_reuse_vector_primitives() {
+        let p = packet_for(json!({
+            "projection": "free",
+            "scale": 1.0,
+            "drawables": [
+                { "type": "draw-shape", "shape": "rect", "position": {"x": 1, "y": 2},
+                  "width": 1, "height": 1, "stroke": "#ff0000", "strokeWidth": 3,
+                  "strokeDash": [4, 2], "strokeDashOffset": 1 },
+                { "type": "draw-shape", "shape": "path", "position": {"x": 2, "y": 3},
+                  "d": "M0 0 L1 0 L1 1 Z", "fill": "#00ff00", "stroke": "#0000ff" }
+            ]
+        }));
+        let paths: Vec<_> = p
+            .draw_commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                DrawCommand::Path {
+                    segments,
+                    fill,
+                    stroke,
+                } => Some((segments, fill, stroke)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].1.is_none());
+        let rect_stroke = paths[0].2.as_ref().expect("rect stroke");
+        assert_eq!(rect_stroke.width, 3.0);
+        assert_eq!(rect_stroke.dash, vec![4.0, 2.0]);
+        assert_eq!(rect_stroke.dash_offset, 1.0);
+        assert!(matches!(paths[0].0.last(), Some(PathSegment::Close)));
+        assert_eq!(paths[1].1.expect("path fill")[1], 1.0);
+        assert!(paths[1].2.is_some());
+        assert!(paths[1].0.len() >= 4);
+    }
+
+    #[test]
+    fn draw_shape_rotation_uses_its_world_pivot() {
+        let p = packet_for(json!({
+            "projection": "free", "scale": 1.0,
+            "drawables": [{"type": "draw-shape", "shape": "rect",
+                "position": {"x": 0, "y": 0}, "width": 1, "height": 1,
+                "fill": "#ff0000", "rotate": std::f32::consts::FRAC_PI_2,
+                "pivot": {"x": 0.5, "y": 0.5}}]
+        }));
+        let points = p
+            .draw_commands
+            .iter()
+            .find_map(|cmd| match cmd {
+                DrawCommand::Poly { points, .. } => Some(points),
+                _ => None,
+            })
+            .expect("rotated rectangle polygon");
+        assert!((points[0].x - 256.0).abs() < 1e-3);
+        assert!(points[0].y.abs() < 1e-3);
+    }
+
+    #[test]
+    fn draw_group_translates_nested_2d_items_and_multiplies_alpha() {
+        let plain = packet_for(json!({
+            "projection": "free", "scale": 1.0,
+            "drawables": [{"type": "draw-shape", "shape": "rect",
+                "position": {"x": 0, "y": 0}, "width": 1, "height": 1,
+                "fill": "#ff0000"}]
+        }));
+        let grouped = packet_for(json!({
+            "projection": "free", "scale": 1.0,
+            "drawables": [{"type": "draw-group", "position": {"x": 2, "y": 3},
+                "opacity": 0.5, "items": [{"type": "draw-shape", "shape": "rect",
+                    "position": {"x": 0, "y": 0}, "width": 1, "height": 1,
+                    "fill": "#ff0000"}]}]
+        }));
+        let rect = |packet: &GameRenderPacket| {
+            packet
+                .draw_commands
+                .iter()
+                .find_map(|cmd| match cmd {
+                    DrawCommand::Quad { rect, color } => Some((*rect, *color)),
+                    _ => None,
+                })
+                .expect("filled rect")
+        };
+        let (plain_rect, _) = rect(&plain);
+        let (group_rect, group_color) = rect(&grouped);
+        assert!(group_rect.x > plain_rect.x);
+        assert!(group_rect.y > plain_rect.y);
+        assert_eq!(group_color[3], 0.5);
+    }
+
+    #[test]
+    fn draw_group_with_unrepresented_clip_does_not_paint_wrong_scene() {
+        let p = packet_for(json!({
+            "projection": "free", "scale": 1.0,
+            "drawables": [{"type": "draw-group", "position": {"x": 2, "y": 3},
+                "clip": "M0 0 L1 0 L1 1 Z", "items": [{"type": "draw-shape",
+                    "shape": "rect", "position": {"x": 0, "y": 0},
+                    "width": 1, "height": 1, "fill": "#ff0000"}]}]
+        }));
+        assert!(!p
+            .draw_commands
+            .iter()
+            .any(|cmd| matches!(cmd, DrawCommand::Quad { .. })));
+    }
+
+    #[test]
+    fn draw_group_uses_shared_affine_transform_for_rotated_shape() {
+        let p = packet_for(json!({
+            "projection": "free", "scale": 1.0,
+            "drawables": [{"type": "draw-group", "position": {"x": 2, "y": 3},
+                "scale": 2, "rotate": 1.5707963267948966,
+                "items": [{"type": "draw-shape", "shape": "rect",
+                    "position": {"x": 0, "y": 0}, "width": 1, "height": 1,
+                    "fill": "#ff0000"}]}]
+        }));
+        assert!(p
+            .draw_commands
+            .iter()
+            .any(|cmd| matches!(cmd, DrawCommand::Poly { points, .. } if points.len() == 4)));
+        assert!(!p
+            .draw_commands
+            .iter()
+            .any(|cmd| matches!(cmd, DrawCommand::Quad { .. })));
+    }
+
+    #[test]
+    fn fx_layer_uses_core_projection_and_epoch_paint_clock() {
+        let props = json!({
+            "projection": "free", "scale": 1.0,
+            "drawables": [{ "type": "draw-fx-layer", "tickMs": 500,
+                "items": [{ "id": "fx-1", "type": "hit", "x": 2, "z": 3,
+                    "ttl": 2, "maxTtl": 4, "bornAt": 1000, "message": "-2" }],
+                "presets": [{ "type": "hit", "shape": "ring", "color": "#ff0000", "size": 0.5 }]
+            }]
+        });
+        let p = from_props_at(&props, 1500.0);
+        let stroke_alpha = p
+            .draw_commands
+            .iter()
+            .find_map(|cmd| match cmd {
+                DrawCommand::Path {
+                    stroke: Some(stroke),
+                    ..
+                } => Some(stroke.color[3]),
+                _ => None,
+            })
+            .expect("ring stroke");
+        assert_eq!(stroke_alpha, 0.75);
+        assert!(p
+            .draw_commands
+            .iter()
+            .any(|cmd| matches!(cmd, DrawCommand::Text { text, .. } if text == "-2")));
+        let expired = from_props_at(&props, 3000.0);
+        assert!(!expired
+            .draw_commands
+            .iter()
+            .any(|cmd| matches!(cmd, DrawCommand::Text { .. } | DrawCommand::Path { .. })));
     }
 
     #[test]

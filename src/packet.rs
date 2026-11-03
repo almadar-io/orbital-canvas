@@ -108,6 +108,16 @@ pub struct Vec2 {
     pub y: f32,
 }
 
+/// One projected mesh vertex. `x`/`y` are packet pixels; `z` is normalized
+/// depth (0 near, 1 far). Three consecutive vertices form one triangle.
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+pub struct MeshVertex {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub color: [f32; 4],
+}
+
 /// A single tile in a `TileGrid`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Tile {
@@ -230,6 +240,9 @@ pub enum DrawCommand {
     Quad { rect: Rect, color: [f32; 4] },
     /// Draw a filled convex polygon (triangle fan from `points[0]`).
     Poly { points: Vec<Vec2>, color: [f32; 4] },
+    /// Depth-tested projected mesh triangles. The scene mapper owns projection,
+    /// geometry, material, and skinning; this packet preserves their depth.
+    Mesh3D { vertices: Vec<MeshVertex> },
     /// Draw a line segment.
     Line {
         from: Vec2,

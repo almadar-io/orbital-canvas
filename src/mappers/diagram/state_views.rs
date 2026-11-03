@@ -13,6 +13,9 @@ use crate::mappers::learning::theme::DiagramTheme;
 use crate::mappers::learning::Xf;
 use crate::mappers::scene::MappedScene;
 use crate::packet::TextAlign;
+use orbital_core_base::schema::avl_projection::{
+    trait_level_from_description, AvlTraitDescription,
+};
 use serde_json::Value;
 
 const MESSAGE_W: f32 = 320.0;
@@ -94,7 +97,25 @@ pub fn state_machine_view(
     if let Some(s) = status_scene("state-machine-view", props, viewport) {
         return Ok(s);
     }
-    let Some(trait_data) = props.get("trait").and_then(TraitData::from_level) else {
+    let described = props
+        .get("description")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            let description: AvlTraitDescription = serde_json::from_value(value.clone())
+                .map_err(|error| CanvasSceneError::NothingToDraw(error.to_string()))?;
+            trait_level_from_description(description)
+                .map_err(CanvasSceneError::NothingToDraw)?
+                .map(|level| serde_json::to_value(level).expect("AVL level serializes"))
+                .map_or(Ok(None), |value| Ok(Some(value)))
+        })
+        .transpose()?
+        .flatten();
+    let Some(trait_data) = props
+        .get("trait")
+        .filter(|value| !value.is_null())
+        .or(described.as_ref())
+        .and_then(TraitData::from_level)
+    else {
         return Ok(message_scene(
             "state-machine-view",
             props,
@@ -344,6 +365,55 @@ mod tests {
             t.iter().filter(|x| *x == "now").count(),
             1,
             "one active state, one badge"
+        );
+    }
+
+    #[test]
+    fn described_machine_paints_each_declared_source_offscreen() {
+        let props = json!({
+            "type": "state-machine-view",
+            "description": {
+                "value": {"trait": "DoorLife"},
+                "machine": {"linkedEntity": "Door", "stateMachine": {
+                    "states": [{"name": "closed", "isInitial": true}, {"name": "open"}],
+                    "transitions": [{"from": ["closed", "open"], "to": "open", "event": "OPEN", "effects": []}]
+                }},
+                "events": {"emits": [], "listens": []}
+            }
+        });
+        let scene = state_machine_view(&props, None).unwrap();
+        let painted = texts(&scene);
+        assert!(painted.iter().any(|text| text == "DoorLife"));
+        assert!(painted.iter().any(|text| text == "closed"));
+        assert!(painted.iter().any(|text| text == "open"));
+        assert_eq!(painted.iter().filter(|text| *text == "OPEN").count(), 2);
+    }
+
+    #[test]
+    fn jazari_machine_paints_each_source_of_a_multi_source_transition() {
+        let mut props = jazari_props();
+        let baseline = texts(&jazari(&props, None).unwrap())
+            .iter()
+            .filter(|text| *text == "COMPARE")
+            .count();
+        props["schema"]["orbitals"][0]["traits"][0]["stateMachine"]["transitions"][1]["from"] =
+            json!(["idle", "embedding"]);
+        let trait_data = TraitData::from_trait(
+            &props["schema"]["orbitals"][0]["traits"][0],
+            "SimilarityComparison",
+        )
+        .unwrap();
+        let sources: Vec<_> = trait_data
+            .transitions
+            .iter()
+            .filter(|transition| transition.index == 1)
+            .map(|transition| transition.from.as_str())
+            .collect();
+        assert_eq!(sources, ["idle", "embedding"]);
+        let painted = texts(&jazari(&props, None).unwrap());
+        assert_eq!(
+            painted.iter().filter(|text| *text == "COMPARE").count(),
+            baseline + 1
         );
     }
 

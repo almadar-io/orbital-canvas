@@ -10,11 +10,7 @@ pub(crate) fn effect_category(head: &str) -> Option<&'static str> {
     Some(match head {
         "render-ui" | "navigate" | "navigate-back" => "ui",
         "set" | "persist" | "fetch" | "fetch-stream" => "data",
-        "emit"
-        | "notify"
-        | "send-server"
-        | "call-service"
-        | "cancel-call" => "communication",
+        "emit" | "notify" | "send-server" | "call-service" | "cancel-call" => "communication",
         "spawn" | "despawn" => "lifecycle",
         "do" | "if" | "when" | "let" | "log" => "control",
         "wait" | "async/delay" | "async/debounce" | "async/throttle" | "async/interval"

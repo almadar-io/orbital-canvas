@@ -13,6 +13,7 @@ pub mod graph_view;
 pub mod layered;
 pub mod mermaid;
 pub mod orbital_viz;
+pub mod pattern_tile;
 pub mod positioned_canvas;
 pub mod scaled_diagram;
 pub mod state_machine;
@@ -30,6 +31,7 @@ pub(crate) const PATTERNS: &[&str] = &[
     "graph-view",
     "jazari-state-machine",
     "orbital-visualization",
+    "pattern-tile",
     "positioned-canvas",
     "scaled-diagram",
     "state-graph",
@@ -61,6 +63,7 @@ pub fn map(
         "jazari-state-machine" => state_views::jazari(props, viewport),
         "mermaid" => mermaid::map(props, viewport),
         "orbital-visualization" => orbital_viz::map(props, viewport),
+        "pattern-tile" => pattern_tile::map(props, viewport),
         "positioned-canvas" => positioned_canvas::map(props, viewport),
         "scaled-diagram" => scaled_diagram::map(props, viewport),
         "atlas-image" => atlas_sprites::image(props, viewport),

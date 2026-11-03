@@ -106,6 +106,8 @@ pub struct SceneHost {
     /// counts from there, so an animation keeps its phase when a new scene arrives.
     pub(crate) clock_ms: f64,
     pub(crate) clock_epoch: Option<f64>,
+    /// Epoch milliseconds from the host paint clock, for `bornAt` world FX.
+    pub(crate) epoch_clock_ms: f64,
     /// Whether the host allows motion (false: the OS reduced-motion setting is on).
     pub(crate) motion: bool,
 }
@@ -239,6 +241,7 @@ impl SceneHost {
             scene_events: Vec::new(),
             clock_ms: 0.0,
             clock_epoch: None,
+            epoch_clock_ms: 0.0,
             motion: true,
         }
     }
@@ -320,6 +323,12 @@ impl SceneHost {
         self.clock_ms = ms;
     }
 
+    pub fn set_epoch_clock(&mut self, epoch_ms: f64) {
+        if epoch_ms.is_finite() && epoch_ms > 0.0 {
+            self.epoch_clock_ms = epoch_ms;
+        }
+    }
+
     /// Whether the host allows motion. Off, every animated scene draws its rest frame.
     pub fn set_motion(&mut self, enabled: bool) {
         self.motion = enabled;
@@ -341,11 +350,46 @@ impl SceneHost {
     /// Whether the host should keep drawing frames: the scene is animated, or assets it asked for
     /// are still arriving. A static, settled scene needs no loop; a new scene or a resize wakes it.
     pub fn wants_frames(&self) -> bool {
-        self.is_animated() || asset::pending() > 0 || asset::generation() != self.asset_generation
+        self.is_animated()
+            || (self.motion
+                && self.epoch_clock_ms > 0.0
+                && self
+                    .scene
+                    .as_ref()
+                    .is_some_and(mappers::game_canvas_2d::has_active_fx))
+            || asset::pending() > 0
+            || asset::generation() != self.asset_generation
     }
 
     /// The current packet as it draws at the clock's scene time.
     pub fn frame_packet(&self) -> Option<GameRenderPacket> {
+        if self.motion && self.epoch_clock_ms > 0.0 {
+            if let Some(scene) = self.scene.as_ref().filter(|scene| {
+                mappers::game_canvas_2d::has_active_fx(scene)
+                    && matches!(
+                        scene.get("type").and_then(serde_json::Value::as_str),
+                        Some("canvas" | "canvas-2d")
+                    )
+            }) {
+                let viewport = self
+                    .viewport
+                    .map(|(w, h)| (w as f32 / self.density, h as f32 / self.density));
+                let remapped = match viewport {
+                    Some((w, h)) => mappers::game_canvas_2d::from_canvas_node_in_viewport_at(
+                        scene,
+                        w,
+                        h,
+                        self.epoch_clock_ms,
+                    ),
+                    None => {
+                        mappers::game_canvas_2d::from_canvas_node_at(scene, self.epoch_clock_ms)
+                    }
+                };
+                if let Ok(packet) = remapped {
+                    return Some(packet.resolved(self.scene_time(), self.motion).into_owned());
+                }
+            }
+        }
         self.packet
             .as_ref()
             .map(|p| p.resolved(self.scene_time(), self.motion).into_owned())
@@ -1213,10 +1257,8 @@ mod tests {
             };
 
         // Fixture: a uniform-red 2×2 PNG (uniform color → filtering can't leak).
-        let dir = std::env::temp_dir().join(format!(
-            "orbital-canvas-sprite-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("orbital-canvas-sprite-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tempdir");
         let path = dir.join("red.png");
         image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
@@ -1365,6 +1407,43 @@ mod tests {
         assert!(
             !themed.is_animated(),
             "the theme's motion switch is honoured"
+        );
+    }
+
+    #[test]
+    fn world_fx_remaps_at_the_epoch_clock_without_changing_kernel_ttl() {
+        let mut renderer = Canvas::new_headless().unwrap();
+        renderer
+            .set_scene(serde_json::json!({
+                "type": "canvas", "mode": "2d", "projection": "free", "scale": 1,
+                "drawables": [{"type": "draw-fx-layer", "tickMs": 500,
+                    "items": [{"id": "fx-1", "type": "hit", "x": 2, "ttl": 2,
+                        "maxTtl": 4, "bornAt": 1000}],
+                    "presets": [{"type": "hit", "shape": "ring", "color": "#ff0000"}]
+                }]
+            }))
+            .unwrap();
+        renderer.set_epoch_clock(1500.0);
+        assert!(renderer.wants_frames());
+        let alpha = |packet: &GameRenderPacket| {
+            packet
+                .draw_commands
+                .iter()
+                .find_map(|cmd| match cmd {
+                    packet::DrawCommand::Path {
+                        stroke: Some(stroke),
+                        ..
+                    } => Some(stroke.color[3]),
+                    _ => None,
+                })
+                .expect("ring stroke")
+        };
+        assert_eq!(alpha(&renderer.frame_packet().unwrap()), 0.75);
+        renderer.set_epoch_clock(2000.0);
+        assert_eq!(alpha(&renderer.frame_packet().unwrap()), 0.5);
+        assert_eq!(
+            renderer.scene().unwrap()["drawables"][0]["items"][0]["ttl"],
+            2
         );
     }
 

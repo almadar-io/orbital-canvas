@@ -1,6 +1,6 @@
 //! GPU pipeline and offscreen rendering for [`Canvas`].
 
-use crate::packet::{DrawCommand, GameRenderPacket, Rect, Vec2};
+use crate::packet::{DrawCommand, GameRenderPacket, MeshVertex, Rect, Vec2};
 use crate::{Canvas, RendererError, Result};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -24,6 +24,104 @@ pub(crate) struct DeviceResources {
 struct Vertex {
     position: [f32; 2],
     color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct MeshGpuVertex {
+    position: [f32; 3],
+    color: [f32; 4],
+}
+
+impl MeshGpuVertex {
+    const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            wgpu::VertexAttribute {
+                offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+        ],
+    };
+}
+
+const MESH_SHADER_SOURCE: &str = r#"
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(in: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    out.clip_position = vec4<f32>(in.position, 1.0);
+    out.color = in.color;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return in.color;
+}
+"#;
+
+fn build_mesh_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("game mesh shader"),
+        source: wgpu::ShaderSource::Wgsl(MESH_SHADER_SOURCE.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("game mesh pipeline layout"),
+        bind_group_layouts: &[],
+        push_constant_ranges: &[],
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("game mesh pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[MeshGpuVertex::LAYOUT],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    })
 }
 
 impl Vertex {
@@ -286,6 +384,7 @@ struct GpuSprite {
 /// One resolved draw of a frame, in z-order.
 enum Draw {
     Quads(Vec<Vertex>),
+    Mesh3D(Vec<MeshGpuVertex>),
     Sprite {
         key: SpriteKey,
         verts: [SpriteVertex; 6],
@@ -316,6 +415,7 @@ pub struct SharedDeviceRenderer {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     pipeline: wgpu::RenderPipeline,
+    mesh_pipeline: wgpu::RenderPipeline,
     sprite_pipeline: wgpu::RenderPipeline,
     sprite_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -336,6 +436,7 @@ impl SharedDeviceRenderer {
         format: wgpu::TextureFormat,
     ) -> Self {
         let pipeline = build_pipeline(&device, format);
+        let mesh_pipeline = build_mesh_pipeline(&device, format);
         let (sprite_pipeline, sprite_layout) = build_sprite_pipeline(&device, format);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("game sprite sampler"),
@@ -348,6 +449,7 @@ impl SharedDeviceRenderer {
             device,
             queue,
             pipeline,
+            mesh_pipeline,
             sprite_pipeline,
             sprite_layout,
             sampler,
@@ -752,6 +854,16 @@ impl SharedDeviceRenderer {
                     self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
                     push_poly_fan(&mut quad_batch, points, color, width, height);
                 }
+                DrawCommand::Mesh3D { vertices } => {
+                    self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
+                    if !quad_batch.is_empty() {
+                        draws.push(Draw::Quads(std::mem::take(&mut quad_batch)));
+                    }
+                    let vertices = mesh_gpu_vertices(vertices, width, height);
+                    if !vertices.is_empty() {
+                        draws.push(Draw::Mesh3D(vertices));
+                    }
+                }
                 DrawCommand::Path { .. }
                 | DrawCommand::ClippedPath { .. }
                 | DrawCommand::Line { .. }
@@ -804,6 +916,29 @@ impl SharedDeviceRenderer {
             draws.push(Draw::Quads(quad_batch));
         }
 
+        let depth_texture = draws
+            .iter()
+            .any(|draw| matches!(draw, Draw::Mesh3D(_)))
+            .then(|| {
+                self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("game mesh depth"),
+                    size: wgpu::Extent3d {
+                        width: target.width(),
+                        height: target.height(),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Depth32Float,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+            });
+        let depth_view = depth_texture
+            .as_ref()
+            .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("game shared-device pass"),
@@ -816,13 +951,35 @@ impl SharedDeviceRenderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: depth_view.as_ref().map(|view| {
+                    wgpu::RenderPassDepthStencilAttachment {
+                        view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
+                    }
+                }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
 
             for draw in &draws {
                 match draw {
+                    Draw::Mesh3D(vertices) => {
+                        let buffer =
+                            self.device
+                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: Some("game mesh vertices"),
+                                    contents: bytemuck::cast_slice(vertices),
+                                    usage: wgpu::BufferUsages::VERTEX,
+                                });
+                        pass.set_pipeline(&self.mesh_pipeline);
+                        pass.set_vertex_buffer(0, buffer.slice(..));
+                        pass.draw(0..vertices.len() as u32, 0..1);
+                        drew = true;
+                    }
                     Draw::Quads(vertices) => {
                         let buffer =
                             self.device
@@ -1155,6 +1312,135 @@ fn to_ndc(x: f32, y: f32, width: u32, height: u32) -> [f32; 2] {
     ]
 }
 
+fn mesh_gpu_vertices(vertices: &[MeshVertex], width: u32, height: u32) -> Vec<MeshGpuVertex> {
+    let mut result = Vec::with_capacity(vertices.len() / 3 * 3);
+    for triangle in vertices.chunks_exact(3) {
+        if triangle.iter().any(|v| {
+            !v.x.is_finite()
+                || !v.y.is_finite()
+                || !v.z.is_finite()
+                || !(0.0..=1.0).contains(&v.z)
+                || v.color.iter().any(|channel| !channel.is_finite())
+        }) {
+            continue;
+        }
+        result.extend(triangle.iter().map(|v| {
+            let [x, y] = to_ndc(v.x, v.y, width, height);
+            MeshGpuVertex {
+                position: [x, y, v.z],
+                color: v.color,
+            }
+        }));
+    }
+    result
+}
+
+#[cfg(test)]
+mod mesh_depth_tests {
+    use super::*;
+
+    fn triangle(z: f32, color: [f32; 4]) -> DrawCommand {
+        DrawCommand::Mesh3D {
+            vertices: vec![
+                MeshVertex {
+                    x: 1.0,
+                    y: 1.0,
+                    z,
+                    color,
+                },
+                MeshVertex {
+                    x: 7.0,
+                    y: 1.0,
+                    z,
+                    color,
+                },
+                MeshVertex {
+                    x: 4.0,
+                    y: 7.0,
+                    z,
+                    color,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn mesh_triangles_use_depth_instead_of_draw_order() {
+        let Some(mut renderer) = super::svg_sprite_tests::renderer() else {
+            return;
+        };
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let blue = [0.0, 0.0, 1.0, 1.0];
+        for commands in [
+            vec![triangle(0.8, blue), triangle(0.2, red)],
+            vec![triangle(0.2, red), triangle(0.8, blue)],
+        ] {
+            let packet = GameRenderPacket {
+                pattern: "mesh-depth-probe".into(),
+                width: 8.0,
+                height: 8.0,
+                draw_commands: commands,
+                ..Default::default()
+            };
+            let pixels =
+                super::svg_sprite_tests::draw(&mut renderer, &packet, 8).expect("readback");
+            let center = &pixels[(4 * 8 + 4) * 4..(4 * 8 + 4) * 4 + 4];
+            assert!(
+                center[0] > 200 && center[2] < 30,
+                "near mesh must win: {center:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_mesh_triangle_cannot_poison_a_following_triangle() {
+        let mut malformed = match triangle(f32::NAN, [1.0; 4]) {
+            DrawCommand::Mesh3D { vertices } => vertices,
+            _ => unreachable!(),
+        };
+        if let DrawCommand::Mesh3D { vertices } = triangle(0.3, [1.0; 4]) {
+            malformed.extend(vertices);
+        }
+        assert_eq!(mesh_gpu_vertices(&malformed, 8, 8).len(), 3);
+    }
+
+    #[test]
+    fn projected_box_paints_visible_volume_on_the_gpu() {
+        let Some(mut renderer) = super::svg_sprite_tests::renderer() else {
+            return;
+        };
+        let (vertices, faces) = crate::mappers::game_canvas_3d::box_geometry(1.0, 1.0, 1.0, true)
+            .expect("box geometry");
+        let camera = crate::mappers::game_canvas_3d::Camera3D {
+            eye: [2.0, 2.0, 3.0],
+            target: [0.0, 0.5, 0.0],
+            up: [0.0, 1.0, 0.0],
+            fov_y_degrees: 60.0,
+            near: 0.1,
+            far: 20.0,
+        };
+        let command = crate::mappers::game_canvas_3d::project_polyhedron(
+            &vertices,
+            &faces,
+            camera,
+            64.0,
+            64.0,
+            [1.0, 0.4, 0.1, 1.0],
+        )
+        .expect("box projection");
+        let packet = GameRenderPacket {
+            pattern: "mesh-box-probe".into(),
+            width: 64.0,
+            height: 64.0,
+            draw_commands: vec![command],
+            ..Default::default()
+        };
+        let pixels = super::svg_sprite_tests::draw(&mut renderer, &packet, 64).expect("readback");
+        let painted = pixels.chunks_exact(4).filter(|pixel| pixel[3] > 0).count();
+        assert!(painted > 100, "box should cover visible pixels: {painted}");
+    }
+}
+
 /// Push two triangles covering `rect` into the vertex buffer.
 fn push_quad(vertices: &mut Vec<Vertex>, rect: &Rect, color: &[f32; 4], width: u32, height: u32) {
     let tl = to_ndc(rect.x, rect.y, width, height);
@@ -1260,10 +1546,8 @@ mod svg_sprite_tests {
     }
 
     fn fixture(name: &str, contents: &[u8]) -> String {
-        let dir = std::env::temp_dir().join(format!(
-            "orbital-canvas-svg-sprite-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("orbital-canvas-svg-sprite-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tempdir");
         let path = dir.join(name);
         std::fs::write(&path, contents).expect("write fixture");

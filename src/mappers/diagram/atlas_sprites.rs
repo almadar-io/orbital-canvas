@@ -108,7 +108,7 @@ pub fn image(props: &Value, viewport: Option<(f32, f32)>) -> Result<MappedScene,
     let theme = theme_for(props);
     let (xf, pw, ph) = frame(bw, bh, viewport);
     let mut pen = Pen::new(&theme, xf);
-    pen.clear(theme.ground);
+    pen.clear([0.0, 0.0, 0.0, 0.0]);
     if let Some(r) = src.rect {
         let (k_contain, k_cover) = ((bw / r.w).min(bh / r.h), (bw / r.w).max(bh / r.h));
         let (s_rect, d_rect) = match props_str(props, "fit").unwrap_or("contain") {
@@ -186,8 +186,12 @@ pub fn panel(props: &Value, viewport: Option<(f32, f32)>) -> Result<MappedScene,
     let border_w = props_f32(props, "borderWidth", 16.0);
     let fallback = if repeat { 0.0 } else { border_w * 2.0 };
     let (bw, bh) = (
-        style_px(props, "width").unwrap_or(fallback),
-        style_px(props, "height").unwrap_or(fallback),
+        style_px(props, "width")
+            .or_else(|| viewport.map(|(w, _)| w))
+            .unwrap_or(fallback),
+        style_px(props, "height")
+            .or_else(|| viewport.map(|(_, h)| h))
+            .unwrap_or(fallback),
     );
     if bw <= 0.0 || bh <= 0.0 {
         return Err(CanvasSceneError::NothingToDraw(
@@ -206,7 +210,7 @@ pub fn panel(props: &Value, viewport: Option<(f32, f32)>) -> Result<MappedScene,
     let theme = theme_for(props);
     let (xf, pw, ph) = frame(bw, bh, viewport);
     let mut pen = Pen::new(&theme, xf);
-    pen.clear(theme.ground);
+    pen.clear([0.0, 0.0, 0.0, 0.0]);
     let Some(r) = src.rect else {
         return Ok(pen.finish("atlas-panel", pw, ph));
     };
@@ -461,5 +465,39 @@ mod tests {
             ),
             "a tiled box with no size is empty on the web too"
         );
+    }
+
+    #[test]
+    fn atlas_scenes_keep_the_host_surface_transparent() {
+        for scene in [
+            image(
+                &json!({"type": "atlas-image", "asset": asset_of("gem.png")}),
+                None,
+            )
+            .unwrap(),
+            panel(
+                &json!({"type": "atlas-panel", "asset": asset_of("panel.png"), "borderWidth": 8}),
+                None,
+            )
+            .unwrap(),
+        ] {
+            assert!(matches!(
+                scene.packet.draw_commands.first(),
+                Some(DrawCommand::Clear { color }) if *color == [0.0, 0.0, 0.0, 0.0]
+            ));
+        }
+    }
+
+    #[test]
+    fn repeat_panel_uses_its_measured_viewport_when_no_pixel_size_is_authored() {
+        let scene = panel(
+            &json!({"type": "atlas-panel", "mode": "repeat", "asset": asset_of("gem.png")}),
+            Some((100.0, 48.0)),
+        )
+        .unwrap();
+        assert_eq!((scene.packet.width, scene.packet.height), (100.0, 48.0));
+        let tiles = sprites(&scene);
+        assert_eq!(tiles.len(), 3);
+        assert_eq!((tiles[2].0.w, tiles[2].1.w), (4.0, 4.0));
     }
 }

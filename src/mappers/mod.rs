@@ -2,6 +2,7 @@
 
 pub mod diagram;
 pub mod game_canvas_2d;
+pub mod game_canvas_3d;
 pub mod isometric_canvas;
 pub mod learning;
 pub mod mini_map;

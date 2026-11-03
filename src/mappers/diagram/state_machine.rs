@@ -78,6 +78,18 @@ fn flag(v: &Value, key: &str) -> bool {
     v.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
+fn source_names(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::String(from)) => vec![from.clone()],
+        Some(Value::Array(froms)) => froms
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn guard_of(v: Option<&Value>) -> Option<String> {
     v.filter(|g| !g.is_null())
         .and_then(|g| serde_json::from_value::<SExpression>(g.clone()).ok())
@@ -108,24 +120,20 @@ impl TraitData {
             .map(|a| {
                 a.iter()
                     .enumerate()
-                    .map(|(i, t)| TransitionInfo {
-                        from: t
-                            .get("from")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        to: t
+                    .flat_map(|(i, t)| {
+                        let froms = source_names(t.get("from"));
+                        let to = t
                             .get("to")
                             .and_then(Value::as_str)
                             .unwrap_or_default()
-                            .to_string(),
-                        event: t
+                            .to_string();
+                        let event = t
                             .get("event")
                             .and_then(Value::as_str)
                             .unwrap_or_default()
-                            .to_string(),
-                        guard: guard_of(t.get("guard")),
-                        effects: t
+                            .to_string();
+                        let guard = guard_of(t.get("guard"));
+                        let effects: Vec<String> = t
                             .get("effects")
                             .and_then(Value::as_array)
                             .map(|fx| {
@@ -138,11 +146,19 @@ impl TraitData {
                                     })
                                     .collect()
                             })
-                            .unwrap_or_default(),
-                        index: t
+                            .unwrap_or_default();
+                        let index = t
                             .get("index")
                             .and_then(Value::as_u64)
-                            .map_or(i, |n| n as usize),
+                            .map_or(i, |n| n as usize);
+                        froms.into_iter().map(move |from| TransitionInfo {
+                            from,
+                            to: to.clone(),
+                            event: event.clone(),
+                            guard: guard.clone(),
+                            effects: effects.clone(),
+                            index,
+                        })
                     })
                     .collect()
             })
@@ -191,24 +207,20 @@ impl TraitData {
             .map(|a| {
                 a.iter()
                     .enumerate()
-                    .map(|(i, tr)| TransitionInfo {
-                        from: tr
-                            .get("from")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        to: tr
+                    .flat_map(|(i, tr)| {
+                        let froms = source_names(tr.get("from"));
+                        let to = tr
                             .get("to")
                             .and_then(Value::as_str)
                             .unwrap_or_default()
-                            .to_string(),
-                        event: tr
+                            .to_string();
+                        let event = tr
                             .get("event")
                             .and_then(Value::as_str)
                             .unwrap_or_default()
-                            .to_string(),
-                        guard: guard_of(tr.get("guard")),
-                        effects: tr
+                            .to_string();
+                        let guard = guard_of(tr.get("guard"));
+                        let effects: Vec<String> = tr
                             .get("effects")
                             .and_then(Value::as_array)
                             .map(|fx| {
@@ -221,8 +233,15 @@ impl TraitData {
                                     })
                                     .collect()
                             })
-                            .unwrap_or_default(),
-                        index: i,
+                            .unwrap_or_default();
+                        froms.into_iter().map(move |from| TransitionInfo {
+                            from,
+                            to: to.clone(),
+                            event: event.clone(),
+                            guard: guard.clone(),
+                            effects: effects.clone(),
+                            index: i,
+                        })
                     })
                     .collect()
             })
