@@ -40,7 +40,7 @@ pub(crate) const PATTERNS: &[&str] = &[
 
 /// Scenes no registry pattern names: a host composes them inside its own pattern (a ```` ```mermaid ````
 /// fence in `markdown-content` / `segment-renderer`).
-pub const SCENE_ONLY: &[&str] = &["mermaid"];
+pub const SCENE_ONLY: &[&str] = &["mermaid", "geometric-pattern-scene"];
 
 pub fn handles(pattern: &str) -> bool {
     svg_atoms::ATOMS.contains(&pattern)
@@ -64,6 +64,7 @@ pub fn map(
         "mermaid" => mermaid::map(props, viewport),
         "orbital-visualization" => orbital_viz::map(props, viewport),
         "pattern-tile" => pattern_tile::map(props, viewport),
+        "geometric-pattern-scene" => pattern_tile::map_geometric(props, viewport),
         "positioned-canvas" => positioned_canvas::map(props, viewport),
         "scaled-diagram" => scaled_diagram::map(props, viewport),
         "atlas-image" => atlas_sprites::image(props, viewport),

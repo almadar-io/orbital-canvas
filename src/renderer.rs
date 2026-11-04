@@ -2435,6 +2435,61 @@ mod svg_sprite_tests {
         );
     }
 
+    #[test]
+    fn svg_pattern_and_gradient_mask_reach_gpu_pixels() {
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">
+            <defs>
+                <pattern id="tile" width="4" height="4" patternUnits="userSpaceOnUse"><rect width="2" height="4" fill="#ff0000"/></pattern>
+                <linearGradient id="fade" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="white" stop-opacity="1"/><stop offset="100%" stop-color="white" stop-opacity="0"/></linearGradient>
+                <mask id="mask"><rect width="100%" height="100%" fill="url(#fade)"/></mask>
+            </defs>
+            <rect width="100%" height="100%" fill="url(#tile)" mask="url(#mask)"/>
+        </svg>"##;
+        let url = fixture("pattern-mask.svg", svg.as_bytes());
+        let packet = GameRenderPacket {
+            pattern: "geometric-pattern-scene".into(),
+            width: 16.0,
+            height: 16.0,
+            draw_commands: vec![DrawCommand::Sprite {
+                texture: url,
+                src: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 16.0,
+                    h: 16.0,
+                },
+                dst: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 16.0,
+                    h: 16.0,
+                },
+                rotation: 0.0,
+                opacity: 1.0,
+                flip_x: false,
+                flip_y: false,
+            }],
+            ..Default::default()
+        };
+        let pixels = draw(&mut renderer, &packet, 16).expect("pattern mask GPU frame");
+        let alphas = [1, 5, 9, 13].map(|x| px(&pixels, 16, x, 8)[3]);
+        assert!(alphas[0] > 200, "visible edge: {alphas:?}");
+        assert!(
+            alphas[0] > alphas[1] && alphas[1] > alphas[2] && alphas[2] > alphas[3],
+            "gradient fade: {alphas:?}"
+        );
+        assert!(alphas[3] < 80, "faded edge: {alphas:?}");
+        for x in [2, 6, 10, 14] {
+            assert!(
+                px(&pixels, 16, x, 8)[3] < alphas[0] / 2,
+                "tile gap at x={x}"
+            );
+        }
+    }
+
     /// Density: a 3x target (24 physical for an 8-unit logical packet) gets a
     /// ~3x denser raster; the 1x control rasterizes at logical size.
     #[test]
