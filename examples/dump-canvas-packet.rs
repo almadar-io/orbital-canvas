@@ -63,11 +63,11 @@ fn main() {
     // until the sprite count stabilizes — the same in-flight → resolved
     // convergence the dioxus paint source gets from the asset generation.
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut packet = game_canvas_2d::from_props(&props);
+    let mut packet = game_canvas_2d::from_props(&props).expect("canvas props map to a packet");
     let mut last_sprites = sprite_count(&packet);
     loop {
         std::thread::sleep(Duration::from_millis(60));
-        packet = game_canvas_2d::from_props(&props);
+        packet = game_canvas_2d::from_props(&props).expect("canvas props map to a packet");
         let sprites = sprite_count(&packet);
         if (sprites == last_sprites && sprites > 0) || Instant::now() > deadline {
             break;
