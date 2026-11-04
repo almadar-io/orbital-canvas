@@ -5,7 +5,7 @@
 use super::canvas::{self, CanvasSpec};
 use super::shape::{parse_shapes, Dash, Point, Shape, ShapeType};
 use super::theme::{DiagramTheme, Rgba};
-use crate::mappers::game_canvas_2d::{get_f32, get_string, paint_drawables};
+use crate::mappers::game_canvas_2d::{get_f32, get_string, paint_drawables, CanvasSceneError};
 use crate::mappers::scene::MappedScene;
 use crate::projector::{PlotAxes, Projector};
 use serde_json::Value;
@@ -587,7 +587,7 @@ pub fn derive_shapes(props: &Value, width: f32, height: f32) -> Vec<Shape> {
     out
 }
 
-pub fn map(props: &Value, viewport: Option<(f32, f32)>) -> MappedScene {
+pub fn map(props: &Value, viewport: Option<(f32, f32)>) -> Result<MappedScene, CanvasSceneError> {
     let width = get_f32(props, "width", 600.0).max(1.0);
     let height = get_f32(props, "height", 400.0).max(1.0);
     let shapes = derive_shapes(props, width, height);
@@ -611,9 +611,9 @@ pub fn map(props: &Value, viewport: Option<(f32, f32)>) -> MappedScene {
             &resolve,
             &|x, y| xf.p(x, y),
             xf.s,
-        ));
+        )?);
     }
-    scene
+    Ok(scene)
 }
 
 fn css_of(c: Rgba) -> String {
@@ -662,7 +662,7 @@ mod tests {
             "xMin": -9, "xMax": 9, "yMin": -6, "yMax": 6,
             "drawables": [{"type": "draw-shape", "shape": "cell", "position": {"x": 0, "y": 0}, "fill": "series-1"}]
         });
-        let scene = map(&props, None);
+        let scene = map(&props, None).unwrap();
         let Some(DrawCommand::Poly { points, color }) = scene.packet.draw_commands.last() else {
             panic!(
                 "the drawable paints last: {:?}",
@@ -688,10 +688,11 @@ mod tests {
     #[test]
     fn control_no_drawables_adds_nothing_after_the_plot() {
         let with = map(&json!({"drawables": []}), None)
+            .unwrap()
             .packet
             .draw_commands
             .len();
-        let without = map(&json!({}), None).packet.draw_commands.len();
+        let without = map(&json!({}), None).unwrap().packet.draw_commands.len();
         assert_eq!(with, without);
     }
 
@@ -890,7 +891,7 @@ mod tests {
 
     #[test]
     fn the_scene_packet_draws_each_curve_with_its_color_dash_and_width() {
-        let scene = map(&sinewave(), None);
+        let scene = map(&sinewave(), None).unwrap();
         let theme = DiagramTheme::heritage(false);
         let strokes: Vec<_> = scene
             .packet
@@ -920,7 +921,7 @@ mod tests {
 
     #[test]
     fn the_packet_follows_the_viewport_and_its_curves_move_with_the_axis_range() {
-        let wide = map(&sinewave(), Some((300.0, 200.0)));
+        let wide = map(&sinewave(), Some((300.0, 200.0))).unwrap();
         assert_eq!((wide.packet.width, wide.packet.height), (300.0, 200.0));
         let end_x = |scene: &MappedScene| {
             let curve = scene
@@ -942,7 +943,7 @@ mod tests {
             }
         };
         let half = end_x(&wide);
-        let full = end_x(&map(&sinewave(), None));
+        let full = end_x(&map(&sinewave(), None).unwrap());
         assert!(
             (full / half - 2.0).abs() < 0.01,
             "300px viewport halves the 600px scene: {full} vs {half}"
@@ -956,7 +957,7 @@ mod tests {
             "interactive": true, "onShapeClick": "POINT_PICKED",
             "points": [{"x": 0, "y": 0}]
         });
-        let scene = map(&props, None);
+        let scene = map(&props, None).unwrap();
         let p = Plot::new(600.0, 400.0, (-5.0, 5.0), (-5.0, 5.0), false);
         let emits = scene.emits_at(p.map_x(0.0), p.map_y(0.0));
         assert_eq!(emits.len(), 1);
@@ -964,7 +965,7 @@ mod tests {
         assert_eq!(emits[0].payload, json!({"type": "circle", "index": 0}));
         props["interactive"] = json!(false);
         assert!(
-            map(&props, None).hits.is_empty(),
+            map(&props, None).unwrap().hits.is_empty(),
             "control: not interactive"
         );
     }
@@ -973,7 +974,7 @@ mod tests {
     fn series_override_recolors_series_tones() {
         let mut props = sinewave();
         props["series"] = json!(["#ff0000"]);
-        let scene = map(&props, None);
+        let scene = map(&props, None).unwrap();
         let first = scene.packet.draw_commands.iter().find_map(|c| match c {
             DrawCommand::Path {
                 stroke: Some(s),

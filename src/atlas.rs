@@ -58,12 +58,31 @@ pub struct Tilesheet {
     pub names: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpriteSheetAtlas {
+    pub frame_width: f32,
+    pub frame_height: f32,
+    pub columns: u32,
+    pub animations: HashMap<String, AnimationDef>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimationDef {
+    pub row: u32,
+    pub frames: u32,
+    pub frame_rate: f64,
+    pub r#loop: bool,
+}
+
 /// A parsed atlas JSON — discriminated by key presence, the same test
 /// `atlasSlice.isTilesheet` applies (`tileWidth` is a number).
 #[derive(Debug, Clone)]
 pub enum ParsedAtlas {
     Texture(TextureAtlas),
     Tilesheet(Tilesheet),
+    SpriteSheet(SpriteSheetAtlas),
 }
 
 static PARSED: OnceLock<RwLock<HashMap<String, Arc<ParsedAtlas>>>> = OnceLock::new();
@@ -86,6 +105,14 @@ pub fn parse_atlas(json: &[u8]) -> Result<ParsedAtlas, String> {
         let sheet: Tilesheet =
             serde_json::from_value(value).map_err(|e| format!("Tilesheet: {e}"))?;
         return Ok(ParsedAtlas::Tilesheet(sheet));
+    }
+    if value.get("frameWidth").is_some()
+        && value.get("frameHeight").is_some()
+        && value.get("animations").is_some()
+    {
+        let sheet: SpriteSheetAtlas =
+            serde_json::from_value(value).map_err(|e| format!("SpriteSheetAtlas: {e}"))?;
+        return Ok(ParsedAtlas::SpriteSheet(sheet));
     }
     Err("atlas json is neither a TextureAtlas (subTextures) nor a Tilesheet (tileWidth)".into())
 }
@@ -156,7 +183,45 @@ pub fn sub_rect_for(atlas: &ParsedAtlas, sprite: &str) -> Option<Rect> {
                 h: st.height,
             })
         }
+        ParsedAtlas::SpriteSheet(_) => None,
     }
+}
+
+/// Resolve a manifest-authored animation frame on the caller's paint clock.
+pub fn sprite_sheet_frame(
+    atlas: &ParsedAtlas,
+    animation: &str,
+    loop_override: Option<bool>,
+    time_ms: f64,
+) -> Option<Rect> {
+    let ParsedAtlas::SpriteSheet(sheet) = atlas else {
+        return None;
+    };
+    let def = sheet.animations.get(animation)?;
+    if def.frames == 0
+        || def.frame_rate <= 0.0
+        || !def.frame_rate.is_finite()
+        || sheet.columns == 0
+        || !time_ms.is_finite()
+        || time_ms < 0.0
+        || sheet.frame_width <= 0.0
+        || sheet.frame_height <= 0.0
+    {
+        return None;
+    }
+    let duration = 1000.0 / def.frame_rate;
+    let total = def.frames as f64 * duration;
+    let frame = if loop_override.unwrap_or(def.r#loop) {
+        (time_ms.rem_euclid(total) / duration).floor() as u32
+    } else {
+        (time_ms / duration).floor().min((def.frames - 1) as f64) as u32
+    };
+    Some(Rect {
+        x: (frame % sheet.columns) as f32 * sheet.frame_width,
+        y: def.row as f32 * sheet.frame_height,
+        w: sheet.frame_width,
+        h: sheet.frame_height,
+    })
 }
 
 /// One-call convenience: resolve `Asset { atlas, sprite }` to a source rect
@@ -222,5 +287,24 @@ mod tests {
     #[test]
     fn shape_detection_rejects_unknown_json() {
         assert!(parse_atlas(br#"{"foo": 1}"#).is_err());
+    }
+
+    #[test]
+    fn sprite_sheet_frame_uses_manifest_rows_clock_and_loop_override() {
+        let atlas = parse_atlas(
+            br#"{
+            "frameWidth": 8, "frameHeight": 12, "columns": 4,
+            "animations": {"walk": {"row": 2, "frames": 3, "frameRate": 10, "loop": true}}
+        }"#,
+        )
+        .unwrap();
+        let looping = sprite_sheet_frame(&atlas, "walk", None, 350.0).unwrap();
+        assert_eq!(
+            (looping.x, looping.y, looping.w, looping.h),
+            (0.0, 24.0, 8.0, 12.0)
+        );
+        let stopped = sprite_sheet_frame(&atlas, "walk", Some(false), 350.0).unwrap();
+        assert_eq!(stopped.x, 16.0);
+        assert!(sprite_sheet_frame(&atlas, "missing", None, 0.0).is_none());
     }
 }

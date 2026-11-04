@@ -4,10 +4,86 @@
 //! not elapsed and a finished animation all draw it unchanged.
 
 use crate::packet::{
-    Animation, DrawCommand, Easing, GameRenderPacket, Halo, PathSegment, Stroke, Vec2,
+    Animation, DrawCommand, Easing, FillPattern, GameRenderPacket, Gradient, Halo, PathSegment,
+    Stroke, Vec2,
 };
+use serde_json::Value;
 use std::borrow::Cow;
 use std::f32::consts::TAU;
+
+/// One authored drawable animation track at the host paint clock. Shape,
+/// group, and mesh descriptors use the same keyframe contract.
+pub fn drawable_track(animation: &Value, time_ms: f64, key: &str) -> Option<Value> {
+    let duration = animation.get("durationMs")?.as_f64()?;
+    let frames = animation.get("keyframes")?.as_array()?;
+    if !duration.is_finite() || duration <= 0.0 || frames.is_empty() {
+        return None;
+    }
+    let cycle = time_ms / duration;
+    let progress = if animation.get("loop").and_then(Value::as_bool) == Some(false) {
+        cycle.min(1.0)
+    } else {
+        cycle - cycle.floor()
+    };
+    let mut defined: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| {
+            let value = key
+                .split('.')
+                .try_fold(frame, |value, part| value.get(part))?;
+            Some((frame.get("at")?.as_f64()?, value))
+        })
+        .collect();
+    defined.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let first = defined.first()?;
+    let previous = defined.iter().rev().find(|(at, _)| *at <= progress);
+    let Some((at, value)) = previous else {
+        return Some(first.1.clone());
+    };
+    let Some((next_at, next_value)) = defined.iter().find(|(next_at, _)| *next_at > progress)
+    else {
+        return Some((*value).clone());
+    };
+    match (value.as_f64(), next_value.as_f64()) {
+        (Some(a), Some(b)) => {
+            let span = next_at - at;
+            let fraction = if span > 0.0 {
+                (progress - at) / span
+            } else {
+                1.0
+            };
+            serde_json::Number::from_f64(a + (b - a) * fraction).map(Value::Number)
+        }
+        _ => Some((*value).clone()),
+    }
+}
+
+#[cfg(test)]
+mod drawable_track_tests {
+    use super::drawable_track;
+    use serde_json::json;
+
+    #[test]
+    fn drawable_tracks_interpolate_numbers_and_hold_colors() {
+        let animation = json!({
+            "durationMs": 1000, "loop": false,
+            "keyframes": [
+                {"at": 0, "width": 0, "fill": "#ff0000", "shadow": {"blur": 1}},
+                {"at": 1, "width": 2, "fill": "#0000ff", "shadow": {"blur": 5}}
+            ]
+        });
+        assert_eq!(drawable_track(&animation, 500.0, "width"), Some(json!(1.0)));
+        assert_eq!(
+            drawable_track(&animation, 500.0, "fill"),
+            Some(json!("#ff0000"))
+        );
+        assert_eq!(
+            drawable_track(&animation, 500.0, "shadow.blur"),
+            Some(json!(3.0))
+        );
+        assert_eq!(drawable_track(&animation, 1500.0, "width"), Some(json!(2)));
+    }
+}
 
 /// The properties of one animation sampled at one time.
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -111,12 +187,14 @@ impl Animation {
 
 struct Xform {
     origin: Vec2,
+    translation: Vec2,
     scale: f32,
     sin: f32,
     cos: f32,
     rotated: bool,
     opacity: f32,
     dash_offset: f32,
+    scale_strokes: bool,
 }
 
 impl Xform {
@@ -124,12 +202,29 @@ impl Xform {
         let (sin, cos) = s.rotate.to_radians().sin_cos();
         Self {
             origin: a.origin,
+            translation: Vec2 { x: 0.0, y: 0.0 },
             scale: s.scale,
             sin,
             cos,
             rotated: s.rotate != 0.0,
             opacity: s.opacity,
             dash_offset: s.dash_offset,
+            scale_strokes: true,
+        }
+    }
+
+    fn group(origin: Vec2, translation: Vec2, scale: f32, radians: f32, opacity: f32) -> Self {
+        let (sin, cos) = radians.sin_cos();
+        Self {
+            origin,
+            translation,
+            scale,
+            sin,
+            cos,
+            rotated: radians != 0.0,
+            opacity,
+            dash_offset: 0.0,
+            scale_strokes: false,
         }
     }
 
@@ -139,8 +234,8 @@ impl Xform {
             (p.y - self.origin.y) * self.scale,
         );
         Vec2 {
-            x: self.origin.x + dx * self.cos - dy * self.sin,
-            y: self.origin.y + dx * self.sin + dy * self.cos,
+            x: self.origin.x + dx * self.cos - dy * self.sin + self.translation.x,
+            y: self.origin.y + dx * self.sin + dy * self.cos + self.translation.y,
         }
     }
 
@@ -152,11 +247,56 @@ impl Xform {
     fn stroke(&self, s: &Stroke) -> Stroke {
         Stroke {
             color: self.color(s.color),
-            width: s.width * self.scale,
-            dash: s.dash.iter().map(|d| d * self.scale).collect(),
+            width: s.width * if self.scale_strokes { self.scale } else { 1.0 },
+            dash: s
+                .dash
+                .iter()
+                .map(|d| d * if self.scale_strokes { self.scale } else { 1.0 })
+                .collect(),
             dash_offset: s.dash_offset + self.dash_offset,
             cap: s.cap,
             join: s.join,
+        }
+    }
+
+    fn gradient(&self, gradient: &Gradient) -> Gradient {
+        let stops = |stops: &[crate::packet::GradientStop]| {
+            stops
+                .iter()
+                .map(|stop| crate::packet::GradientStop {
+                    offset: stop.offset,
+                    color: self.color(stop.color),
+                })
+                .collect()
+        };
+        match gradient {
+            Gradient::Linear {
+                from,
+                to,
+                stops: colors,
+            } => Gradient::Linear {
+                from: self.point(*from),
+                to: self.point(*to),
+                stops: stops(colors),
+            },
+            Gradient::Radial {
+                center,
+                radius,
+                stops: colors,
+            } => Gradient::Radial {
+                center: self.point(*center),
+                radius: radius * self.scale,
+                stops: stops(colors),
+            },
+            Gradient::Conic {
+                center,
+                angle,
+                stops: colors,
+            } => Gradient::Conic {
+                center: self.point(*center),
+                angle: angle + self.sin.atan2(self.cos),
+                stops: stops(colors),
+            },
         }
     }
 
@@ -245,6 +385,66 @@ impl Xform {
                 fill: fill.map(|c| self.color(c)),
                 stroke: stroke.as_ref().map(|s| self.stroke(s)),
             },
+            DrawCommand::GradientPath {
+                segments,
+                fill,
+                stroke,
+                fill_gradient,
+                stroke_gradient,
+            } => DrawCommand::GradientPath {
+                segments: self.segments(segments),
+                fill: fill.map(|color| self.color(color)),
+                stroke: stroke.as_ref().map(|stroke| self.stroke(stroke)),
+                fill_gradient: fill_gradient
+                    .as_ref()
+                    .map(|gradient| self.gradient(gradient)),
+                stroke_gradient: stroke_gradient
+                    .as_ref()
+                    .map(|gradient| self.gradient(gradient)),
+            },
+            DrawCommand::PatternPath {
+                segments,
+                pattern,
+                opacity,
+            } => {
+                let scale = match pattern {
+                    FillPattern::Noise {
+                        scale,
+                        alpha,
+                        color,
+                    } => FillPattern::Noise {
+                        scale: *scale / self.scale.abs().max(f32::EPSILON),
+                        alpha: *alpha,
+                        color: *color,
+                    },
+                    FillPattern::Image { url, scale } => FillPattern::Image {
+                        url: url.clone(),
+                        scale: *scale / self.scale.abs().max(f32::EPSILON),
+                    },
+                };
+                DrawCommand::PatternPath {
+                    segments: self.segments(segments),
+                    pattern: scale,
+                    opacity: *opacity * self.opacity,
+                }
+            }
+            DrawCommand::Blurred { command, radius } => DrawCommand::Blurred {
+                command: Box::new(self.command(command)),
+                radius: *radius,
+            },
+            DrawCommand::AdditiveGroup { commands } => DrawCommand::AdditiveGroup {
+                commands: commands
+                    .iter()
+                    .map(|command| self.command(command))
+                    .collect(),
+            },
+            DrawCommand::ClipGroup { clip, commands } => DrawCommand::ClipGroup {
+                clip: self.segments(clip),
+                commands: commands
+                    .iter()
+                    .map(|command| self.command(command))
+                    .collect(),
+            },
             DrawCommand::ClippedPath {
                 segments,
                 fill,
@@ -291,16 +491,115 @@ impl Xform {
                     width: h.width * self.scale,
                 }),
             },
-            DrawCommand::Quad { rect, color } => DrawCommand::Quad {
-                rect: *rect,
+            DrawCommand::Quad { rect, color } if self.rotated => DrawCommand::Poly {
+                points: [
+                    Vec2 {
+                        x: rect.x,
+                        y: rect.y,
+                    },
+                    Vec2 {
+                        x: rect.x + rect.w,
+                        y: rect.y,
+                    },
+                    Vec2 {
+                        x: rect.x + rect.w,
+                        y: rect.y + rect.h,
+                    },
+                    Vec2 {
+                        x: rect.x,
+                        y: rect.y + rect.h,
+                    },
+                ]
+                .map(|p| self.point(p))
+                .to_vec(),
                 color: self.color(*color),
             },
+            DrawCommand::Quad { rect, color } => {
+                let p = self.point(Vec2 {
+                    x: rect.x,
+                    y: rect.y,
+                });
+                DrawCommand::Quad {
+                    rect: crate::packet::Rect {
+                        x: p.x,
+                        y: p.y,
+                        w: rect.w * self.scale,
+                        h: rect.h * self.scale,
+                    },
+                    color: self.color(*color),
+                }
+            }
             DrawCommand::Poly { points, color } => DrawCommand::Poly {
                 points: points.iter().map(|p| self.point(*p)).collect(),
                 color: self.color(*color),
             },
+            DrawCommand::TexturedTriangle {
+                texture,
+                points,
+                uv,
+                uv_in_pixels,
+                opacity,
+            } => DrawCommand::TexturedTriangle {
+                texture: texture.clone(),
+                points: points.map(|point| self.point(point)),
+                uv: *uv,
+                uv_in_pixels: *uv_in_pixels,
+                opacity: opacity * self.opacity,
+            },
+            DrawCommand::Sprite {
+                texture,
+                src,
+                dst,
+                rotation,
+                opacity,
+                flip_x,
+                flip_y,
+            } => {
+                let center = self.point(Vec2 {
+                    x: dst.x + dst.w / 2.0,
+                    y: dst.y + dst.h / 2.0,
+                });
+                let w = dst.w * self.scale.abs();
+                let h = dst.h * self.scale.abs();
+                DrawCommand::Sprite {
+                    texture: texture.clone(),
+                    src: *src,
+                    dst: crate::packet::Rect {
+                        x: center.x - w / 2.0,
+                        y: center.y - h / 2.0,
+                        w,
+                        h,
+                    },
+                    rotation: *rotation
+                        + self.sin.atan2(self.cos)
+                        + if self.scale < 0.0 {
+                            std::f32::consts::PI
+                        } else {
+                            0.0
+                        },
+                    opacity: *opacity * self.opacity,
+                    flip_x: *flip_x,
+                    flip_y: *flip_y,
+                }
+            }
             other => other.clone(),
         }
+    }
+}
+
+/// Apply one 2D group transform to the range a drawable group just emitted.
+/// The same command geometry path serves packet animations and group nesting.
+pub(crate) fn transform_group_commands(
+    commands: &mut [DrawCommand],
+    origin: Vec2,
+    translation: Vec2,
+    scale: f32,
+    radians: f32,
+    opacity: f32,
+) {
+    let transform = Xform::group(origin, translation, scale, radians, opacity);
+    for command in commands {
+        *command = transform.command(command);
     }
 }
 
@@ -796,5 +1095,90 @@ mod tests {
             }
             _ => panic!("text and line"),
         }
+    }
+
+    #[test]
+    fn affine_group_transform_carries_quad_sprite_and_constant_width_stroke() {
+        let mut commands = vec![
+            DrawCommand::Quad {
+                rect: crate::packet::Rect {
+                    x: 1.0,
+                    y: 0.0,
+                    w: 2.0,
+                    h: 1.0,
+                },
+                color: RED,
+            },
+            DrawCommand::Sprite {
+                texture: "icon.png".into(),
+                src: crate::packet::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 2.0,
+                    h: 2.0,
+                },
+                dst: crate::packet::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 2.0,
+                    h: 2.0,
+                },
+                rotation: 0.0,
+                opacity: 1.0,
+                flip_x: false,
+                flip_y: false,
+            },
+            DrawCommand::Path {
+                segments: vec![
+                    PathSegment::MoveTo { x: 0.0, y: 0.0 },
+                    PathSegment::LineTo { x: 1.0, y: 0.0 },
+                ],
+                fill: None,
+                stroke: Some(Stroke {
+                    color: RED,
+                    width: 3.0,
+                    dash: vec![2.0, 1.0],
+                    dash_offset: 0.0,
+                    cap: LineCap::Butt,
+                    join: LineJoin::Miter,
+                }),
+            },
+        ];
+        transform_group_commands(
+            &mut commands,
+            Vec2 { x: 0.0, y: 0.0 },
+            Vec2 { x: 5.0, y: 7.0 },
+            2.0,
+            std::f32::consts::FRAC_PI_2,
+            0.5,
+        );
+        let DrawCommand::Poly { points, color } = &commands[0] else {
+            panic!("rotated quad")
+        };
+        assert!((points[0].x - 5.0).abs() < 1e-4 && (points[0].y - 9.0).abs() < 1e-4);
+        assert_eq!(color[3], 0.5);
+        let DrawCommand::Sprite {
+            dst,
+            rotation,
+            opacity,
+            ..
+        } = &commands[1]
+        else {
+            panic!("sprite")
+        };
+        assert!((dst.x - 1.0).abs() < 1e-4 && (dst.y - 7.0).abs() < 1e-4);
+        assert_eq!((dst.w, dst.h), (4.0, 4.0));
+        assert!((*rotation - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
+        assert_eq!(*opacity, 0.5);
+        let DrawCommand::Path {
+            stroke: Some(stroke),
+            ..
+        } = &commands[2]
+        else {
+            panic!("path stroke")
+        };
+        assert_eq!(stroke.width, 3.0);
+        assert_eq!(stroke.dash, vec![2.0, 1.0]);
+        assert_eq!(stroke.color[3], 0.5);
     }
 }

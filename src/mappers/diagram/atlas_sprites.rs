@@ -108,7 +108,7 @@ pub fn image(props: &Value, viewport: Option<(f32, f32)>) -> Result<MappedScene,
     let theme = theme_for(props);
     let (xf, pw, ph) = frame(bw, bh, viewport);
     let mut pen = Pen::new(&theme, xf);
-    pen.clear(theme.ground);
+    pen.clear([0.0, 0.0, 0.0, 0.0]);
     if let Some(r) = src.rect {
         let (k_contain, k_cover) = ((bw / r.w).min(bh / r.h), (bw / r.w).max(bh / r.h));
         let (s_rect, d_rect) = match props_str(props, "fit").unwrap_or("contain") {
@@ -168,11 +168,15 @@ fn style_px(props: &Value, key: &str) -> Option<f32> {
         .and_then(|n| n.trim().parse::<f32>().ok())
     {
         Some(n) => Some(n),
-        None => {
-            gap_once("atlas-panel-style", &format!("style.{key} `{text}` is not a pixel size — the panel keeps its border-only size"));
-            None
-        }
+        None => None,
     }
+}
+
+fn panel_extent(props: &Value, key: &str) -> Result<f32, CanvasSceneError> {
+    style_px(props, key).ok_or_else(|| CanvasSceneError::MissingField {
+        pattern: "atlas-panel".into(),
+        field: format!("style.{key} (a pixel size)"),
+    })
 }
 
 pub fn panel(props: &Value, viewport: Option<(f32, f32)>) -> Result<MappedScene, CanvasSceneError> {
@@ -184,10 +188,9 @@ pub fn panel(props: &Value, viewport: Option<(f32, f32)>) -> Result<MappedScene,
     let repeat = props_str(props, "mode") == Some("repeat");
     let border_slice = props_f32(props, "borderSlice", 16.0);
     let border_w = props_f32(props, "borderWidth", 16.0);
-    let fallback = if repeat { 0.0 } else { border_w * 2.0 };
     let (bw, bh) = (
-        style_px(props, "width").unwrap_or(fallback),
-        style_px(props, "height").unwrap_or(fallback),
+        panel_extent(props, "width")?,
+        panel_extent(props, "height")?,
     );
     if bw <= 0.0 || bh <= 0.0 {
         return Err(CanvasSceneError::NothingToDraw(
@@ -206,7 +209,7 @@ pub fn panel(props: &Value, viewport: Option<(f32, f32)>) -> Result<MappedScene,
     let theme = theme_for(props);
     let (xf, pw, ph) = frame(bw, bh, viewport);
     let mut pen = Pen::new(&theme, xf);
-    pen.clear(theme.ground);
+    pen.clear([0.0, 0.0, 0.0, 0.0]);
     let Some(r) = src.rect else {
         return Ok(pen.finish("atlas-panel", pw, ph));
     };
@@ -436,12 +439,19 @@ mod tests {
         let bare = panel(
             &json!({"type": "atlas-panel", "asset": asset_of("panel.png"), "borderWidth": 10}),
             None,
+        );
+        assert!(matches!(
+            bare,
+            Err(CanvasSceneError::MissingField { ref field, .. }) if field.starts_with("style.width")
+        ));
+        let measured = panel(
+            &json!({"type": "atlas-panel", "asset": asset_of("panel.png"), "borderWidth": 10, "style": {"width": 20, "height": 20}}),
+            None,
         )
         .unwrap();
         assert_eq!(
-            (bare.packet.width, bare.packet.height),
-            (20.0, 20.0),
-            "no content and no size: just the border"
+            (measured.packet.width, measured.packet.height),
+            (20.0, 20.0)
         );
     }
 
@@ -457,9 +467,50 @@ mod tests {
                     &json!({"type": "atlas-panel", "mode": "repeat", "asset": asset_of("gem.png")}),
                     None
                 ),
-                Err(CanvasSceneError::NothingToDraw(_))
+                Err(CanvasSceneError::MissingField { .. })
             ),
-            "a tiled box with no size is empty on the web too"
+            "a panel without a declared size is an error"
         );
+    }
+
+    #[test]
+    fn atlas_scenes_keep_the_host_surface_transparent() {
+        for scene in [
+            image(
+                &json!({"type": "atlas-image", "asset": asset_of("gem.png")}),
+                None,
+            )
+            .unwrap(),
+            panel(
+                &json!({"type": "atlas-panel", "asset": asset_of("panel.png"), "borderWidth": 8, "style": {"width": 40, "height": 40}}),
+                None,
+            )
+            .unwrap(),
+        ] {
+            assert!(matches!(
+                scene.packet.draw_commands.first(),
+                Some(DrawCommand::Clear { color }) if *color == [0.0, 0.0, 0.0, 0.0]
+            ));
+        }
+    }
+
+    #[test]
+    fn repeat_panel_needs_an_authored_size_and_fits_its_measured_viewport() {
+        assert!(matches!(
+            panel(
+                &json!({"type": "atlas-panel", "mode": "repeat", "asset": asset_of("gem.png")}),
+                Some((100.0, 48.0)),
+            ),
+            Err(CanvasSceneError::MissingField { .. })
+        ));
+        let scene = panel(
+            &json!({"type": "atlas-panel", "mode": "repeat", "asset": asset_of("gem.png"), "style": {"width": 100, "height": 48}}),
+            Some((100.0, 48.0)),
+        )
+        .unwrap();
+        assert_eq!((scene.packet.width, scene.packet.height), (100.0, 48.0));
+        let tiles = sprites(&scene);
+        assert_eq!(tiles.len(), 3);
+        assert_eq!((tiles[2].0.w, tiles[2].1.w), (4.0, 4.0));
     }
 }

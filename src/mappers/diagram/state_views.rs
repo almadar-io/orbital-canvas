@@ -348,6 +348,34 @@ mod tests {
     }
 
     #[test]
+    fn jazari_machine_paints_each_source_of_a_multi_source_transition() {
+        let mut props = jazari_props();
+        let baseline = texts(&jazari(&props, None).unwrap())
+            .iter()
+            .filter(|text| *text == "COMPARE")
+            .count();
+        props["schema"]["orbitals"][0]["traits"][0]["stateMachine"]["transitions"][1]["from"] =
+            json!(["idle", "embedding"]);
+        let trait_data = TraitData::from_trait(
+            &props["schema"]["orbitals"][0]["traits"][0],
+            "SimilarityComparison",
+        )
+        .unwrap();
+        let sources: Vec<_> = trait_data
+            .transitions
+            .iter()
+            .filter(|transition| transition.index == 1)
+            .map(|transition| transition.from.as_str())
+            .collect();
+        assert_eq!(sources, ["idle", "embedding"]);
+        let painted = texts(&jazari(&props, None).unwrap());
+        assert_eq!(
+            painted.iter().filter(|text| *text == "COMPARE").count(),
+            baseline + 1
+        );
+    }
+
+    #[test]
     fn taps_report_the_state_and_the_transition_with_the_web_payloads() {
         let scene = state_machine_view(&machine(), None).unwrap();
         let state_hits: Vec<_> = scene

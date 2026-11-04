@@ -116,10 +116,7 @@ pub unsafe extern "C" fn orbital_canvas_destroy(renderer: *mut Canvas) {
 /// `renderer` must be a valid pointer. `json_packet` must be a valid
 /// null-terminated UTF-8 string.
 #[no_mangle]
-pub unsafe extern "C" fn orbital_canvas_submit(
-    renderer: *mut Canvas,
-    json_packet: *const c_char,
-) {
+pub unsafe extern "C" fn orbital_canvas_submit(renderer: *mut Canvas, json_packet: *const c_char) {
     if renderer.is_null() || json_packet.is_null() {
         return;
     }
@@ -211,11 +208,7 @@ pub unsafe extern "C" fn orbital_canvas_render(renderer: *mut Canvas) {
 /// # Safety
 /// `renderer` must be a valid pointer.
 #[no_mangle]
-pub unsafe extern "C" fn orbital_canvas_resize(
-    renderer: *mut Canvas,
-    width: u32,
-    height: u32,
-) {
+pub unsafe extern "C" fn orbital_canvas_resize(renderer: *mut Canvas, width: u32, height: u32) {
     if renderer.is_null() {
         return;
     }
@@ -240,10 +233,7 @@ pub unsafe extern "C" fn orbital_canvas_resize(
 /// # Safety
 /// `renderer` must be a valid pointer.
 #[no_mangle]
-pub unsafe extern "C" fn orbital_canvas_set_scale(
-    renderer: *mut Canvas,
-    scale: f32,
-) -> c_int {
+pub unsafe extern "C" fn orbital_canvas_set_scale(renderer: *mut Canvas, scale: f32) -> c_int {
     if renderer.is_null() {
         return 0;
     }
@@ -270,16 +260,27 @@ pub unsafe extern "C" fn orbital_canvas_set_clock(renderer: *mut Canvas, ms: f64
     guarded("set_clock", (), || (*renderer).set_clock(ms))
 }
 
+/// Give world FX its epoch paint clock (`bornAt` is an epoch timestamp).
+///
+/// # Safety
+/// `renderer` must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn orbital_canvas_set_epoch_clock(renderer: *mut Canvas, epoch_ms: f64) {
+    if renderer.is_null() || !epoch_ms.is_finite() || epoch_ms <= 0.0 {
+        return;
+    }
+    guarded("set_epoch_clock", (), || {
+        (*renderer).set_epoch_clock(epoch_ms)
+    })
+}
+
 /// Allow (non-zero) or forbid (0) motion: the host passes the OS reduced-motion setting here.
 /// Forbidden, animated scenes draw their rest frame.
 ///
 /// # Safety
 /// `renderer` must be a valid pointer.
 #[no_mangle]
-pub unsafe extern "C" fn orbital_canvas_set_motion(
-    renderer: *mut Canvas,
-    enabled: c_int,
-) {
+pub unsafe extern "C" fn orbital_canvas_set_motion(renderer: *mut Canvas, enabled: c_int) {
     if renderer.is_null() {
         return;
     }
@@ -388,9 +389,7 @@ pub unsafe extern "C" fn orbital_canvas_scene_size(
 /// # Safety
 /// `renderer` must be a valid pointer.
 #[no_mangle]
-pub unsafe extern "C" fn orbital_canvas_take_events(
-    renderer: *mut Canvas,
-) -> *mut c_char {
+pub unsafe extern "C" fn orbital_canvas_take_events(renderer: *mut Canvas) -> *mut c_char {
     if renderer.is_null() {
         return ptr::null_mut();
     }
@@ -413,12 +412,7 @@ pub unsafe extern "C" fn orbital_canvas_take_events(
 /// # Safety
 /// `renderer` must be a valid pointer.
 #[no_mangle]
-pub unsafe extern "C" fn orbital_canvas_zoom(
-    renderer: *mut Canvas,
-    factor: f32,
-    x: f32,
-    y: f32,
-) {
+pub unsafe extern "C" fn orbital_canvas_zoom(renderer: *mut Canvas, factor: f32, x: f32, y: f32) {
     if renderer.is_null() {
         return;
     }
@@ -508,9 +502,7 @@ pub unsafe extern "C" fn orbital_canvas_add_font(
 /// # Safety
 /// `renderer` may be null (errors from failed init are also captured).
 #[no_mangle]
-pub unsafe extern "C" fn orbital_canvas_last_error(
-    _renderer: *mut Canvas,
-) -> *mut c_char {
+pub unsafe extern "C" fn orbital_canvas_last_error(_renderer: *mut Canvas) -> *mut c_char {
     guarded("last_error", ptr::null_mut(), || {
         let msg = get_last_error();
         match CString::new(msg) {
@@ -694,9 +686,7 @@ mod tests {
     }
 
     fn headless() -> *mut Canvas {
-        Box::into_raw(Box::new(
-            Canvas::new_headless().expect("headless renderer"),
-        ))
+        Box::into_raw(Box::new(Canvas::new_headless().expect("headless renderer")))
     }
 
     #[test]
@@ -727,12 +717,13 @@ mod tests {
             0
         );
         assert!(get_last_error().contains("not valid JSON"));
-        let three_d = CString::new(r#"{"type":"canvas","mode":"3d"}"#).unwrap();
+        let missing_3d_camera = CString::new(r#"{"type":"canvas","mode":"3d"}"#).unwrap();
         assert_eq!(
-            unsafe { orbital_canvas_set_scene(renderer, three_d.as_ptr()) },
+            unsafe { orbital_canvas_set_scene(renderer, missing_3d_camera.as_ptr()) },
             0
         );
-        assert!(get_last_error().contains("3d"));
+        assert!(get_last_error().contains("3D canvas contract"));
+        assert!(get_last_error().contains("canvas.camera"));
         assert!(unsafe { (*renderer).host.packet.is_none() });
         assert_eq!(
             unsafe { orbital_canvas_set_scene(renderer, ptr::null()) },
@@ -811,8 +802,7 @@ mod tests {
     #[test]
     fn scene_size_reports_the_authored_size_and_refuses_bad_scenes() {
         let (mut w, mut h) = (0.0f32, 0.0f32);
-        let ok =
-            unsafe { orbital_canvas_scene_size(learning_scene().as_ptr(), &mut w, &mut h) };
+        let ok = unsafe { orbital_canvas_scene_size(learning_scene().as_ptr(), &mut w, &mut h) };
         assert_eq!((ok, w, h), (1, 300.0, 200.0));
         let bad = CString::new("{nope").unwrap();
         set_last_error("");
@@ -875,14 +865,7 @@ mod tests {
         let bad = CString::new("{nope").unwrap();
         assert_eq!(
             unsafe {
-                orbital_canvas_render_scene_rgba(
-                    bad.as_ptr(),
-                    10,
-                    10,
-                    1.0,
-                    &mut pixels,
-                    &mut len,
-                )
+                orbital_canvas_render_scene_rgba(bad.as_ptr(), 10, 10, 1.0, &mut pixels, &mut len)
             },
             0
         );
@@ -938,9 +921,7 @@ mod tests {
         );
         let good = CString::new("Ethi").unwrap();
         assert_eq!(
-            unsafe {
-                orbital_canvas_add_font(good.as_ptr(), bytes.as_ptr(), bytes.len(), 0)
-            },
+            unsafe { orbital_canvas_add_font(good.as_ptr(), bytes.as_ptr(), bytes.len(), 0) },
             1
         );
     }
@@ -1089,11 +1070,7 @@ mod tests {
         assert_eq!(unsafe { orbital_canvas_set_scale(r, 2.0) }, 1);
         for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
             set_last_error("");
-            assert_eq!(
-                unsafe { orbital_canvas_set_scale(r, bad) },
-                0,
-                "{bad}"
-            );
+            assert_eq!(unsafe { orbital_canvas_set_scale(r, bad) }, 0, "{bad}");
             assert!(get_last_error().starts_with("set_scale:"));
         }
         assert_eq!(
@@ -1101,10 +1078,7 @@ mod tests {
             1
         );
         assert_eq!(logical_size(r), (300.0, 150.0), "still 2x");
-        assert_eq!(
-            unsafe { orbital_canvas_set_scale(ptr::null_mut(), 2.0) },
-            0
-        );
+        assert_eq!(unsafe { orbital_canvas_set_scale(ptr::null_mut(), 2.0) }, 0);
         set_last_error("");
         unsafe { orbital_canvas_destroy(r) };
     }
@@ -1167,9 +1141,7 @@ mod tests {
                 unsafe { orbital_canvas_resize(r, w, h) };
                 assert_eq!(unsafe { orbital_canvas_set_scale(r, density) }, 1);
                 assert_eq!(
-                    unsafe {
-                        orbital_canvas_set_scene(r, board_scene(projection, fit).as_ptr())
-                    },
+                    unsafe { orbital_canvas_set_scene(r, board_scene(projection, fit).as_ptr()) },
                     1
                 );
                 assert_eq!(logical_size(r), (402.0, 724.0));
@@ -1225,6 +1197,7 @@ mod tests {
     fn clock_motion_and_wants_frames_are_null_safe_and_drive_the_renderer() {
         unsafe {
             orbital_canvas_set_clock(ptr::null_mut(), 1.0);
+            orbital_canvas_set_epoch_clock(ptr::null_mut(), 1000.0);
             orbital_canvas_set_motion(ptr::null_mut(), 0);
             assert_eq!(orbital_canvas_wants_frames(ptr::null_mut()), 0);
         }
@@ -1232,18 +1205,21 @@ mod tests {
         let scene = CString::new(r#"{"type":"svg-pulse","rings":3}"#).unwrap();
         unsafe {
             assert_eq!(orbital_canvas_set_scene(r, scene.as_ptr()), 1);
-            assert_eq!(
-                orbital_canvas_wants_frames(r),
-                1,
-                "the pulse animates"
-            );
+            assert_eq!(orbital_canvas_wants_frames(r), 1, "the pulse animates");
             orbital_canvas_set_motion(r, 0);
             assert!(!(*r).is_animated(), "reduced motion stops the animation");
             orbital_canvas_set_motion(r, 1);
             orbital_canvas_set_clock(r, f64::NAN);
-            assert!((*r).host.clock_epoch.is_none(), "a non-finite clock is ignored");
+            assert!(
+                (*r).host.clock_epoch.is_none(),
+                "a non-finite clock is ignored"
+            );
             orbital_canvas_set_clock(r, 250.0);
             assert_eq!((*r).host.clock_epoch, Some(250.0));
+            orbital_canvas_set_epoch_clock(r, f64::NAN);
+            assert_eq!((*r).host.epoch_clock_ms, 0.0);
+            orbital_canvas_set_epoch_clock(r, 1000.0);
+            assert_eq!((*r).host.epoch_clock_ms, 1000.0);
             drop(Box::from_raw(r));
         }
     }

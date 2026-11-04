@@ -108,6 +108,28 @@ pub struct Vec2 {
     pub y: f32,
 }
 
+/// One projected mesh vertex. `x`/`y` are packet pixels; `z` is normalized
+/// depth (0 near, 1 far). Three consecutive vertices form one triangle.
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+pub struct MeshVertex {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub color: [f32; 4],
+}
+
+/// Projected textured mesh vertex. `inverse_depth` reconstructs perspective-
+/// correct UVs after rasterization of packet-space triangles.
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+pub struct TexturedMeshVertex {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub uv: [f32; 2],
+    pub inverse_depth: f32,
+    pub color: [f32; 4],
+}
+
 /// A single tile in a `TileGrid`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Tile {
@@ -174,6 +196,49 @@ pub struct Stroke {
     pub join: LineJoin,
 }
 
+/// One source-tagged color stop of an authored shape gradient.
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+pub struct GradientStop {
+    pub offset: f32,
+    pub color: [f32; 4],
+}
+
+/// Gradient geometry is already projected to packet pixel coordinates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Gradient {
+    Linear {
+        from: Vec2,
+        to: Vec2,
+        stops: Vec<GradientStop>,
+    },
+    Radial {
+        center: Vec2,
+        radius: f32,
+        stops: Vec<GradientStop>,
+    },
+    Conic {
+        center: Vec2,
+        angle: f32,
+        stops: Vec<GradientStop>,
+    },
+}
+
+/// A repeating fill overlay in packet pixel coordinates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum FillPattern {
+    Noise {
+        scale: f32,
+        alpha: f32,
+        color: [f32; 4],
+    },
+    Image {
+        url: String,
+        scale: f32,
+    },
+}
+
 /// One path operation. Angles are radians in screen convention (0 = +x,
 /// increasing clockwise because y points down); an `Arc` sweeps from `start`
 /// to `end` in the direction of the difference, a full ellipse when it spans
@@ -226,10 +291,28 @@ pub enum DrawCommand {
         flip_x: bool,
         flip_y: bool,
     },
+    /// One deformable textured triangle; UVs are normalized unless the source
+    /// mesh declares pixel-space UV coordinates.
+    TexturedTriangle {
+        texture: String,
+        points: [Vec2; 3],
+        uv: [[f32; 2]; 3],
+        uv_in_pixels: bool,
+        opacity: f32,
+    },
     /// Draw a solid colored quad.
     Quad { rect: Rect, color: [f32; 4] },
     /// Draw a filled convex polygon (triangle fan from `points[0]`).
     Poly { points: Vec<Vec2>, color: [f32; 4] },
+    /// Depth-tested projected mesh triangles. The scene mapper owns projection,
+    /// geometry, material, and skinning; this packet preserves their depth.
+    Mesh3D { vertices: Vec<MeshVertex> },
+    /// Depth-tested triangles with perspective-correct UVs. UVs follow glTF:
+    /// top-left image origin, normalized units, and repeat wrapping.
+    TexturedMesh3D {
+        texture: String,
+        vertices: Vec<TexturedMeshVertex>,
+    },
     /// Draw a line segment.
     Line {
         from: Vec2,
@@ -266,6 +349,38 @@ pub enum DrawCommand {
         fill: Option<[f32; 4]>,
         #[serde(default)]
         stroke: Option<Stroke>,
+    },
+    /// Vector shape with authored gradient fill or stroke, using the same
+    /// geometry and stroke rules as `Path`.
+    GradientPath {
+        segments: Vec<PathSegment>,
+        #[serde(default)]
+        fill: Option<[f32; 4]>,
+        #[serde(default)]
+        stroke: Option<Stroke>,
+        #[serde(default)]
+        fill_gradient: Option<Gradient>,
+        #[serde(default)]
+        stroke_gradient: Option<Gradient>,
+    },
+    /// Repeating image or deterministic noise over a path fill, after the
+    /// solid/gradient fill and before the stroke.
+    PatternPath {
+        segments: Vec<PathSegment>,
+        pattern: FillPattern,
+        opacity: f32,
+    },
+    /// Apply a Gaussian blur in painter pixels to one vector draw operation.
+    Blurred {
+        command: Box<DrawCommand>,
+        radius: f32,
+    },
+    /// Composite one shape's vector operations with canvas `lighter` blending.
+    AdditiveGroup { commands: Vec<DrawCommand> },
+    /// Scope mixed child commands to an authored SVG path in packet pixels.
+    ClipGroup {
+        clip: Vec<PathSegment>,
+        commands: Vec<DrawCommand>,
     },
     /// A path painted only where every `clip` region covers and no `cut` region does
     /// (canvas `clip()` then `destination-out`): venn regions and hatch fills.
