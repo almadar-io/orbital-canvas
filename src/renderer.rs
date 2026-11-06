@@ -12,7 +12,7 @@ fn align_up(value: usize, alignment: usize) -> usize {
 /// Lazily-initialized GPU resources needed for offscreen rendering.
 pub(crate) struct DeviceResources {
     #[allow(dead_code)]
-    pub adapter: wgpu::Adapter,
+    pub adapter: Option<wgpu::Adapter>,
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
     /// Format used by the render pipeline (Rgba8Unorm headless; surface format on-screen).
@@ -1652,47 +1652,38 @@ impl Canvas {
     /// Ensure a `wgpu` adapter, device, queue, and pipeline are available.
     fn ensure_device_resources(&mut self) -> Result<&DeviceResources> {
         if self.device_resources.is_none() {
-            let adapter =
-                pollster::block_on(self.instance.request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    compatible_surface: self.surface.as_ref(),
-                    force_fallback_adapter: false,
-                }))
-                .map_err(|_| RendererError::NoAdapter)?;
-
-            let (device, queue) = pollster::block_on(
-                adapter.request_device(&wgpu::DeviceDescriptor {
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                        .using_resolution(adapter.limits()),
-                    label: Some("orbital-canvas"),
-                    memory_hints: wgpu::MemoryHints::Performance,
-                    trace: wgpu::Trace::Off,
-                }),
-            )
-            .map_err(|e| RendererError::DeviceRequestFailed(e.to_string()))?;
-
-            let device = Arc::new(device);
-            let queue = Arc::new(queue);
+            let shared = crate::device::acquire(&self.instance, self.surface.as_ref())?;
+            if self.surface.is_none() {
+                if let Some(instance) = &shared.instance {
+                    self.instance = instance.clone();
+                }
+            }
+            let device = shared.device.clone();
+            let queue = shared.queue.clone();
 
             // Use the surface's preferred format when on-screen, fall back to Rgba8Unorm headless.
-            let surface_format = self
-                .surface
-                .as_ref()
-                .and_then(|s| {
+            let surface_format = match (self.surface.as_ref(), shared.adapter.as_ref()) {
+                (Some(s), Some(adapter)) => {
                     // Packet colors are already sRGB-encoded (CSS values): an sRGB target would
                     // encode them a second time and wash every color out.
-                    let formats = s.get_capabilities(&adapter).formats;
+                    let formats = s.get_capabilities(adapter).formats;
                     formats
                         .iter()
                         .copied()
                         .find(|f| !f.is_srgb())
                         .or_else(|| formats.first().copied())
-                })
-                .unwrap_or(wgpu::TextureFormat::Rgba8Unorm);
+                        .unwrap_or(wgpu::TextureFormat::Rgba8Unorm)
+                }
+                (Some(_), None) => {
+                    return Err(RendererError::Surface(
+                        "a surface needs the adapter that opened the shared device".into(),
+                    ))
+                }
+                (None, _) => wgpu::TextureFormat::Rgba8Unorm,
+            };
 
             self.device_resources = Some(DeviceResources {
-                adapter,
+                adapter: shared.adapter,
                 device: device.clone(),
                 queue: queue.clone(),
                 surface_format,

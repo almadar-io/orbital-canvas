@@ -8,7 +8,9 @@ pub mod animate;
 pub mod asset;
 pub mod atlas;
 pub mod c_api;
+pub mod device;
 pub mod fx_projection;
+pub mod gpu;
 pub mod mappers;
 pub mod packet;
 pub mod platform;
@@ -24,6 +26,10 @@ use packet::GameRenderPacket;
 use thiserror::Error;
 
 pub(crate) use renderer::DeviceResources;
+#[cfg(not(target_arch = "wasm32"))]
+pub use device::shared_device;
+pub use device::{register_device, shared_device_async};
+pub use gpu::GpuHost;
 pub use renderer::SharedDeviceRenderer;
 
 /// Errors that can occur when creating or using the renderer.
@@ -862,7 +868,10 @@ mod tests {
             return; // no adapter — skip
         }
         let resources = renderer.device_resources.as_ref().expect("device created");
-        let adapter_limits = resources.adapter.limits();
+        let Some(adapter) = resources.adapter.as_ref() else {
+            return;
+        };
+        let adapter_limits = adapter.limits();
         let device_limits = resources.device.limits();
         assert_eq!(
             device_limits.max_texture_dimension_2d,
@@ -872,10 +881,13 @@ mod tests {
             device_limits.max_texture_dimension_2d >= 4096
                 || adapter_limits.max_texture_dimension_2d < 4096
         );
-        // Control: only resolution is lifted; other limits stay at the downlevel contract.
+        // The shared device is compute-capable; the WebGL2 downlevel contract would zero these.
+        assert!(device_limits.max_compute_workgroups_per_dimension > 0);
+        assert!(device_limits.max_storage_buffers_per_shader_stage > 0);
+        // Control: the rest stays at the downlevel defaults.
         assert_eq!(
             device_limits.max_bind_groups,
-            wgpu::Limits::downlevel_webgl2_defaults().max_bind_groups
+            wgpu::Limits::downlevel_defaults().max_bind_groups
         );
     }
 
