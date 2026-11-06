@@ -2,6 +2,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Where a particle draw reads its packed words.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "from", rename_all = "kebab-case")]
+pub enum ParticleSource {
+    /// Words inline (a CPU copy, e.g. a readback).
+    Bytes { data: Vec<u8> },
+    /// A live GPU buffer (`{ id, device }` of a `GpuBuffer` handle), drawn where it lies (EXEC-GPU-7).
+    Gpu { id: u64, device: u64 },
+}
+
 /// Top-level packet describing one frame of game rendering.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GameRenderPacket {
@@ -106,28 +116,6 @@ pub struct Rect {
 pub struct Vec2 {
     pub x: f32,
     pub y: f32,
-}
-
-/// One projected mesh vertex. `x`/`y` are packet pixels; `z` is normalized
-/// depth (0 near, 1 far). Three consecutive vertices form one triangle.
-#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
-pub struct MeshVertex {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-    pub color: [f32; 4],
-}
-
-/// Projected textured mesh vertex. `inverse_depth` reconstructs perspective-
-/// correct UVs after rasterization of packet-space triangles.
-#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
-pub struct TexturedMeshVertex {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-    pub uv: [f32; 2],
-    pub inverse_depth: f32,
-    pub color: [f32; 4],
 }
 
 /// A single tile in a `TileGrid`.
@@ -304,18 +292,20 @@ pub enum DrawCommand {
     Quad { rect: Rect, color: [f32; 4] },
     /// Draw a filled convex polygon (triangle fan from `points[0]`).
     Poly { points: Vec<Vec2>, color: [f32; 4] },
+    /// Packed particles drawn in one instanced pass: one little-endian 32-bit word every `stride` bytes, x in bits
+    /// 0-11, y in bits 12-23 (scene pixels) and a `palette` index in bits 24-31; each a square of half-size
+    /// `radius` scene pixels, placed at `origin + scene * scale` in packet units.
+    Particles {
+        source: ParticleSource,
+        stride: u32,
+        radius: f32,
+        palette: Vec<[f32; 4]>,
+        scale: f32,
+        origin: Vec2,
+    },
     /// A whole 3D scene drawn by [`crate::scene3d::Renderer3D`] across the surface, before the 2D commands, which
     /// paint over it.
     Scene3D { scene: Box<crate::scene3d::Scene3D> },
-    /// Depth-tested projected mesh triangles. The scene mapper owns projection,
-    /// geometry, material, and skinning; this packet preserves their depth.
-    Mesh3D { vertices: Vec<MeshVertex> },
-    /// Depth-tested triangles with perspective-correct UVs. UVs follow glTF:
-    /// top-left image origin, normalized units, and repeat wrapping.
-    TexturedMesh3D {
-        texture: String,
-        vertices: Vec<TexturedMeshVertex>,
-    },
     /// Draw a line segment.
     Line {
         from: Vec2,

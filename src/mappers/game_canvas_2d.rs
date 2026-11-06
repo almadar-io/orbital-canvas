@@ -211,6 +211,8 @@ pub enum CanvasSceneError {
     NothingToDraw(String),
     #[error("3D canvas contract is unsupported: {0}")]
     Unsupported3DContract(String),
+    #[error("`{field}`: {detail}")]
+    InvalidProp { field: String, detail: String },
     #[error(transparent)]
     Fx(#[from] crate::fx_projection::FxError),
     #[error(transparent)]

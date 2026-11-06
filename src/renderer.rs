@@ -1,6 +1,6 @@
 //! GPU pipeline and offscreen rendering for [`Canvas`].
 
-use crate::packet::{DrawCommand, GameRenderPacket, MeshVertex, Rect, TexturedMeshVertex, Vec2};
+use crate::packet::{DrawCommand, GameRenderPacket, Rect, Vec2};
 use crate::{Canvas, RendererError, Result};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -24,228 +24,6 @@ pub(crate) struct DeviceResources {
 struct Vertex {
     position: [f32; 2],
     color: [f32; 4],
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct MeshGpuVertex {
-    position: [f32; 3],
-    color: [f32; 4],
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct TexturedMeshGpuVertex {
-    position: [f32; 3],
-    uv_over_depth: [f32; 2],
-    inverse_depth: f32,
-    color: [f32; 4],
-}
-
-impl TexturedMeshGpuVertex {
-    const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
-        array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
-        step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &[
-            wgpu::VertexAttribute {
-                offset: 0,
-                shader_location: 0,
-                format: wgpu::VertexFormat::Float32x3,
-            },
-            wgpu::VertexAttribute {
-                offset: 12,
-                shader_location: 1,
-                format: wgpu::VertexFormat::Float32x2,
-            },
-            wgpu::VertexAttribute {
-                offset: 20,
-                shader_location: 2,
-                format: wgpu::VertexFormat::Float32,
-            },
-            wgpu::VertexAttribute {
-                offset: 24,
-                shader_location: 3,
-                format: wgpu::VertexFormat::Float32x4,
-            },
-        ],
-    };
-}
-
-const TEXTURED_MESH_SHADER_SOURCE: &str = r#"
-@group(0) @binding(0) var t_diffuse: texture_2d<f32>;
-@group(0) @binding(1) var s_diffuse: sampler;
-
-struct VertexInput {
-    @location(0) position: vec3<f32>,
-    @location(1) uv_over_depth: vec2<f32>,
-    @location(2) inverse_depth: f32,
-    @location(3) color: vec4<f32>,
-};
-
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) uv_over_depth: vec2<f32>,
-    @location(1) inverse_depth: f32,
-    @location(2) color: vec4<f32>,
-};
-
-@vertex
-fn vs_main(in: VertexInput) -> VertexOutput {
-    var out: VertexOutput;
-    out.clip_position = vec4<f32>(in.position, 1.0);
-    out.uv_over_depth = in.uv_over_depth;
-    out.inverse_depth = in.inverse_depth;
-    out.color = in.color;
-    return out;
-}
-
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let uv = in.uv_over_depth / in.inverse_depth;
-    return textureSample(t_diffuse, s_diffuse, uv) * in.color;
-}
-"#;
-
-impl MeshGpuVertex {
-    const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
-        array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
-        step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &[
-            wgpu::VertexAttribute {
-                offset: 0,
-                shader_location: 0,
-                format: wgpu::VertexFormat::Float32x3,
-            },
-            wgpu::VertexAttribute {
-                offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
-                shader_location: 1,
-                format: wgpu::VertexFormat::Float32x4,
-            },
-        ],
-    };
-}
-
-const MESH_SHADER_SOURCE: &str = r#"
-struct VertexInput {
-    @location(0) position: vec3<f32>,
-    @location(1) color: vec4<f32>,
-};
-
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) color: vec4<f32>,
-};
-
-@vertex
-fn vs_main(in: VertexInput) -> VertexOutput {
-    var out: VertexOutput;
-    out.clip_position = vec4<f32>(in.position, 1.0);
-    out.color = in.color;
-    return out;
-}
-
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return in.color;
-}
-"#;
-
-fn build_mesh_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("game mesh shader"),
-        source: wgpu::ShaderSource::Wgsl(MESH_SHADER_SOURCE.into()),
-    });
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("game mesh pipeline layout"),
-        bind_group_layouts: &[],
-        push_constant_ranges: &[],
-    });
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("game mesh pipeline"),
-        layout: Some(&layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            buffers: &[MeshGpuVertex::LAYOUT],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            cull_mode: None,
-            ..Default::default()
-        },
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
-            stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
-        }),
-        multisample: wgpu::MultisampleState::default(),
-        multiview: None,
-        cache: None,
-    })
-}
-
-fn build_textured_mesh_pipeline(
-    device: &wgpu::Device,
-    format: wgpu::TextureFormat,
-    texture_layout: &wgpu::BindGroupLayout,
-) -> wgpu::RenderPipeline {
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("game textured mesh shader"),
-        source: wgpu::ShaderSource::Wgsl(TEXTURED_MESH_SHADER_SOURCE.into()),
-    });
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("game textured mesh pipeline layout"),
-        bind_group_layouts: &[texture_layout],
-        push_constant_ranges: &[],
-    });
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("game textured mesh pipeline"),
-        layout: Some(&layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            buffers: &[TexturedMeshGpuVertex::LAYOUT],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            cull_mode: None,
-            ..Default::default()
-        },
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
-            stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
-        }),
-        multisample: wgpu::MultisampleState::default(),
-        multiview: None,
-        cache: None,
-    })
 }
 
 impl Vertex {
@@ -575,7 +353,6 @@ struct GpuSprite {
     width: u32,
     height: u32,
     bind_group: wgpu::BindGroup,
-    repeat_bind_group: wgpu::BindGroup,
     /// Value of `SharedDeviceRenderer::use_clock` at the last draw request;
     /// orders eviction (smallest = least recently used).
     last_used: u64,
@@ -584,11 +361,7 @@ struct GpuSprite {
 /// One resolved draw of a frame, in z-order.
 enum Draw {
     Quads(Vec<Vertex>),
-    Mesh3D(Vec<MeshGpuVertex>),
-    TexturedMesh3D {
-        key: SpriteKey,
-        verts: Vec<TexturedMeshGpuVertex>,
-    },
+    Particles(crate::particles::ParticleDraw),
     Sprite {
         key: SpriteKey,
         verts: Vec<SpriteVertex>,
@@ -624,15 +397,12 @@ pub struct SharedDeviceRenderer {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     pipeline: wgpu::RenderPipeline,
-    mesh_pipeline: wgpu::RenderPipeline,
-    textured_mesh_pipeline: wgpu::RenderPipeline,
     sprite_pipeline: wgpu::RenderPipeline,
     additive_sprite_pipeline: wgpu::RenderPipeline,
     sprite_layout: wgpu::BindGroupLayout,
     masked_sprite_pipeline: wgpu::RenderPipeline,
     masked_sprite_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    repeat_sampler: wgpu::Sampler,
     sprites: std::collections::HashMap<SpriteKey, GpuSprite>,
     /// Bumped on every sprite request; stamps `GpuSprite::last_used`.
     use_clock: u64,
@@ -641,6 +411,8 @@ pub struct SharedDeviceRenderer {
     frame_epoch: u64,
     render_depth: usize,
     scene3d: Option<crate::scene3d::Renderer3D>,
+    format: wgpu::TextureFormat,
+    particles: Option<crate::particles::ParticlePass>,
 }
 
 impl SharedDeviceRenderer {
@@ -652,7 +424,6 @@ impl SharedDeviceRenderer {
         format: wgpu::TextureFormat,
     ) -> Self {
         let pipeline = build_pipeline(&device, format);
-        let mesh_pipeline = build_mesh_pipeline(&device, format);
         let (sprite_pipeline, sprite_layout) = build_sprite_pipeline(&device, format);
         let additive_sprite_pipeline = textured_pipeline(
             &device,
@@ -672,19 +443,10 @@ impl SharedDeviceRenderer {
                 },
             },
         );
-        let textured_mesh_pipeline = build_textured_mesh_pipeline(&device, format, &sprite_layout);
         let (masked_sprite_pipeline, masked_sprite_layout) =
             build_masked_sprite_pipeline(&device, format);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("game sprite sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let repeat_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("game mesh repeat sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
@@ -694,20 +456,19 @@ impl SharedDeviceRenderer {
             device,
             queue,
             pipeline,
-            mesh_pipeline,
-            textured_mesh_pipeline,
             sprite_pipeline,
             additive_sprite_pipeline,
             sprite_layout,
             masked_sprite_pipeline,
             masked_sprite_layout,
             sampler,
-            repeat_sampler,
             sprites: std::collections::HashMap::new(),
             use_clock: 0,
             frame_epoch: 0,
             render_depth: 0,
             scene3d: None,
+            format,
+            particles: None,
         }
     }
 
@@ -826,20 +587,6 @@ impl SharedDeviceRenderer {
                 },
             ],
         });
-        let repeat_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("game textured mesh bind group"),
-            layout: &self.sprite_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.repeat_sampler),
-                },
-            ],
-        });
         tracing::info!(target: "almadar::game_renderer", url, width, height, sheet_w = sheet.0, sheet_h = sheet.1, "sprite uploaded");
         if key.raster.is_some() {
             self.evict_stale_svg_rasters(url);
@@ -850,7 +597,6 @@ impl SharedDeviceRenderer {
                 width: sheet.0,
                 height: sheet.1,
                 bind_group,
-                repeat_bind_group,
                 last_used: now,
             },
         );
@@ -1055,25 +801,10 @@ impl SharedDeviceRenderer {
                 },
             ],
         });
-        let repeat_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("game vector repeat bind group"),
-            layout: &self.sprite_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.repeat_sampler),
-                },
-            ],
-        });
         GpuSprite {
             width,
             height,
             bind_group,
-            repeat_bind_group,
             last_used: now,
         }
     }
@@ -1261,48 +992,41 @@ impl SharedDeviceRenderer {
                     self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
                     push_quad(&mut quad_batch, rect, color, width, height);
                 }
+                DrawCommand::Particles {
+                    source,
+                    stride,
+                    radius,
+                    palette,
+                    scale,
+                    origin,
+                } => {
+                    self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
+                    if !quad_batch.is_empty() {
+                        draws.push(Draw::Quads(std::mem::take(&mut quad_batch)));
+                    }
+                    let (device, format) = (self.device.clone(), self.format);
+                    let pass = self.particles.get_or_insert_with(|| {
+                        crate::particles::ParticlePass::new(&device, format)
+                    });
+                    match pass.prepare(
+                        &device,
+                        source,
+                        *stride,
+                        *radius,
+                        palette,
+                        *scale,
+                        *origin,
+                        (width as f32, height as f32),
+                    ) {
+                        Ok(prepared) => draws.push(Draw::Particles(prepared)),
+                        Err(error) => {
+                            tracing::error!(target: "almadar::game_renderer", %error, "particles not drawn")
+                        }
+                    }
+                }
                 DrawCommand::Poly { points, color } => {
                     self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
                     push_poly_fan(&mut quad_batch, points, color, width, height);
-                }
-                DrawCommand::Mesh3D { vertices } => {
-                    self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
-                    if !quad_batch.is_empty() {
-                        draws.push(Draw::Quads(std::mem::take(&mut quad_batch)));
-                    }
-                    let vertices = mesh_gpu_vertices(vertices, width, height);
-                    if !vertices.is_empty() {
-                        draws.push(Draw::Mesh3D(vertices));
-                    }
-                }
-                DrawCommand::TexturedMesh3D { texture, vertices } => {
-                    self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
-                    let Some((sheet_w, sheet_h)) = crate::asset::image_info(texture) else {
-                        continue;
-                    };
-                    let mut target_scale = density;
-                    for triangle in vertices.chunks_exact(3) {
-                        for i in 0..3 {
-                            let j = (i + 1) % 3;
-                            let dst = (triangle[j].x - triangle[i].x)
-                                .hypot(triangle[j].y - triangle[i].y);
-                            let src = ((triangle[j].uv[0] - triangle[i].uv[0]) * sheet_w as f32)
-                                .hypot((triangle[j].uv[1] - triangle[i].uv[1]) * sheet_h as f32);
-                            if src > f32::EPSILON {
-                                target_scale = target_scale.max(dst * density / src);
-                            }
-                        }
-                    }
-                    let Some((key, _)) = self.ensure_sprite(texture, target_scale) else {
-                        continue;
-                    };
-                    if !quad_batch.is_empty() {
-                        draws.push(Draw::Quads(std::mem::take(&mut quad_batch)));
-                    }
-                    let verts = textured_mesh_gpu_vertices(vertices, width, height);
-                    if !verts.is_empty() {
-                        draws.push(Draw::TexturedMesh3D { key, verts });
-                    }
                 }
                 DrawCommand::Path { .. }
                 | DrawCommand::PatternPath { .. }
@@ -1436,29 +1160,6 @@ impl SharedDeviceRenderer {
             draws.push(Draw::Quads(quad_batch));
         }
 
-        let depth_texture = draws
-            .iter()
-            .any(|draw| matches!(draw, Draw::Mesh3D(_) | Draw::TexturedMesh3D { .. }))
-            .then(|| {
-                self.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("game mesh depth"),
-                    size: wgpu::Extent3d {
-                        width: target.width(),
-                        height: target.height(),
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Depth32Float,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    view_formats: &[],
-                })
-            });
-        let depth_view = depth_texture
-            .as_ref()
-            .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
-
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("game shared-device pass"),
@@ -1475,51 +1176,25 @@ impl SharedDeviceRenderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: depth_view.as_ref().map(|view| {
-                    wgpu::RenderPassDepthStencilAttachment {
-                        view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
-                            store: wgpu::StoreOp::Discard,
-                        }),
-                        stencil_ops: None,
-                    }
-                }),
+                depth_stencil_attachment: None,
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
 
             for draw in &draws {
                 match draw {
-                    Draw::Mesh3D(vertices) => {
-                        let buffer =
-                            self.device
-                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                    label: Some("game mesh vertices"),
-                                    contents: bytemuck::cast_slice(vertices),
-                                    usage: wgpu::BufferUsages::VERTEX,
-                                });
-                        pass.set_pipeline(&self.mesh_pipeline);
-                        pass.set_vertex_buffer(0, buffer.slice(..));
-                        pass.draw(0..vertices.len() as u32, 0..1);
-                        drew = true;
-                    }
-                    Draw::TexturedMesh3D { key, verts } => {
-                        let Some(sprite) = self.sprites.get(key) else {
-                            continue;
-                        };
-                        let buffer =
-                            self.device
-                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                    label: Some("game textured mesh vertices"),
-                                    contents: bytemuck::cast_slice(verts),
-                                    usage: wgpu::BufferUsages::VERTEX,
-                                });
-                        pass.set_pipeline(&self.textured_mesh_pipeline);
-                        pass.set_bind_group(0, &sprite.repeat_bind_group, &[]);
-                        pass.set_vertex_buffer(0, buffer.slice(..));
-                        pass.draw(0..verts.len() as u32, 0..1);
-                        drew = true;
+                    Draw::Particles(particles) => {
+                        if let Some(pipeline) = self
+                            .particles
+                            .as_ref()
+                            .and_then(|p| p.pipelines.get(&particles.stride))
+                        {
+                            pass.set_pipeline(pipeline);
+                            pass.set_bind_group(0, &particles.bind_group, &[]);
+                            pass.set_vertex_buffer(0, particles.vertices.slice(..));
+                            pass.draw(0..6, 0..particles.count);
+                            drew = true;
+                        }
                     }
                     Draw::Quads(vertices) => {
                         let buffer =
@@ -1894,166 +1569,8 @@ fn to_ndc(x: f32, y: f32, width: u32, height: u32) -> [f32; 2] {
     ]
 }
 
-fn mesh_gpu_vertices(vertices: &[MeshVertex], width: u32, height: u32) -> Vec<MeshGpuVertex> {
-    let mut result = Vec::with_capacity(vertices.len() / 3 * 3);
-    for triangle in vertices.chunks_exact(3) {
-        if triangle.iter().any(|v| {
-            !v.x.is_finite()
-                || !v.y.is_finite()
-                || !v.z.is_finite()
-                || !(0.0..=1.0).contains(&v.z)
-                || v.color.iter().any(|channel| !channel.is_finite())
-        }) {
-            continue;
-        }
-        result.extend(triangle.iter().map(|v| {
-            let [x, y] = to_ndc(v.x, v.y, width, height);
-            MeshGpuVertex {
-                position: [x, y, v.z],
-                color: v.color,
-            }
-        }));
-    }
-    result
-}
-
-fn textured_mesh_gpu_vertices(
-    vertices: &[TexturedMeshVertex],
-    width: u32,
-    height: u32,
-) -> Vec<TexturedMeshGpuVertex> {
-    let mut result = Vec::with_capacity(vertices.len() / 3 * 3);
-    for triangle in vertices.chunks_exact(3) {
-        if triangle.iter().any(|v| {
-            !v.x.is_finite()
-                || !v.y.is_finite()
-                || !v.z.is_finite()
-                || !(0.0..=1.0).contains(&v.z)
-                || !v.inverse_depth.is_finite()
-                || v.inverse_depth <= 0.0
-                || v.uv.iter().any(|value| !value.is_finite())
-                || v.color.iter().any(|value| !value.is_finite())
-        }) {
-            continue;
-        }
-        result.extend(triangle.iter().map(|v| {
-            let [x, y] = to_ndc(v.x, v.y, width, height);
-            TexturedMeshGpuVertex {
-                position: [x, y, v.z],
-                uv_over_depth: [v.uv[0] * v.inverse_depth, v.uv[1] * v.inverse_depth],
-                inverse_depth: v.inverse_depth,
-                color: v.color,
-            }
-        }));
-    }
-    result
-}
-
 #[cfg(test)]
-mod mesh_depth_tests {
-    use super::*;
-
-    fn triangle(z: f32, color: [f32; 4]) -> DrawCommand {
-        DrawCommand::Mesh3D {
-            vertices: vec![
-                MeshVertex {
-                    x: 1.0,
-                    y: 1.0,
-                    z,
-                    color,
-                },
-                MeshVertex {
-                    x: 7.0,
-                    y: 1.0,
-                    z,
-                    color,
-                },
-                MeshVertex {
-                    x: 4.0,
-                    y: 7.0,
-                    z,
-                    color,
-                },
-            ],
-        }
-    }
-
-    #[test]
-    fn mesh_triangles_use_depth_instead_of_draw_order() {
-        let Some(mut renderer) = super::svg_sprite_tests::renderer() else {
-            return;
-        };
-        let red = [1.0, 0.0, 0.0, 1.0];
-        let blue = [0.0, 0.0, 1.0, 1.0];
-        for commands in [
-            vec![triangle(0.8, blue), triangle(0.2, red)],
-            vec![triangle(0.2, red), triangle(0.8, blue)],
-        ] {
-            let packet = GameRenderPacket {
-                pattern: "mesh-depth-probe".into(),
-                width: 8.0,
-                height: 8.0,
-                draw_commands: commands,
-                ..Default::default()
-            };
-            let pixels =
-                super::svg_sprite_tests::draw(&mut renderer, &packet, 8).expect("readback");
-            let center = &pixels[(4 * 8 + 4) * 4..(4 * 8 + 4) * 4 + 4];
-            assert!(
-                center[0] > 200 && center[2] < 30,
-                "near mesh must win: {center:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_mesh_triangle_cannot_poison_a_following_triangle() {
-        let mut malformed = match triangle(f32::NAN, [1.0; 4]) {
-            DrawCommand::Mesh3D { vertices } => vertices,
-            _ => unreachable!(),
-        };
-        if let DrawCommand::Mesh3D { vertices } = triangle(0.3, [1.0; 4]) {
-            malformed.extend(vertices);
-        }
-        assert_eq!(mesh_gpu_vertices(&malformed, 8, 8).len(), 3);
-    }
-
-    #[test]
-    fn projected_box_paints_visible_volume_on_the_gpu() {
-        let Some(mut renderer) = super::svg_sprite_tests::renderer() else {
-            return;
-        };
-        let (vertices, faces) = crate::mappers::game_canvas_3d::box_geometry(1.0, 1.0, 1.0, true)
-            .expect("box geometry");
-        let camera = crate::mappers::game_canvas_3d::Camera3D {
-            eye: [2.0, 2.0, 3.0],
-            target: [0.0, 0.5, 0.0],
-            up: [0.0, 1.0, 0.0],
-            fov_y_degrees: 60.0,
-            near: 0.1,
-            far: 20.0,
-        };
-        let command = crate::mappers::game_canvas_3d::project_polyhedron(
-            &vertices,
-            &faces,
-            camera,
-            64.0,
-            64.0,
-            [1.0, 0.4, 0.1, 1.0],
-        )
-        .expect("box projection");
-        let packet = GameRenderPacket {
-            pattern: "mesh-box-probe".into(),
-            width: 64.0,
-            height: 64.0,
-            draw_commands: vec![command],
-            ..Default::default()
-        };
-        let pixels = super::svg_sprite_tests::draw(&mut renderer, &packet, 64).expect("readback");
-        let painted = pixels.chunks_exact(4).filter(|pixel| pixel[3] > 0).count();
-        assert!(painted > 100, "box should cover visible pixels: {painted}");
-    }
-
+mod scene3d_canvas_tests {
     #[test]
     fn authored_3d_canvas_scene_paints_box_pixels_on_the_gpu() {
         let Some(mut renderer) = super::svg_sprite_tests::renderer() else {
@@ -2078,169 +1595,6 @@ mod mesh_depth_tests {
         assert!(
             red > 20,
             "authored box must cover visible red pixels: {red}"
-        );
-    }
-
-    #[test]
-    fn textured_mesh_samples_authored_uvs_and_keeps_depth() {
-        let Some(mut renderer) = super::svg_sprite_tests::renderer() else {
-            return;
-        };
-        let texture = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'><rect width='2' height='4' fill='red'/><rect x='2' width='2' height='4' fill='lime'/></svg>";
-        let vertex = |x, y, z, u, v| TexturedMeshVertex {
-            x,
-            y,
-            z,
-            uv: [u, v],
-            inverse_depth: 1.0,
-            color: [1.0; 4],
-        };
-        let packet = GameRenderPacket {
-            pattern: "textured-mesh-probe".into(),
-            width: 64.0,
-            height: 64.0,
-            draw_commands: vec![
-                DrawCommand::TexturedMesh3D {
-                    texture: texture.into(),
-                    vertices: vec![
-                        vertex(8.0, 8.0, 0.2, 0.0, 0.0),
-                        vertex(56.0, 8.0, 0.2, 1.0, 0.0),
-                        vertex(56.0, 56.0, 0.2, 1.0, 1.0),
-                        vertex(8.0, 8.0, 0.2, 0.0, 0.0),
-                        vertex(56.0, 56.0, 0.2, 1.0, 1.0),
-                        vertex(8.0, 56.0, 0.2, 0.0, 1.0),
-                    ],
-                },
-                DrawCommand::Mesh3D {
-                    vertices: vec![
-                        MeshVertex {
-                            x: 8.0,
-                            y: 8.0,
-                            z: 0.8,
-                            color: [0.0, 0.0, 1.0, 1.0],
-                        },
-                        MeshVertex {
-                            x: 56.0,
-                            y: 8.0,
-                            z: 0.8,
-                            color: [0.0, 0.0, 1.0, 1.0],
-                        },
-                        MeshVertex {
-                            x: 56.0,
-                            y: 56.0,
-                            z: 0.8,
-                            color: [0.0, 0.0, 1.0, 1.0],
-                        },
-                    ],
-                },
-            ],
-            ..Default::default()
-        };
-        let pixels = super::svg_sprite_tests::draw(&mut renderer, &packet, 64).expect("readback");
-        let left = &pixels[(32 * 64 + 20) * 4..(32 * 64 + 20) * 4 + 4];
-        let right = &pixels[(32 * 64 + 44) * 4..(32 * 64 + 44) * 4 + 4];
-        assert!(
-            left[0] > 150 && left[1] < 100 && left[2] < 100,
-            "left UV: {left:?}"
-        );
-        assert!(
-            right[1] > 150 && right[0] < 100 && right[2] < 100,
-            "right UV: {right:?}"
-        );
-    }
-
-    #[test]
-    fn authored_parametric_plane_map_paints_both_texture_halves() {
-        let Some(mut renderer) = super::svg_sprite_tests::renderer() else {
-            return;
-        };
-        let texture = "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'><rect width='2' height='4' fill='red'/><rect x='2' width='2' height='4' fill='lime'/></svg>";
-        let node = serde_json::json!({
-            "type": "canvas", "mode": "3d", "backgroundColor": "#000000",
-            "camera": {"pos": {"x": 0, "y": 1, "z": 4},
-                "target": {"x": 0, "y": 0, "z": 0}, "fov": 60},
-            "drawables": [{"type": "draw-mesh", "shape": "plane",
-                "width": 2, "depth": 2,
-                "position": {"x": 0, "y": 0, "z": 0},
-                "material": {"kind": "basic", "side": "double", "map": texture}}]
-        });
-        let packet =
-            crate::mappers::game_canvas_3d::from_canvas_node_in_viewport(&node, 64.0, 64.0)
-                .expect("parametric plane scene");
-        let pixels = super::svg_sprite_tests::draw(&mut renderer, &packet, 64).expect("readback");
-        let red = pixels
-            .chunks_exact(4)
-            .filter(|pixel| pixel[0] > 150 && pixel[1] < 100)
-            .count();
-        let green = pixels
-            .chunks_exact(4)
-            .filter(|pixel| pixel[1] > 150 && pixel[0] < 100)
-            .count();
-        assert!(
-            red > 50 && green > 50,
-            "authored plane UV map must show both halves: red={red} green={green}"
-        );
-    }
-
-    #[test]
-    fn derived_face_normals_visualize_distinct_sides_on_gpu() {
-        let Some(mut renderer) = super::svg_sprite_tests::renderer() else {
-            return;
-        };
-        let camera = crate::mappers::game_canvas_3d::Camera3D {
-            eye: [0.0, 0.0, 5.0],
-            target: [0.0, 0.0, 0.0],
-            up: [0.0, 1.0, 0.0],
-            fov_y_degrees: 60.0,
-            near: 0.1,
-            far: 20.0,
-        };
-        let mut commands = Vec::new();
-        for (vertices, face) in [
-            (
-                [[-1.5, 0.0, -0.5], [-0.5, 0.0, -0.5], [-1.0, 0.0, 0.5]],
-                [0, 1, 2],
-            ),
-            (
-                [[0.5, 0.0, -0.5], [1.5, 0.0, -0.5], [1.0, 0.0, 0.5]],
-                [0, 2, 1],
-            ),
-        ] {
-            let normals = crate::mappers::game_canvas_3d::mesh_normals(&vertices, &[face])
-                .expect("authored face normal");
-            let normal = normals.faces[0];
-            let color = [
-                (normal[0] + 1.0) * 0.5,
-                (normal[1] + 1.0) * 0.5,
-                (normal[2] + 1.0) * 0.5,
-                1.0,
-            ];
-            commands.push(
-                crate::mappers::game_canvas_3d::project_polyhedron(
-                    &vertices,
-                    &[face],
-                    camera,
-                    64.0,
-                    64.0,
-                    color,
-                )
-                .expect("normal visualization projection"),
-            );
-        }
-        let packet = GameRenderPacket {
-            pattern: "mesh-normal-probe".into(),
-            width: 64.0,
-            height: 64.0,
-            draw_commands: commands,
-            ..Default::default()
-        };
-        let pixels = super::svg_sprite_tests::draw(&mut renderer, &packet, 64).expect("readback");
-        let left = &pixels[(32 * 64 + 21) * 4..(32 * 64 + 21) * 4 + 4];
-        let right = &pixels[(32 * 64 + 43) * 4..(32 * 64 + 43) * 4 + 4];
-        assert!(left[0] > 80 && left[1] < 30, "negative normal: {left:?}");
-        assert!(
-            right[0] > 80 && right[1] > 200,
-            "positive normal: {right:?}"
         );
     }
 }

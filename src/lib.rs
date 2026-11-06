@@ -13,10 +13,13 @@ pub mod fx_projection;
 pub mod gpu;
 pub mod mappers;
 pub mod packet;
+pub mod particles;
 pub mod platform;
 pub mod projector;
 pub mod renderer;
 pub mod scene3d;
+#[cfg(target_arch = "wasm32")]
+pub mod web2d;
 #[cfg(target_arch = "wasm32")]
 pub mod web3d;
 pub mod skinning_2d;

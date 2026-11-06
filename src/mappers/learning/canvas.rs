@@ -5,7 +5,7 @@
 use super::shape::{self, PaintCtx, Point, Shape, ShapeType};
 use super::theme::DiagramTheme;
 use super::Xf;
-use crate::mappers::game_canvas_2d::{get_f32, get_string};
+use crate::mappers::game_canvas_2d::{get_f32, get_string, CanvasSceneError};
 use crate::mappers::scene::{Emit, Hit, MappedScene};
 use crate::packet::{DrawCommand, GameRenderPacket, Rect};
 use serde_json::{json, Value};
@@ -49,6 +49,91 @@ pub struct CanvasSpec {
     pub traces: Vec<TracePanel>,
     pub interactive: bool,
     pub on_shape_click: Option<String>,
+    /// Packed particles drawn under the shapes (physics-canvas).
+    pub particles: Option<Particles>,
+}
+
+/// physics-canvas `particles`: packed words from inline bytes or a live GPU buffer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Particles {
+    pub source: crate::packet::ParticleSource,
+    pub stride: u32,
+    pub radius: f32,
+    pub palette: Vec<String>,
+}
+
+/// Parse `particles`: exactly one of `data` (base64 bytes) or `buffer` (a `GpuBuffer` handle), and `stride`,
+/// `radius` and a non-empty `palette`.
+pub fn parse_particles(v: Option<&Value>) -> Result<Option<Particles>, CanvasSceneError> {
+    let Some(v) = v.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let bad = |detail: String| {
+        let (field, detail) = detail
+            .split_once(": ")
+            .map_or((String::new(), detail.clone()), |(f, d)| {
+                (f.to_string(), d.to_string())
+            });
+        CanvasSceneError::InvalidProp {
+            field: format!("physics-canvas.particles{field}"),
+            detail,
+        }
+    };
+    let map = v.as_object().ok_or_else(|| bad(": not a record".into()))?;
+    for key in map.keys() {
+        if !matches!(
+            key.as_str(),
+            "data" | "buffer" | "stride" | "radius" | "palette"
+        ) {
+            return Err(bad(format!(".{key}: not a declared prop")));
+        }
+    }
+    let source = match (map.get("data"), map.get("buffer")) {
+        (Some(Value::String(data)), None) => {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|e| bad(format!(".data: not base64 bytes ({e})")))?;
+            crate::packet::ParticleSource::Bytes { data: bytes }
+        }
+        (None, Some(buffer)) => {
+            let field = |key: &str| buffer.get(key).and_then(Value::as_u64);
+            match (field("id"), field("device")) {
+                (Some(id), Some(device)) => crate::packet::ParticleSource::Gpu { id, device },
+                _ => return Err(bad(".buffer: not a GpuBuffer handle".into())),
+            }
+        }
+        (Some(_), None) => return Err(bad(".data: must be bytes".into())),
+        _ => return Err(bad(": exactly one of data or buffer".into())),
+    };
+    let stride = map
+        .get("stride")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| bad(".stride: a whole number of bytes is required".into()))?
+        as u32;
+    let radius = map
+        .get("radius")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| bad(".radius: a number is required".into()))? as f32;
+    let palette: Vec<String> = map
+        .get("palette")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|c| c.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if palette.is_empty() {
+        return Err(bad(".palette: at least one color is required".into()));
+    }
+    Ok(Some(Particles {
+        source,
+        stride,
+        radius,
+        palette,
+    }))
 }
 
 fn num_text(v: &Value) -> String {
@@ -158,6 +243,7 @@ impl CanvasSpec {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             on_shape_click: get_string(props, "onShapeClick"),
+            particles: None,
         }
     }
 }
@@ -418,6 +504,20 @@ pub fn render(
         theme.ground
     };
     let mut draw_commands = vec![DrawCommand::Clear { color: ground }];
+    if let Some(p) = &spec.particles {
+        draw_commands.push(DrawCommand::Particles {
+            source: p.source.clone(),
+            stride: p.stride,
+            radius: p.radius,
+            palette: p
+                .palette
+                .iter()
+                .map(|c| theme.mark_color(Some(c), "ink"))
+                .collect(),
+            scale: xf.s,
+            origin: crate::packet::Vec2 { x: xf.ox, y: xf.oy },
+        });
+    }
     for shape in derived.iter().filter(|s| s.ty != ShapeType::Text) {
         shape::paint(shape, &ctx, &mut draw_commands);
     }
@@ -490,6 +590,7 @@ mod tests {
             traces: vec![],
             interactive: false,
             on_shape_click: None,
+            particles: None,
         }
     }
 

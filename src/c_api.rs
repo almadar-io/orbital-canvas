@@ -717,12 +717,13 @@ mod tests {
             0
         );
         assert!(get_last_error().contains("not valid JSON"));
-        let missing_3d_camera = CString::new(r#"{"type":"canvas","mode":"3d"}"#).unwrap();
+        let undeclared_mode =
+            CString::new(r#"{"type":"canvas","mode":"3d","camera":{"mode":"sideways"}}"#).unwrap();
         assert_eq!(
-            unsafe { orbital_canvas_set_scene(renderer, missing_3d_camera.as_ptr()) },
+            unsafe { orbital_canvas_set_scene(renderer, undeclared_mode.as_ptr()) },
             0
         );
-        assert!(get_last_error().contains("3D canvas contract"));
+        assert!(get_last_error().contains("canvas.camera.mode"));
         assert!(get_last_error().contains("canvas.camera"));
         assert!(unsafe { (*renderer).host.packet.is_none() });
         assert_eq!(
@@ -811,7 +812,8 @@ mod tests {
             0
         );
         assert!(get_last_error().contains("scene_size"));
-        let three_d = CString::new(r#"{"type":"canvas","mode":"3d"}"#).unwrap();
+        let three_d =
+            CString::new(r#"{"type":"canvas","mode":"3d","camera":{"mode":"sideways"}}"#).unwrap();
         assert_eq!(
             unsafe { orbital_canvas_scene_size(three_d.as_ptr(), &mut w, &mut h) },
             0

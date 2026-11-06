@@ -3,8 +3,10 @@
 
 pub mod animation;
 pub mod geometry;
+pub mod gltf;
 pub mod model;
 pub mod render;
+pub mod skin;
 pub mod view;
 
 pub use model::*;

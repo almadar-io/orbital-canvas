@@ -3,16 +3,24 @@
 //! is a typed error naming the field, never a silent drop.
 
 use super::game_canvas_2d::{parse_css_color, to_drawable_nodes, CanvasSceneError};
+use super::skinned_mesh_2d;
+use crate::asset;
+use crate::packet::DrawCommand;
+use crate::projector::{Projection as Layout2D, Projector};
 use crate::scene3d::animation::{self, AnimatedState, Animation, AnimationError, MATERIAL_TRACKS};
 use crate::scene3d::geometry;
+use crate::scene3d::gltf::{model_state, ModelState};
 use crate::scene3d::model::{
     srgb_to_linear, srgb_to_linear_rgb, AmbientLight, Camera, DirectionalLight, Grid,
     HemisphereLight, Lights, Material, MaterialKind, MeshData, MeshInstance, PointLight,
     Projection, Scene3D, ShadowSettings, Side, ToneMapping,
 };
 use crate::scene3d::model::{CellId, Interaction};
-use glam::{DMat4, DVec3};
+use crate::scene3d::skin;
+use crate::skinning_2d::{self, BoneDef, Pose, SkinMesh};
+use glam::{DMat4, DVec3, Mat4};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::f64::consts::FRAC_PI_2;
 
 type Fields = Map<String, Value>;
@@ -176,6 +184,9 @@ fn compose(
         pick_id: None,
         elapsed_ms,
         animated: false,
+        scopes: vec![HashMap::new()],
+        scope: 0,
+        skins: Vec::new(),
     };
     let place = Placement {
         cell,
@@ -185,6 +196,7 @@ fn compose(
     for (path, node) in &nodes {
         walk.drawable(node, path, DMat4::IDENTITY, place, 1.0)?;
     }
+    walk.bind_skins()?;
 
     let camera = camera(opt_object(fields, "camera", "canvas")?, &bounds, cell)?;
     let (lights, tone_mapping) = lights(opt_object(fields, "lighting", "canvas")?, shadows, theme)?;
@@ -233,13 +245,12 @@ fn interaction(
     let mut cells = Vec::new();
     for (path, node) in nodes {
         let Some(f) = node.as_object() else { continue };
-        let (Some(id), Some("draw-mesh" | "draw-group")) = (
-            f.get("id").and_then(Value::as_str),
-            f.get("type").and_then(Value::as_str),
-        ) else {
+        let Some(id) = f.get("id").and_then(Value::as_str) else {
             continue;
         };
-        let pos = required_pos(f, path)?;
+        let Some(pos) = drawn_pos(f, path)? else {
+            continue;
+        };
         if pos[0].fract() == 0.0 && pos[1].fract() == 0.0 {
             cells.push(CellId {
                 x: pos[0] as i64,
@@ -343,13 +354,9 @@ fn scene_bounds(nodes: &[(String, Value)]) -> Result<Bounds, CanvasSceneError> {
         let Some(fields) = node.as_object() else {
             continue;
         };
-        if !matches!(
-            fields.get("type").and_then(Value::as_str),
-            Some("draw-mesh" | "draw-group")
-        ) {
+        let Some(pos) = drawn_pos(fields, path)? else {
             continue;
-        }
-        let pos = required_pos(fields, path)?;
+        };
         let b = bounds.get_or_insert(Bounds {
             min_x: pos[0],
             max_x: pos[0],
@@ -387,9 +394,9 @@ fn camera(fields: Option<&Fields>, b: &Bounds, cell: f64) -> Result<Camera, Canv
         ],
         path,
     )?;
-    if present(c, "pos").is_some() {
-        return Err(undrawn("canvas.camera.pos", STEP_HOST));
-    }
+    let pos = present(c, "pos")
+        .map(|v| scene_pos(v, "canvas.camera.pos"))
+        .transpose()?;
     opt_bool(c, "controls", path)?;
     let mode = match present(c, "mode") {
         None => "isometric",
@@ -420,66 +427,62 @@ fn camera(fields: Option<&Fields>, b: &Bounds, cell: f64) -> Result<Camera, Canv
         .map(|v| scene_pos(v, "canvas.camera.target"))
         .transpose()?;
     let follow = matches!(mode, "follow" | "chase");
-    if follow {
-        for (key, set) in [
-            ("zoom", zoom.is_some()),
-            ("azimuth", azimuth.is_some()),
-            ("elevation", elevation.is_some()),
-        ] {
-            if set {
-                return Err(undrawn(
-                    &format!("canvas.camera.{key} in {mode} mode"),
-                    STEP_HOST,
-                ));
-            }
-        }
-    } else {
-        if target.is_some() {
-            return Err(undrawn(
-                &format!("canvas.camera.target in {mode} mode"),
-                STEP_HOST,
-            ));
-        }
-        if elevation.is_some() && mode != "perspective" {
-            return Err(undrawn(
-                &format!("canvas.camera.elevation in {mode} mode"),
-                STEP_HOST,
-            ));
-        }
-    }
-
+    let world = |t: [f64; 3]| {
+        DVec3::new(
+            t[0] * cell - b.min_x * cell,
+            t[2],
+            t[1] * cell - b.min_z * cell,
+        )
+    };
     let (span_x, span_z) = (b.max_x - b.min_x, b.max_z - b.min_z);
-    let center = DVec3::new(span_x / 2.0 * cell, 0.0, span_z / 2.0 * cell);
+    let scene_center = DVec3::new(span_x / 2.0 * cell, 0.0, span_z / 2.0 * cell);
+    // `target` replaces the scene center as the point a mode frames (and a follow camera follows).
+    let center = target.map(world).unwrap_or(scene_center);
     let (eye, look) = if follow {
-        let look = match target {
-            Some(t) => DVec3::new(
-                t[0] * cell - b.min_x * cell,
-                t[2],
-                t[1] * cell - b.min_z * cell,
-            ),
-            None => center,
-        };
-        let offset = if mode == "chase" {
+        let base = if mode == "chase" {
             DVec3::new(0.0, 4.0, -7.0)
         } else {
             DVec3::new(0.0, 12.0, 14.0)
         };
-        (look + offset, look)
+        let horizontal = base.x.hypot(base.z);
+        let lifted = match elevation {
+            Some(el) => DVec3::new(
+                base.x,
+                horizontal * el.clamp(-FRAC_PI_2 + 0.1, FRAC_PI_2 - 0.1).tan(),
+                base.z,
+            ),
+            None => base,
+        };
+        let turned = match azimuth.filter(|a| *a != 0.0) {
+            Some(a) => {
+                let (s, c) = a.sin_cos();
+                DVec3::new(
+                    lifted.x * c - lifted.z * s,
+                    lifted.y,
+                    lifted.x * s + lifted.z * c,
+                )
+            }
+            None => lifted,
+        };
+        (center + turned / zoom.unwrap_or(1.0), center)
     } else {
         let size = (span_x * cell).max(span_z * cell).max(4.0);
         let d = size / zoom.unwrap_or(1.0);
         let (cx, cz) = (center.x, center.z);
-        let base = match mode {
+        let framed = match mode {
             "isometric" => DVec3::new(cx + d, d * 0.8, cz + d),
             "top-down" => DVec3::new(cx, d * 2.0, cz + d * 0.35),
             "front" => DVec3::new(cx, d * 0.32, cz + d * 1.15),
-            _ => match elevation {
-                None => DVec3::new(cx + d, d, cz + d),
-                Some(el) => {
-                    let el = el.clamp(0.0, FRAC_PI_2 - 0.1);
-                    DVec3::new(cx + d, d * el.tan(), cz + d)
-                }
-            },
+            _ => DVec3::new(cx + d, d, cz + d),
+        };
+        let base = match elevation.map(|el| el.clamp(0.0, FRAC_PI_2 - 0.1)) {
+            None => framed,
+            // three's perspective formula; the other modes keep their horizontal offset and take the angle over it
+            Some(el) if mode == "perspective" => DVec3::new(cx + d, d * el.tan(), cz + d),
+            Some(el) => {
+                let horizontal = (framed.x - cx).hypot(framed.z - cz);
+                DVec3::new(framed.x, horizontal * el.tan(), framed.z)
+            }
         };
         let posed = match azimuth.filter(|a| *a != 0.0) {
             None => base,
@@ -491,6 +494,8 @@ fn camera(fields: Option<&Fields>, b: &Bounds, cell: f64) -> Result<Camera, Canv
         };
         (orbit_controls_pose(posed, center), center)
     };
+    // an authored `pos` places the eye itself, looking at the framed point
+    let eye = pos.map(world).unwrap_or(eye);
     Ok(Camera {
         eye: eye.as_vec3().to_array(),
         target: look.as_vec3().to_array(),
@@ -694,7 +699,73 @@ struct Walk<'a> {
     /// The canvas clock; `None` leaves animations at rest.
     elapsed_ms: Option<f64>,
     animated: bool,
+    /// `BoneStore`s: the canvas's at 0, one per `skeleton: true` group after it; name → bone world matrix.
+    scopes: Vec<HashMap<String, DMat4>>,
+    scope: usize,
+    /// Skinned meshes, bound once every bone in the tree is known (three re-binds on each registration).
+    skins: Vec<PendingSkin>,
 }
+
+struct PendingSkin {
+    mesh: usize,
+    scope: usize,
+    path: String,
+    bones: Vec<String>,
+    inverse_bind: Vec<DMat4>,
+    joints: Vec<[u16; 4]>,
+    weights: Vec<[f32; 4]>,
+    bind_inverse: DMat4,
+}
+
+const SPRITE_KEYS: &[&str] = &[
+    "type",
+    "id",
+    "position",
+    "asset",
+    "anchor",
+    "width",
+    "height",
+    "frame",
+    "animation",
+    "loop",
+    "clockMs",
+    "flipX",
+    "rotation",
+    "opacity",
+    "shadow",
+];
+
+const ASSET_KEYS: &[&str] = &[
+    "url",
+    "role",
+    "category",
+    "animations",
+    "style",
+    "variant",
+    "dimension",
+    "aspect",
+    "atlas",
+    "sprite",
+    "name",
+    "thumbnailUrl",
+];
+
+const SKINNED_MESH_KEYS: &[&str] = &[
+    "type",
+    "id",
+    "position",
+    "asset",
+    "mesh",
+    "meshUrl",
+    "bones",
+    "pose",
+    "clip",
+    "clipName",
+    "frame",
+    "opacity",
+    "weightsOverlay",
+    "ghost",
+];
 
 const MESH_KEYS: &[&str] = &[
     "type",
@@ -789,8 +860,10 @@ impl Walk<'_> {
         let drawn = match ty {
             "draw-mesh" => self.mesh(fields, path, parent, place, opacity),
             "draw-group" => self.group(fields, path, parent, place, opacity),
-            "draw-sprite" | "draw-shape" | "draw-text" | "draw-sprite-layer"
-            | "draw-shape-layer" | "draw-text-layer" | "draw-fx-layer" | "draw-skinned-mesh" => {
+            "draw-sprite" => self.sprite(fields, path, parent, place, opacity),
+            "draw-skinned-mesh" => self.skinned_mesh(fields, path, parent, place, opacity),
+            "draw-shape" | "draw-text" | "draw-sprite-layer" | "draw-shape-layer"
+            | "draw-text-layer" | "draw-fx-layer" => {
                 Err(undrawn(&format!("{ty} at {path}"), STEP_PARITY))
             }
             other => Err(bad(
@@ -811,14 +884,19 @@ impl Walk<'_> {
         opacity: f64,
     ) -> Result<(), CanvasSceneError> {
         check_keys(f, GROUP_KEYS, path)?;
-        for key in ["bone", "clip"] {
-            if present(f, key).is_some() {
-                return Err(undrawn(&join(path, key), STEP_PARITY));
+        if present(f, "clip").is_some() {
+            return Err(undrawn(&join(path, "clip"), STEP_PARITY));
+        }
+        let skeleton = opt_bool(f, "skeleton", path)? == Some(true);
+        let bone = match opt_str(f, "bone", path)? {
+            Some("") => {
+                return Err(bad(
+                    &join(path, "bone"),
+                    "is empty (the three host mounts no bone)",
+                ))
             }
-        }
-        if opt_bool(f, "skeleton", path)? == Some(true) {
-            return Err(undrawn(&join(path, "skeleton"), STEP_PARITY));
-        }
+            other => other,
+        };
         let world = place.world(required_pos(f, path)?);
         let scale = opt_number(f, "scale", path)?.unwrap_or(1.0);
         let rotate = opt_number(f, "rotate", path)?;
@@ -862,6 +940,22 @@ impl Walk<'_> {
         if !items.is_array() {
             return Err(bad(&join(path, "items"), "must be an array"));
         }
+        let outer_scope = self.scope;
+        if skeleton {
+            self.scopes.push(HashMap::new());
+            self.scope = self.scopes.len() - 1;
+        }
+        if let Some(name) = bone {
+            if self.scopes[self.scope]
+                .insert(name.to_string(), matrix)
+                .is_some()
+            {
+                return Err(bad(
+                    &join(path, "bone"),
+                    format!("`{name}` is already a bone in this skeleton scope (the three host keeps whichever registers last)"),
+                ));
+            }
+        }
         let items_path = join(path, "items");
         for (i, item) in drawable_nodes(items, &items_path)?.iter().enumerate() {
             self.drawable(
@@ -872,6 +966,7 @@ impl Walk<'_> {
                 opacity,
             )?;
         }
+        self.scope = outer_scope;
         Ok(())
     }
 
@@ -884,10 +979,8 @@ impl Walk<'_> {
         group_opacity: f64,
     ) -> Result<(), CanvasSceneError> {
         check_keys(f, MESH_KEYS, path)?;
-        for key in ["skin", "outline"] {
-            if present(f, key).is_some() {
-                return Err(undrawn(&join(path, key), STEP_PARITY));
-            }
+        if present(f, "outline").is_some() {
+            return Err(undrawn(&join(path, "outline"), STEP_PARITY));
         }
         if self.theme.outline > 0.0 {
             return Err(undrawn(
@@ -933,6 +1026,17 @@ impl Walk<'_> {
                     format!("shape `{shape}` has no {key} (the three host ignores it)"),
                 ));
             }
+        }
+        if shape != "polyhedron" && present(f, "skin").is_some() {
+            return Err(bad(
+                &join(path, "skin"),
+                format!(
+                    "only a polyhedron is skinned; shape is `{shape}` (the three host ignores it)"
+                ),
+            ));
+        }
+        if shape == "polyhedron" && present(f, "skin").is_some() {
+            return self.skinned_polyhedron(f, path, parent, place, group_opacity);
         }
         if shape != "polyhedron" {
             for key in ["vertices", "faces", "uvs"] {
@@ -1091,6 +1195,512 @@ impl Walk<'_> {
         });
         Ok(())
     }
+}
+
+impl Walk<'_> {
+    /// `SkinnedPolyhedron3D`: a `SkinnedMesh` under a group at the mesh's position, bound with an identity bind
+    /// matrix in attached mode, so the named bones alone place every vertex.
+    fn skinned_polyhedron(
+        &mut self,
+        f: &Fields,
+        path: &str,
+        parent: DMat4,
+        place: Placement,
+        group_opacity: f64,
+    ) -> Result<(), CanvasSceneError> {
+        for key in ["rotation", "pivot", "animation"] {
+            if present(f, key).is_some() {
+                return Err(bad(
+                    &join(path, key),
+                    "a skinned mesh is placed by its bones alone (the three host ignores it)",
+                ));
+            }
+        }
+        let world = place.world(required_pos(f, path)?);
+        let (mesh, _) = polyhedron(f, path, place.cell)?;
+        let skin_path = join(path, "skin");
+        let skin =
+            opt_object(f, "skin", path)?.ok_or_else(|| bad(&skin_path, "must be an object"))?;
+        check_keys(
+            skin,
+            &["bones", "inverseBindMatrices", "indices", "weights"],
+            &skin_path,
+        )?;
+        let bones = skin_list(skin, "bones", &skin_path)?
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                b.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| bad(&format!("{skin_path}.bones[{i}]"), "must be a bone name"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let ibm_path = join(&skin_path, "inverseBindMatrices");
+        let mut inverse_bind = Vec::new();
+        for (i, m) in skin_list(skin, "inverseBindMatrices", &skin_path)?
+            .iter()
+            .enumerate()
+        {
+            let field = format!("{ibm_path}[{i}]");
+            let values = m
+                .as_array()
+                .filter(|v| v.len() == 16)
+                .ok_or_else(|| bad(&field, "must be 16 numbers, column-major"))?;
+            let mut cols = [0.0; 16];
+            for (k, v) in values.iter().enumerate() {
+                cols[k] = number(v, &field)?;
+            }
+            // translations are authored in cells, like the vertices
+            for c in &mut cols[12..15] {
+                *c *= place.cell;
+            }
+            inverse_bind.push(DMat4::from_cols_array(&cols));
+        }
+        if inverse_bind.len() != bones.len() {
+            return Err(bad(
+                &ibm_path,
+                format!(
+                    "{} matrices for {} bones (the three host never binds the skin)",
+                    inverse_bind.len(),
+                    bones.len()
+                ),
+            ));
+        }
+        let n = mesh.positions.len();
+        let mut joints = Vec::with_capacity(n);
+        for (i, row) in skin_rows(skin, "indices", &skin_path, n)?
+            .into_iter()
+            .enumerate()
+        {
+            let mut j = [0u16; 4];
+            for k in 0..4 {
+                if row[k].fract() != 0.0 || !(0.0..=65535.0).contains(&row[k]) {
+                    return Err(bad(
+                        &format!("{skin_path}.indices[{i}]"),
+                        "bone indices must be integers in 0..=65535",
+                    ));
+                }
+                j[k] = row[k] as u16;
+            }
+            joints.push(j);
+        }
+        let weights: Vec<[f32; 4]> = skin_rows(skin, "weights", &skin_path, n)?
+            .into_iter()
+            .map(|row| row.map(|w| w as f32))
+            .collect();
+
+        let material_fields = opt_object(f, "material", path)?;
+        let material_opacity = match material_fields {
+            Some(m) => opt_number(m, "opacity", &join(path, "material"))?.unwrap_or(1.0),
+            None => 1.0,
+        };
+        let opacity =
+            opt_number(f, "opacity", path)?.unwrap_or(1.0) * material_opacity * group_opacity;
+        let material = material(
+            material_fields,
+            &join(path, "material"),
+            opacity,
+            self.theme,
+        )?;
+        let transform = parent * DMat4::from_translation(world);
+        self.meshes.push(MeshInstance {
+            mesh,
+            transform: transform.as_mat4().to_cols_array(),
+            material,
+            cast_shadow: opt_bool(f, "castShadow", path)?.unwrap_or(true),
+            receive_shadow: opt_bool(f, "receiveShadow", path)?.unwrap_or(true),
+            id: self.pick_id.clone(),
+        });
+        self.skins.push(PendingSkin {
+            mesh: self.meshes.len() - 1,
+            scope: self.scope,
+            path: path.to_string(),
+            bones,
+            inverse_bind,
+            joints,
+            weights,
+            bind_inverse: transform.inverse(),
+        });
+        Ok(())
+    }
+
+    /// Pose each skinned mesh by its scope's bones: three's bone matrices are bone world × inverse bind, and the
+    /// attached bind mode's `bindMatrixInverse` is the inverse of the mesh's world matrix.
+    fn bind_skins(&mut self) -> Result<(), CanvasSceneError> {
+        for pending in std::mem::take(&mut self.skins) {
+            let scope = &self.scopes[pending.scope];
+            let mut bones = Vec::with_capacity(pending.bones.len());
+            for (i, name) in pending.bones.iter().enumerate() {
+                let world = scope.get(name).ok_or_else(|| {
+                    bad(
+                        &format!("{}.skin.bones[{i}]", pending.path),
+                        format!("no draw-group in this skeleton scope declares bone `{name}` (the three host never binds the skin)"),
+                    )
+                })?;
+                bones.push((*world * pending.inverse_bind[i]).as_mat4());
+            }
+            let instance = &mut self.meshes[pending.mesh];
+            instance.mesh = skin::skin_mesh(
+                &instance.mesh,
+                &pending.joints,
+                &pending.weights,
+                &bones,
+                Mat4::IDENTITY,
+                pending.bind_inverse.as_mat4(),
+            )
+            .map_err(|e| bad(&join(&pending.path, "skin"), e))?;
+        }
+        Ok(())
+    }
+
+    /// `Sprite3D` with `asset.dimension: "3d"`: `ModelLoader` at the sprite's position, turned by `rotation` (which
+    /// it reads in degrees), scaled to the sprite's size over the model's rest-pose extent, playing `animation`.
+    fn sprite(
+        &mut self,
+        f: &Fields,
+        path: &str,
+        parent: DMat4,
+        place: Placement,
+        group_opacity: f64,
+    ) -> Result<(), CanvasSceneError> {
+        check_keys(f, SPRITE_KEYS, path)?;
+        let asset_path = join(path, "asset");
+        let asset = opt_object(f, "asset", path)?;
+        let (dimension, url) = match asset {
+            Some(a) => (
+                opt_str(a, "dimension", &asset_path)?,
+                opt_str(a, "url", &asset_path)?.filter(|u| !u.is_empty()),
+            ),
+            None => (None, None),
+        };
+        let (Some("3d"), Some(asset), Some(url)) = (dimension, asset, url) else {
+            return Err(undrawn(&format!("draw-sprite at {path}"), STEP_PARITY));
+        };
+        check_keys(asset, ASSET_KEYS, &asset_path)?;
+        for key in ["atlas", "sprite"] {
+            if present(asset, key).is_some() {
+                return Err(bad(
+                    &join(&asset_path, key),
+                    "a 3D model has no atlas (the three host ignores it)",
+                ));
+            }
+        }
+        for key in [
+            "anchor", "frame", "loop", "clockMs", "flipX", "opacity", "shadow",
+        ] {
+            if present(f, key).is_some() {
+                return Err(bad(
+                    &join(path, key),
+                    "a 3D model does not draw it (the three host ignores it)",
+                ));
+            }
+        }
+        let width = opt_number(f, "width", path)?;
+        let height = opt_number(f, "height", path)?;
+        if width.is_none() && height.is_some() {
+            return Err(bad(
+                &join(path, "height"),
+                "a 3D model reads height only alongside width (the three host ignores it)",
+            ));
+        }
+        if group_opacity != 1.0 {
+            return Err(bad(
+                path,
+                "an enclosing draw-group's opacity does not reach a 3D model's own materials (the three host ignores it)",
+            ));
+        }
+        let rotation = opt_number(f, "rotation", path)?.unwrap_or(0.0);
+        let animation = opt_str(f, "animation", path)?;
+        let at = parent * DMat4::from_translation(place.world(required_pos(f, path)?));
+
+        let model = match model_state(url)
+            .map_err(|e| bad(&join(&asset_path, "url"), format!("{url}: {e}")))?
+        {
+            ModelState::Loading => return Ok(()),
+            ModelState::Failed(why) => {
+                tracing::warn!(target: "almadar::scene3d", url, %why, "model failed; drawing the error fallback");
+                return self.model_fallback(at);
+            }
+            ModelState::Ready(model) => model,
+        };
+        // GLTFLoader resolves only once every texture settled; a texture that failed leaves its material unmapped.
+        let mut dropped = Vec::new();
+        for map in model.map_urls() {
+            if asset::image_info(&map).is_some() {
+                continue;
+            }
+            if asset::image_failed(&map) {
+                dropped.push(map);
+                continue;
+            }
+            return Ok(());
+        }
+        let clip = animation.and_then(|name| model.clip_index(name));
+        if clip.is_some() {
+            self.animated = true;
+        }
+        let posed = match self.elapsed_ms {
+            Some(ms) => model.pose(clip, (ms / 1000.0) as f32),
+            None => model.pose(None, 0.0),
+        }
+        .map_err(|e| bad(&join(&asset_path, "url"), format!("{url}: {e}")))?;
+        let norm = match model.rest_bounds() {
+            Some((lo, hi)) => {
+                let max = f64::from((hi - lo).max_element());
+                if !max.is_finite() || max < 0.05 {
+                    1.0
+                } else {
+                    1.0 / max
+                }
+            }
+            None => 1.0,
+        };
+        let size = match (width, height) {
+            (None, _) => DVec3::ONE,
+            (Some(w), None) => DVec3::splat(w * place.cell),
+            (Some(w), Some(h)) => DVec3::new(w * place.cell, h * place.cell, w * place.cell),
+        };
+        let world =
+            at * DMat4::from_rotation_y(rotation.to_radians()) * DMat4::from_scale(size * norm);
+        for mut instance in posed {
+            let local = Mat4::from_cols_array(&instance.transform).as_dmat4();
+            instance.transform = (world * local).as_mat4().to_cols_array();
+            if instance
+                .material
+                .map
+                .as_ref()
+                .is_some_and(|m| dropped.contains(m))
+            {
+                instance.material.map = None;
+            }
+            instance.id = self.pick_id.clone();
+            self.meshes.push(instance);
+        }
+        Ok(())
+    }
+
+    /// `ModelLoader`'s error fallback (`fallbackGeometry: 'box'`): a 0.8 red standard box lifted 0.5, unrotated.
+    fn model_fallback(&mut self, at: DMat4) -> Result<(), CanvasSceneError> {
+        let mesh = geometry::cuboid(0.8, 0.8, 0.8).map_err(|e| bad("model fallback", e.0))?;
+        let color = rgb(&Value::String("#ff4444".into()), "model fallback")?;
+        self.meshes.push(MeshInstance {
+            mesh,
+            transform: (at * DMat4::from_translation(DVec3::new(0.0, 0.5, 0.0)))
+                .as_mat4()
+                .to_cols_array(),
+            material: Material {
+                color,
+                ..Material::default()
+            },
+            cast_shadow: false,
+            receive_shadow: false,
+            id: self.pick_id.clone(),
+        });
+        Ok(())
+    }
+
+    /// The three host skips `draw-skinned-mesh` in 3D; this draws its 2D semantics on the scene plane instead: the
+    /// rig the 2D painter poses (same mesh, bones, pose, clip and frame resolution), its scene `x`/`y` laid on world
+    /// X/Z at the position's height, unlit and double-sided as a canvas paints it.
+    fn skinned_mesh(
+        &mut self,
+        f: &Fields,
+        path: &str,
+        parent: DMat4,
+        place: Placement,
+        group_opacity: f64,
+    ) -> Result<(), CanvasSceneError> {
+        check_keys(f, SKINNED_MESH_KEYS, path)?;
+        if present(f, "ghost").is_some() {
+            return Err(undrawn(
+                &format!("{path}.ghost (an onion skin coplanar with the live pass has no depth order in 3D)"),
+                STEP_PARITY,
+            ));
+        }
+        let height = required_pos(f, path)?[2];
+        let projector = Projector::new(1.0, 0.0, Layout2D::Flat);
+        let unit = f64::from(projector.tile_width);
+        let Some(commands) =
+            skinned_mesh_2d::paint(&Value::Object(f.clone()), &projector, &|x, y| (x, y))
+                .map_err(|e| bad(path, e))?
+        else {
+            return Ok(());
+        };
+        let mut batches: Vec<(Material, MeshData)> = Vec::new();
+        for command in commands {
+            let (points, uv, material) = match command {
+                DrawCommand::TexturedTriangle {
+                    texture,
+                    points,
+                    uv,
+                    uv_in_pixels,
+                    opacity,
+                } => {
+                    let (w, h) = asset::image_info(&texture)
+                        .ok_or_else(|| bad(&join(path, "asset.url"), "the texture has no size"))?;
+                    let pixel = uv.map(|c| {
+                        if uv_in_pixels {
+                            c
+                        } else {
+                            [c[0] * w as f32, c[1] * h as f32]
+                        }
+                    });
+                    let area = (pixel[1][0] - pixel[0][0]) * (pixel[2][1] - pixel[0][1])
+                        - (pixel[1][1] - pixel[0][1]) * (pixel[2][0] - pixel[0][0]);
+                    // the 2D renderer skips a triangle that cuts no texture area
+                    if area.abs() < f32::EPSILON {
+                        continue;
+                    }
+                    let uv = pixel.map(|c| [c[0] / w.max(1) as f32, c[1] / h.max(1) as f32]);
+                    let material = Material {
+                        kind: MaterialKind::Basic,
+                        opacity: (f64::from(opacity.clamp(0.0, 1.0)) * group_opacity) as f32,
+                        side: Side::Double,
+                        map: Some(texture),
+                        ..Material::default()
+                    };
+                    (points.to_vec(), uv, material)
+                }
+                DrawCommand::Poly { points, color } => {
+                    let material = Material {
+                        kind: MaterialKind::Basic,
+                        color: srgb_to_linear_rgb([color[0], color[1], color[2]]),
+                        opacity: (f64::from(color[3]) * group_opacity) as f32,
+                        side: Side::Double,
+                        ..Material::default()
+                    };
+                    (points, [[0.0; 2]; 3], material)
+                }
+                _ => {
+                    return Err(bad(
+                        path,
+                        "the 2D rig painted something other than a triangle",
+                    ))
+                }
+            };
+            if points.len() != 3 {
+                return Err(bad(
+                    path,
+                    "the 2D rig painted something other than a triangle",
+                ));
+            }
+            if batches.last().is_none_or(|(m, _)| *m != material) {
+                batches.push((material, MeshData::default()));
+            }
+            let (_, mesh) = batches.last_mut().expect("a batch was just pushed");
+            for (i, p) in points.iter().enumerate() {
+                let at = place.world([f64::from(p.x) / unit, f64::from(p.y) / unit, height]);
+                mesh.indices.push(mesh.positions.len() as u32);
+                mesh.positions.push(f32x3(at.to_array()));
+                mesh.normals.push([0.0, 1.0, 0.0]);
+                mesh.uvs.push(uv[i]);
+            }
+        }
+        for (material, mesh) in batches {
+            self.meshes.push(MeshInstance {
+                mesh,
+                transform: parent.as_mat4().to_cols_array(),
+                material,
+                cast_shadow: false,
+                receive_shadow: false,
+                id: self.pick_id.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn skin_list<'a>(
+    skin: &'a Fields,
+    key: &str,
+    path: &str,
+) -> Result<&'a Vec<Value>, CanvasSceneError> {
+    present(skin, key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| bad(&join(path, key), "is required as an array"))
+}
+
+/// Per-vertex rows of up to four numbers; three reads `[k] ?? 0`, so a short row pads with zeros.
+fn skin_rows(
+    skin: &Fields,
+    key: &str,
+    path: &str,
+    vertices: usize,
+) -> Result<Vec<[f64; 4]>, CanvasSceneError> {
+    let field = join(path, key);
+    let items = skin_list(skin, key, path)?;
+    if items.len() != vertices {
+        return Err(bad(
+            &field,
+            format!(
+                "{} entries for {vertices} vertices (the three host drops the skin)",
+                items.len()
+            ),
+        ));
+    }
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let row_field = format!("{field}[{i}]");
+            let row = row.as_array().filter(|r| r.len() <= 4).ok_or_else(|| {
+                bad(
+                    &row_field,
+                    "must be up to 4 numbers (the three host reads four)",
+                )
+            })?;
+            let mut out = [0.0; 4];
+            for (k, v) in row.iter().enumerate() {
+                out[k] = number(v, &row_field)?;
+            }
+            Ok(out)
+        })
+        .collect()
+}
+
+/// `collectDrawnItems`: a drawable's scene position for the bounds and the hit index; a skinned mesh's is offset
+/// by its posed hull's local minimum (`skinnedMeshDrawnItem`), others are their position.
+fn drawn_pos(f: &Fields, path: &str) -> Result<Option<[f64; 3]>, CanvasSceneError> {
+    match f.get("type").and_then(Value::as_str) {
+        Some("draw-mesh" | "draw-group" | "draw-sprite") => required_pos(f, path).map(Some),
+        Some("draw-skinned-mesh") => skinned_mesh_pos(f, path).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn skinned_mesh_pos(f: &Fields, path: &str) -> Result<[f64; 3], CanvasSceneError> {
+    let pos = required_pos(f, path)?;
+    let bones = present(f, "bones")
+        .and_then(Value::as_array)
+        .filter(|b| !b.is_empty());
+    let (Some(mesh), Some(bones)) = (present(f, "mesh"), bones) else {
+        return Ok(pos);
+    };
+    let parse = |e: serde_json::Error| bad(path, format!("draw-skinned-mesh: {e}"));
+    let mesh: SkinMesh = serde_json::from_value(mesh.clone()).map_err(parse)?;
+    let bones: Vec<BoneDef> = serde_json::from_value(Value::Array(bones.clone())).map_err(parse)?;
+    let frames: Option<Vec<Pose>> = present(f, "clip")
+        .and_then(|c| c.get("frames"))
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()
+        .map_err(parse)?;
+    let frame = present(f, "frame").and_then(Value::as_u64);
+    let pose = match (frames.as_deref(), frame) {
+        (Some(frames), Some(i)) if !frames.is_empty() => frames[i as usize % frames.len()].clone(),
+        _ => present(f, "pose")
+            .map(|p| serde_json::from_value::<Pose>(p.clone()))
+            .transpose()
+            .map_err(parse)?
+            .unwrap_or_default(),
+    };
+    let skin_error = |e: skinning_2d::SkinError| bad(path, format!("draw-skinned-mesh: {e}"));
+    let bind = skinning_2d::compute_world_matrices(&bones, &Pose::new()).map_err(skin_error)?;
+    let current = skinning_2d::compute_world_matrices(&bones, &pose).map_err(skin_error)?;
+    let points = skinning_2d::skin_vertices(&mesh, &bind, &current).map_err(skin_error)?;
+    Ok(match skinning_2d::vertex_bounds(&points) {
+        Some(b) => [pos[0] + b[0], pos[1] + b[1], pos[2]],
+        None => pos,
+    })
 }
 
 /// `DrawMesh3D.polyhedronGeometry`: scene `[x, y, z]` (z up) to three `[x, z, y]` scaled by the cell; that swap
@@ -1984,5 +2594,192 @@ mod tests {
             "{bad_color}"
         );
         assert!(scene_at(pulsing_box(pulse()), -1.0).is_err());
+    }
+
+    fn rig_group(tip_scope: bool, bones: Value) -> Value {
+        let tip = json!({"type": "draw-group", "position": {"x": 2, "y": 0}, "bone": "tip",
+            "rotation": [0, 0, std::f64::consts::FRAC_PI_2], "items": []});
+        let tip = if tip_scope {
+            json!({"type": "draw-group", "position": {"x": 0, "y": 0}, "skeleton": true, "items": [tip]})
+        } else {
+            tip
+        };
+        json!({"drawables": [{"type": "draw-group", "position": {"x": 0, "y": 0}, "skeleton": true, "items": [
+            {"type": "draw-group", "position": {"x": 0, "y": 0}, "bone": "root", "items": []},
+            tip,
+            {"type": "draw-mesh", "shape": "polyhedron", "position": {"x": 0, "y": 0},
+                "vertices": [[0, 0, 0], [1, 0, 0], [0, 1, 0]], "faces": [[0, 1, 2]],
+                "skin": {"bones": bones,
+                    "inverseBindMatrices": [
+                        [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+                        [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -2, 0, 0, 1]
+                    ],
+                    "indices": [[0], [1], [0]],
+                    "weights": [[1], [1], [1]]}}
+        ]}]})
+    }
+
+    #[test]
+    fn a_skinned_polyhedron_follows_its_named_bone_groups() {
+        let s = scene(rig_group(false, json!(["root", "tip"]))).unwrap();
+        assert_eq!(s.meshes.len(), 1);
+        let mesh = &s.meshes[0];
+        // scene [x, y, z] -> three [x, z, y]; vertex 1 rides `tip`: (1,0,0) - 2 = (-1,0,0), turned a quarter about
+        // Z is (0,-1,0), back at x = 2
+        close(mesh.mesh.positions[0], [0.0, 0.0, 0.0]);
+        close(mesh.mesh.positions[1], [2.0, -1.0, 0.0]);
+        close(mesh.mesh.positions[2], [0.0, 0.0, 1.0]);
+        assert_eq!(mesh.transform, Mat4::IDENTITY.to_cols_array());
+    }
+
+    #[test]
+    fn control_skin_bones_resolve_only_inside_their_skeleton_scope() {
+        let scoped_away = message(scene(rig_group(true, json!(["root", "tip"]))));
+        assert_eq!(
+            scoped_away,
+            "drawables[0].items[2].skin.bones[1]: no draw-group in this skeleton scope declares bone `tip` (the three host never binds the skin)"
+        );
+        let unknown = message(scene(rig_group(false, json!(["root", "ghost"]))));
+        assert!(unknown.contains("bone `ghost`"), "{unknown}");
+        let mut turned = rig_group(false, json!(["root", "tip"]));
+        turned["drawables"][0]["items"][2]["rotation"] = json!([0, 1, 0]);
+        assert_eq!(
+            message(scene(turned)),
+            "drawables[0].items[2].rotation: a skinned mesh is placed by its bones alone (the three host ignores it)"
+        );
+        let boxed = message(scene(
+            json!({"drawables": [{"type": "draw-mesh", "position": {"x": 0, "y": 0},
+            "skin": {"bones": [], "inverseBindMatrices": [], "indices": [], "weights": []}}]}),
+        ));
+        assert!(
+            boxed.starts_with("drawables[0].skin: only a polyhedron is skinned"),
+            "{boxed}"
+        );
+    }
+
+    fn register_model(url: &str, bytes: Vec<u8>) {
+        crate::asset::register_asset(url, bytes.into(), Some("model/gltf-binary"));
+    }
+
+    fn model_sprite(url: &str, extra: Value) -> Value {
+        let mut sprite = json!({"type": "draw-sprite", "id": "knight", "position": {"x": 0, "y": 0},
+            "asset": {"url": url, "role": "unit", "category": "character", "dimension": "3d"},
+            "width": 2, "animation": "walk"});
+        for (key, value) in extra.as_object().unwrap() {
+            sprite[key] = value.clone();
+        }
+        json!({"drawables": [sprite]})
+    }
+
+    #[test]
+    fn a_3d_sprite_draws_its_model_posed_by_the_named_clip_on_the_canvas_clock() {
+        use crate::scene3d::gltf::tests::{rig, rig_material};
+        let url = "test://canvas-scene3d/knight.glb";
+        register_model(url, rig(rig_material()));
+        let rest = scene(model_sprite(url, json!({}))).unwrap();
+        assert_eq!(rest.meshes.len(), 1);
+        let mesh = &rest.meshes[0];
+        close(mesh.mesh.positions[2], [0.0, 1.0, 0.0]);
+        // the rest pose spans one unit, so the sprite's width 2 is the scale
+        let t = mesh.transform;
+        close([t[0], t[5], t[10]], [2.0, 2.0, 2.0]);
+        assert_eq!(mesh.id.as_deref(), Some("knight"));
+        assert_eq!(
+            mesh.material.map.as_deref(),
+            Some("test://canvas-scene3d/knight.glb#gltf-image-0")
+        );
+        assert!(
+            rest.animated,
+            "a playing clip keeps the host mapping frames"
+        );
+
+        let walking = scene_at(model_sprite(url, json!({})), 500.0).unwrap();
+        close(
+            walking.meshes[0].mesh.positions[2],
+            [1.0 - std::f32::consts::SQRT_2, 0.0, 0.0],
+        );
+        let turned = scene(model_sprite(url, json!({"rotation": 90}))).unwrap();
+        let t = turned.meshes[0].transform;
+        // ModelLoader reads the rotation in degrees: a quarter turn about Y
+        close([t[0], t[1], t[2]], [0.0, 0.0, -2.0]);
+        let unknown = scene_at(model_sprite(url, json!({"animation": "run"})), 500.0).unwrap();
+        close(unknown.meshes[0].mesh.positions[2], [0.0, 1.0, 0.0]);
+        assert!(
+            !unknown.animated,
+            "control: an unknown clip leaves the model at rest"
+        );
+    }
+
+    #[test]
+    fn a_broken_model_draws_the_three_error_box_and_an_undrawn_one_errors_by_name() {
+        let broken = "test://canvas-scene3d/broken.glb";
+        register_model(broken, b"not a glb".to_vec());
+        let s = scene(model_sprite(broken, json!({}))).unwrap();
+        assert_eq!(s.meshes.len(), 1);
+        let t = s.meshes[0].transform;
+        close([t[12], t[13], t[14]], [0.0, 0.5, 0.0]);
+        let channel = |byte: u8| srgb_to_linear(byte as f32 / 255.0);
+        assert_eq!(
+            s.meshes[0].material.color,
+            [channel(0xff), channel(0x44), channel(0x44)]
+        );
+
+        use crate::scene3d::gltf::tests::rig;
+        let masked = "test://canvas-scene3d/masked.glb";
+        register_model(masked, rig(json!({"alphaMode": "MASK"})));
+        assert_eq!(
+            message(scene(model_sprite(masked, json!({})))),
+            "drawables[0].asset.url: test://canvas-scene3d/masked.glb: glTF materials[0].alphaMode MASK (three's alphaTest): not yet drawn by orbital-canvas"
+        );
+        let faded = message(scene(model_sprite(broken, json!({"opacity": 0.5}))));
+        assert_eq!(
+            faded,
+            "drawables[0].opacity: a 3D model does not draw it (the three host ignores it)"
+        );
+        let billboard = message(scene(
+            json!({"drawables": [{"type": "draw-sprite", "position": {"x": 0, "y": 0},
+            "asset": {"url": "a.png", "role": "unit", "category": "c"}}]}),
+        ));
+        assert_eq!(
+            billboard,
+            "draw-sprite at drawables[0]: not yet drawn by orbital-canvas (P-025 step 4)"
+        );
+    }
+
+    #[test]
+    fn a_skinned_2d_rig_lies_on_the_scene_plane_as_the_2d_painter_poses_it() {
+        let s = scene(json!({"drawables": [{
+            "type": "draw-skinned-mesh",
+            "position": {"x": 1, "y": 2, "z": 0.5},
+            "asset": {"url": "unused", "role": "unit", "category": "c"},
+            "weightsOverlay": true,
+            "mesh": {"vertices": [
+                {"x": 0, "y": 0, "u": 0, "v": 0, "weights": [{"bone": 0, "w": 1}]},
+                {"x": 1, "y": 0, "u": 1, "v": 0, "weights": [{"bone": 0, "w": 1}]},
+                {"x": 0, "y": 1, "u": 0, "v": 1, "weights": [{"bone": 0, "w": 1}]}
+            ], "triangles": [[0, 1, 2]]},
+            "bones": [{"name": "root", "pivot": [0, 0], "tip": [1, 0]}],
+            "pose": {"root": 90}
+        }]}))
+        .unwrap();
+        assert_eq!(s.meshes.len(), 1);
+        let mesh = &s.meshes[0];
+        // posed (0,0), (0,1), (-1,0) about position (1,2); the hull's minimum (0,2) anchors the bounds
+        close(mesh.mesh.positions[0], [1.0, 0.5, 0.0]);
+        close(mesh.mesh.positions[1], [1.0, 0.5, 1.0]);
+        close(mesh.mesh.positions[2], [0.0, 0.5, 0.0]);
+        assert_eq!(
+            (
+                mesh.material.kind,
+                mesh.material.side,
+                mesh.material.opacity
+            ),
+            (MaterialKind::Basic, Side::Double, 1.0)
+        );
+        let ghost = message(scene(json!({"drawables": [{
+            "type": "draw-skinned-mesh", "position": {"x": 0, "y": 0},
+            "ghost": {"frame": 0, "opacity": 0.5}
+        }]})));
+        assert!(ghost.starts_with("drawables[0].ghost"), "{ghost}");
     }
 }

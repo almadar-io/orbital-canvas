@@ -190,6 +190,17 @@ async fn fetch_browser(url: &str) -> Result<Fetched, String> {
     Ok((js_sys::Uint8Array::new(&buffer).to_vec(), content_type))
 }
 
+/// Store bytes that arrived inside another asset (a GLB's embedded image) under `key`, so renderers resolve them like
+/// any fetched URL. `mime` classifies the kind as a transport's content type would.
+pub fn register_asset(key: &str, bytes: Arc<[u8]>, mime: Option<&str>) {
+    let kind = AssetKind::classify(key, mime);
+    cache()
+        .write()
+        .expect("asset cache poisoned")
+        .insert(key.to_string(), State::Ready(bytes, kind));
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
 /// Assets whose fetch has not completed.
 pub fn pending() -> usize {
     cache()

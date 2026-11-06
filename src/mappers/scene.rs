@@ -3,7 +3,6 @@
 
 use super::diagram;
 use super::game_canvas_2d::{self, CanvasSceneError};
-use super::game_canvas_3d;
 use super::learning;
 use crate::packet::{GameRenderPacket, Rect};
 use serde_json::Value;
@@ -186,22 +185,58 @@ pub fn map_scene(
         .get("type")
         .or_else(|| fields.get("type"))
         .and_then(Value::as_str);
+    let three_d = fields.get("mode").and_then(Value::as_str) == Some("3d");
+    if three_d
+        && matches!(
+            pattern,
+            Some("canvas" | "physics-canvas" | "biology-canvas" | "chemistry-canvas")
+        )
+    {
+        return scene3d_packet(
+            pattern.unwrap_or("canvas"),
+            &Value::Object(fields.clone()),
+            viewport,
+        );
+    }
     if let Some(pattern) = pattern.filter(|p| learning::handles(p)) {
         return learning::map(pattern, &Value::Object(fields.clone()), viewport);
     }
     if let Some(pattern) = pattern.filter(|p| diagram::handles(p)) {
         return diagram::map(pattern, &Value::Object(fields.clone()), viewport);
     }
-    if pattern == Some("canvas") && fields.get("mode").and_then(Value::as_str) == Some("3d") {
-        let (width, height) = viewport.unwrap_or((800.0, 600.0));
-        return game_canvas_3d::from_canvas_node_in_viewport(node, width, height)
-            .map(MappedScene::drawn);
-    }
     let packet = match viewport {
         Some((w, h)) => game_canvas_2d::from_canvas_node_in_viewport(node, w, h)?,
         None => game_canvas_2d::from_canvas_node(node)?,
     };
     Ok(MappedScene::drawn(packet))
+}
+
+/// A 3D canvas as one [`DrawCommand::Scene3D`](crate::packet::DrawCommand::Scene3D) across the viewport.
+fn scene3d_packet(
+    pattern: &str,
+    fields: &Value,
+    viewport: Option<(f32, f32)>,
+) -> Result<MappedScene, CanvasSceneError> {
+    let (width, height) = viewport.unwrap_or((800.0, 600.0));
+    let theme = super::canvas_scene3d::SceneTheme::default();
+    let scene = if pattern == "canvas" {
+        super::canvas_scene3d::scene_from_canvas_node_themed(fields, width, height, &theme)?
+    } else {
+        let mut node = fields.clone();
+        if let Some(map) = node.as_object_mut() {
+            map.insert("type".into(), Value::String(pattern.into()));
+        }
+        super::learning_scene3d::learning_scene3d(&node, width, height, &theme)?
+    };
+    Ok(MappedScene::drawn(GameRenderPacket {
+        pattern: pattern.to_string(),
+        width,
+        height,
+        draw_commands: vec![crate::packet::DrawCommand::Scene3D {
+            scene: Box::new(scene),
+        }],
+        ..Default::default()
+    }))
 }
 
 /// [`map_scene`] with the renderer's memory of this scene: a graph keeps its settled layout and
@@ -267,17 +302,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn authored_3d_canvas_routes_to_the_mesh_packet() {
+    fn authored_3d_canvas_routes_to_one_scene3d_command() {
         let node = serde_json::json!({
             "type": "canvas",
             "props": {
                 "mode": "3d",
                 "backgroundColor": "#000000",
-                "camera": {
-                    "pos": {"x": 0, "y": 5, "z": 2},
-                    "target": {"x": 0, "y": 0, "z": 0},
-                    "fov": 60
-                },
+                "camera": {"mode": "perspective", "fov": 60},
                 "children": [{"type": "draw-mesh", "props": {
                     "shape": "box", "position": {"x": 0, "y": 0, "z": 0},
                     "material": {"kind": "basic", "side": "double", "color": "#00ff00"}
@@ -286,11 +317,27 @@ mod tests {
         });
         let mapped = map_scene(&node, Some((320.0, 240.0))).unwrap();
         assert_eq!(mapped.packet.pattern, "canvas");
-        assert!(mapped
+        assert!(matches!(
+            mapped.packet.draw_commands.as_slice(),
+            [crate::packet::DrawCommand::Scene3D { scene }] if scene.meshes.len() == 1
+        ));
+    }
+
+    #[test]
+    fn a_3d_learning_canvas_routes_to_scene3d_and_control_its_2d_mode_does_not() {
+        let three_d = serde_json::json!({"type": "physics-canvas", "mode": "3d", "bodies": []});
+        let mapped = map_scene(&three_d, Some((320.0, 240.0))).unwrap();
+        assert!(matches!(
+            mapped.packet.draw_commands.as_slice(),
+            [crate::packet::DrawCommand::Scene3D { .. }]
+        ));
+        let flat = serde_json::json!({"type": "physics-canvas", "bodies": []});
+        let mapped = map_scene(&flat, Some((320.0, 240.0))).unwrap();
+        assert!(!mapped
             .packet
             .draw_commands
             .iter()
-            .any(|command| matches!(command, crate::packet::DrawCommand::Mesh3D { .. })));
+            .any(|c| matches!(c, crate::packet::DrawCommand::Scene3D { .. })));
     }
     use serde_json::json;
 

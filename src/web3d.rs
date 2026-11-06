@@ -24,12 +24,12 @@ pub struct WebCanvas3D {
     reduced_motion: bool,
 }
 
-struct Opened {
-    surface: wgpu::Surface<'static>,
-    adapter: wgpu::Adapter,
-    device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
-    webgpu: bool,
+pub(crate) struct Opened {
+    pub(crate) surface: wgpu::Surface<'static>,
+    pub(crate) adapter: wgpu::Adapter,
+    pub(crate) device: Arc<wgpu::Device>,
+    pub(crate) queue: Arc<wgpu::Queue>,
+    pub(crate) webgpu: bool,
 }
 
 async fn open_webgpu(
@@ -97,37 +97,46 @@ async fn open_webgl2(
     })
 }
 
+/// A surface on `canvas`: on the WebGPU device the page's gpu/* work shares, else a WebGL2 device of its own.
+pub(crate) async fn open_canvas(
+    canvas: web_sys::HtmlCanvasElement,
+) -> Result<(Opened, wgpu::SurfaceConfiguration), String> {
+    let (width, height) = (canvas.width().max(1), canvas.height().max(1));
+    let opened = match open_webgpu(canvas).await {
+        Ok(opened) => opened,
+        Err((error, canvas)) => open_webgl2(canvas, &error).await?,
+    };
+    let caps = opened.surface.get_capabilities(&opened.adapter);
+    let format = *caps
+        .formats
+        .first()
+        .ok_or("the canvas offers no surface format")?;
+    let alpha_mode = if caps
+        .alpha_modes
+        .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+    {
+        wgpu::CompositeAlphaMode::PreMultiplied
+    } else {
+        caps.alpha_modes[0]
+    };
+    let config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format,
+        width,
+        height,
+        present_mode: wgpu::PresentMode::Fifo,
+        desired_maximum_frame_latency: 2,
+        alpha_mode,
+        view_formats: vec![],
+    };
+    opened.surface.configure(&opened.device, &config);
+    Ok((opened, config))
+}
+
 impl WebCanvas3D {
     pub async fn new(canvas: web_sys::HtmlCanvasElement) -> Result<Self, String> {
-        let (width, height) = (canvas.width().max(1), canvas.height().max(1));
-        let opened = match open_webgpu(canvas).await {
-            Ok(opened) => opened,
-            Err((error, canvas)) => open_webgl2(canvas, &error).await?,
-        };
-        let caps = opened.surface.get_capabilities(&opened.adapter);
-        let format = *caps
-            .formats
-            .first()
-            .ok_or("the canvas offers no surface format")?;
-        let alpha_mode = if caps
-            .alpha_modes
-            .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
-        {
-            wgpu::CompositeAlphaMode::PreMultiplied
-        } else {
-            caps.alpha_modes[0]
-        };
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width,
-            height,
-            present_mode: wgpu::PresentMode::Fifo,
-            desired_maximum_frame_latency: 2,
-            alpha_mode,
-            view_formats: vec![],
-        };
-        opened.surface.configure(&opened.device, &config);
+        let (opened, config) = open_canvas(canvas).await?;
+        let (width, height) = (config.width, config.height);
         let mut view = Scene3DView::new();
         view.resize(width as f32, height as f32);
         Ok(Self {
