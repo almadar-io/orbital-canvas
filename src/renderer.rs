@@ -411,6 +411,8 @@ pub struct SharedDeviceRenderer {
     frame_epoch: u64,
     render_depth: usize,
     scene3d: Option<crate::scene3d::Renderer3D>,
+    /// Why the last packet's 3D scene was not drawn; a host with no log sink reports it ([`Self::take_scene3d_error`]).
+    scene3d_error: Option<String>,
     format: wgpu::TextureFormat,
     particles: Option<crate::particles::ParticlePass>,
 }
@@ -466,6 +468,7 @@ impl SharedDeviceRenderer {
             use_clock: 0,
             frame_epoch: 0,
             render_depth: 0,
+            scene3d_error: None,
             scene3d: None,
             format,
             particles: None,
@@ -931,6 +934,11 @@ impl SharedDeviceRenderer {
         Some(Draw::MaskedSprite { bind_group, verts })
     }
 
+    /// The error that kept the last packet's 3D scene from drawing, once.
+    pub fn take_scene3d_error(&mut self) -> Option<String> {
+        self.scene3d_error.take()
+    }
+
     pub fn render_packet_to_texture(
         &mut self,
         packet: &GameRenderPacket,
@@ -962,9 +970,11 @@ impl SharedDeviceRenderer {
                     Ok(()) => {
                         load_3d = true;
                         drew = true;
+                        self.scene3d_error = None;
                     }
                     Err(error) => {
-                        tracing::error!(target: "almadar::game_renderer", %error, "3D scene not drawn")
+                        tracing::error!(target: "almadar::game_renderer", %error, "3D scene not drawn");
+                        self.scene3d_error = Some(error.to_string());
                     }
                 }
             }

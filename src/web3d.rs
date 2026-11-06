@@ -360,7 +360,10 @@ impl WebCanvas3D {
         self.renderer
             .render_packet_to_texture(&packet, &frame.texture);
         frame.present();
-        Ok(())
+        match self.renderer.take_scene3d_error() {
+            Some(error) => Err(format!("3D scene not drawn: {error}")),
+            None => Ok(()),
+        }
     }
 
     /// Advances the canvas clock to `now_ms` (`performance.now()`) with the page's `epoch_ms`
