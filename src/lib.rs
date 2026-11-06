@@ -18,24 +18,24 @@ pub mod platform;
 pub mod projector;
 pub mod renderer;
 pub mod scene3d;
-#[cfg(target_arch = "wasm32")]
-pub mod web2d;
-#[cfg(target_arch = "wasm32")]
-pub mod web3d;
 pub mod skinning_2d;
 pub mod svg;
 #[cfg(feature = "system-fonts")]
 pub mod system_fonts;
 pub mod vector;
+#[cfg(target_arch = "wasm32")]
+pub mod web2d;
+#[cfg(target_arch = "wasm32")]
+pub mod web3d;
 
-use packet::GameRenderPacket;
+use packet::{DrawCommand, GameRenderPacket};
 use thiserror::Error;
 
-pub(crate) use renderer::DeviceResources;
 #[cfg(not(target_arch = "wasm32"))]
 pub use device::shared_device;
 pub use device::{register_device, shared_device_async};
 pub use gpu::GpuHost;
+pub(crate) use renderer::DeviceResources;
 pub use renderer::SharedDeviceRenderer;
 
 /// Errors that can occur when creating or using the renderer.
@@ -124,6 +124,11 @@ pub struct SceneHost {
     pub(crate) epoch_clock_ms: f64,
     /// Whether the host allows motion (false: the OS reduced-motion setting is on).
     pub(crate) motion: bool,
+    /// A 3D scene's camera and picking (OrbitControls, follow easing, unit/tile clicks), the same view the
+    /// browser host drives; set while the current packet draws a `Scene3D`.
+    pub(crate) view3d: Option<scene3d::Scene3DView>,
+    /// Whether the 3D camera moved on the last clock tick (damping or follow easing still running).
+    pub(crate) view3d_moving: bool,
 }
 
 fn contains(r: &packet::Rect, x: f32, y: f32) -> bool {
@@ -257,6 +262,8 @@ impl SceneHost {
             clock_epoch: None,
             epoch_clock_ms: 0.0,
             motion: true,
+            view3d: None,
+            view3d_moving: false,
         }
     }
 
@@ -323,6 +330,41 @@ impl SceneHost {
     }
 
     fn install(&mut self, mapped: mappers::scene::MappedScene) {
+        let scene = mapped.packet.draw_commands.iter().find_map(|c| match c {
+            DrawCommand::Scene3D { scene } => Some(scene.as_ref().clone()),
+            _ => None,
+        });
+        match scene {
+            Some(scene) => {
+                let density = self.density;
+                let view = self.view3d.get_or_insert_with(scene3d::Scene3DView::new);
+                if let Some((w, h)) = self.viewport {
+                    view.resize(w as f32 / density, h as f32 / density);
+                }
+                view.set_reduced_motion(!self.motion);
+                view.set_follow(
+                    scene
+                        .interaction
+                        .follow_from
+                        .map(|start_eye| scene3d::view::Follow { start_eye }),
+                );
+                let interaction = &scene.interaction;
+                let ground_events = self.scene.as_ref().is_some_and(|node| {
+                    let f = node.get("props").unwrap_or(node);
+                    f.get("tileClickEvent").is_some() || f.get("unitClickEvent").is_some()
+                });
+                let picks_ground =
+                    interaction.editable || !interaction.cells.is_empty() || ground_events;
+                view.set_ground_extent(picks_ground.then_some(scene3d::view::GroundExtent {
+                    min_x: interaction.min_x,
+                    max_x: interaction.max_x,
+                    min_z: interaction.min_z,
+                    max_z: interaction.max_z,
+                }));
+                view.set_scene(scene);
+            }
+            None => self.view3d = None,
+        }
         self.packet = Some(mapped.packet);
         self.hits = mapped.hits;
         self.drags = mapped.drags;
@@ -334,7 +376,11 @@ impl SceneHost {
     /// first value is scene time zero.
     pub fn set_clock(&mut self, ms: f64) {
         self.clock_epoch.get_or_insert(ms);
+        let dt = ((ms - self.clock_ms) / 1000.0).max(0.0) as f32;
         self.clock_ms = ms;
+        if let Some(view) = self.view3d.as_mut() {
+            self.view3d_moving = view.advance(dt);
+        }
     }
 
     pub fn set_epoch_clock(&mut self, epoch_ms: f64) {
@@ -364,7 +410,8 @@ impl SceneHost {
     /// Whether the host should keep drawing frames: the scene is animated, or assets it asked for
     /// are still arriving. A static, settled scene needs no loop; a new scene or a resize wakes it.
     pub fn wants_frames(&self) -> bool {
-        self.is_animated()
+        self.view3d_moving
+            || self.is_animated()
             || (self.motion
                 && self.epoch_clock_ms > 0.0
                 && self
@@ -404,9 +451,18 @@ impl SceneHost {
                 }
             }
         }
-        self.packet
+        let mut packet = self
+            .packet
             .as_ref()
-            .map(|p| p.resolved(self.scene_time(), self.motion).into_owned())
+            .map(|p| p.resolved(self.scene_time(), self.motion).into_owned())?;
+        if let Some(camera) = self.view3d.as_ref().and_then(scene3d::Scene3DView::camera) {
+            for command in &mut packet.draw_commands {
+                if let DrawCommand::Scene3D { scene } = command {
+                    scene.camera = camera;
+                }
+            }
+        }
+        Some(packet)
     }
 
     /// Map the current scene again once every asset it asked for has landed (or `timeout` passes):
@@ -463,6 +519,11 @@ impl SceneHost {
 
     /// A pinch: zoom a pannable scene by `factor` about the focus point (logical points).
     pub fn zoom(&mut self, factor: f32, x: f32, y: f32) {
+        if let Some(view) = self.view3d.as_mut() {
+            // a pinch or wheel out (factor below 1) dollies the 3D camera away, as a wheel down does
+            self.view3d_moving |= view.wheel(if factor < 1.0 { 1.0 } else { -1.0 });
+            return;
+        }
         if self.pannable && factor.is_finite() && factor > 0.0 {
             self.memory.pending_zoom = Some((factor, x, y));
             self.relayout();
@@ -491,6 +552,9 @@ impl SceneHost {
         button: i32,
         key: Option<&str>,
     ) -> bool {
+        if self.view3d.is_some() {
+            return self.input_3d(event_type, x, y, button);
+        }
         match event_type {
             "touch-down" => {
                 self.touch_down = Some((x, y));
@@ -592,6 +656,57 @@ impl SceneHost {
                 payload: serde_json::json!({ "id": id, "x": nx, "y": ny }),
             });
         }
+    }
+
+    /// Pointer input on a 3D scene: the view orbits, and a click becomes the scene's own unit or tile event.
+    fn input_3d(&mut self, event_type: &str, x: f32, y: f32, button: i32) -> bool {
+        let button = match button {
+            1 => scene3d::Button::Middle,
+            2 => scene3d::Button::Secondary,
+            _ => scene3d::Button::Primary,
+        };
+        let declared = |key: &str| {
+            self.scene
+                .as_ref()
+                .and_then(|node| node.get("props").unwrap_or(node).get(key))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        let (unit, tile) = (declared("unitClickEvent"), declared("tileClickEvent"));
+        let Some(view) = self.view3d.as_mut() else {
+            return false;
+        };
+        match event_type {
+            "touch-down" => view.pointer_down(0, x, y, button, false),
+            "touch-move" => self.view3d_moving |= view.pointer_move(0, x, y),
+            "touch-up" => {
+                let released = view.pointer_release(0, x, y, unit.is_some(), tile.is_some());
+                let emit = |event: String, payload: serde_json::Value| mappers::scene::Emit {
+                    event,
+                    arg: String::new(),
+                    payload,
+                };
+                match released {
+                    Some(scene3d::view::Release::Pick(scene3d::Pick::Unit { id, x, z })) => {
+                        if let Some(event) = unit {
+                            self.scene_events.push(emit(
+                                event,
+                                serde_json::json!({ "unitId": id, "x": x, "z": z }),
+                            ));
+                        }
+                    }
+                    Some(scene3d::view::Release::Pick(scene3d::Pick::Tile { x, z })) => {
+                        if let Some(event) = tile {
+                            self.scene_events
+                                .push(emit(event, serde_json::json!({ "x": x, "z": z })));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        true
     }
 
     /// Drain the scene events that taps queued (`[{event, payload}]` for the host to send).
@@ -1103,6 +1218,67 @@ mod tests {
             0,
             "control: an atlas that never loads draws nothing, and settling still returns"
         );
+    }
+
+    fn board_3d() -> serde_json::Value {
+        serde_json::json!({"type": "canvas", "mode": "3d", "tileClickEvent": "TILE",
+            "drawables": [{"type": "draw-mesh", "position": {"x": 2, "y": 2}}]})
+    }
+
+    #[test]
+    fn a_click_on_a_3d_board_queues_its_tile_event() {
+        let mut host = SceneHost::new();
+        host.set_viewport(800, 600);
+        host.set_scene(board_3d()).unwrap();
+        assert!(host.view3d.is_some());
+        host.input("touch-down", 400.0, 300.0, 0, None);
+        host.input("touch-up", 400.0, 300.0, 0, None);
+        let events = host.take_scene_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].event, "TILE");
+        assert!(
+            events[0].delivered().get("x").is_some()
+                && events[0].delivered().get("unitId").is_none()
+        );
+
+        let mut silent = board_3d();
+        silent.as_object_mut().unwrap().remove("tileClickEvent");
+        host.set_scene(silent).unwrap();
+        host.input("touch-down", 400.0, 300.0, 0, None);
+        host.input("touch-up", 400.0, 300.0, 0, None);
+        assert!(
+            host.take_scene_events().is_empty(),
+            "no declared event, nothing queued"
+        );
+    }
+
+    #[test]
+    fn dragging_a_3d_scene_orbits_its_camera() {
+        let camera = |host: &SceneHost| {
+            host.frame_packet()
+                .unwrap()
+                .draw_commands
+                .iter()
+                .find_map(|c| match c {
+                    packet::DrawCommand::Scene3D { scene } => Some(scene.camera),
+                    _ => None,
+                })
+        };
+        let mut host = SceneHost::new();
+        host.set_viewport(800, 600);
+        host.set_scene(board_3d()).unwrap();
+        let before = camera(&host).unwrap();
+        host.input("touch-down", 400.0, 300.0, 0, None);
+        host.input("touch-move", 520.0, 300.0, 0, None);
+        host.input("touch-up", 520.0, 300.0, 0, None);
+        host.set_clock(16.0);
+        host.set_clock(1000.0);
+        assert_ne!(camera(&host).unwrap().eye, before.eye);
+        assert!(host.take_scene_events().is_empty(), "a drag is not a click");
+
+        host.set_scene(serde_json::json!({"type": "canvas", "drawables": []}))
+            .unwrap();
+        assert!(host.view3d.is_none(), "a 2D scene has no 3D view");
     }
 
     #[test]
