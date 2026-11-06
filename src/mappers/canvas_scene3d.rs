@@ -2,21 +2,28 @@
 //! `Lighting3D`) builds today, rebuilt as a retained scene. Anything the pattern declares that this slice does not draw
 //! is a typed error naming the field, never a silent drop.
 
-use super::game_canvas_2d::{parse_css_color, to_drawable_nodes, CanvasSceneError};
+use super::game_canvas_2d::{
+    paint_drawables, parse_css_color, to_drawable_nodes, CanvasSceneError,
+};
+use super::learning::shape::parse_path_data;
+use super::learning::Xf;
 use super::skinned_mesh_2d;
 use crate::asset;
+use crate::atlas;
 use crate::packet::DrawCommand;
-use crate::projector::{Projection as Layout2D, Projector};
+use crate::projector::{Projection as Layout2D, Projector, TILE_WIDTH};
 use crate::scene3d::animation::{self, AnimatedState, Animation, AnimationError, MATERIAL_TRACKS};
 use crate::scene3d::geometry;
 use crate::scene3d::gltf::{model_state, ModelState};
+use crate::scene3d::label::{label, LabelStyle};
 use crate::scene3d::model::{
-    srgb_to_linear, srgb_to_linear_rgb, AmbientLight, Camera, DirectionalLight, Grid,
+    srgb_to_linear, srgb_to_linear_rgb, AmbientLight, Camera, DirectionalLight, Flat, Grid,
     HemisphereLight, Lights, Material, MaterialKind, MeshData, MeshInstance, PointLight,
     Projection, Scene3D, ShadowSettings, Side, ToneMapping,
 };
 use crate::scene3d::model::{CellId, Interaction};
 use crate::scene3d::skin;
+use crate::scene3d::tessellate::{self, Subpath};
 use crate::skinning_2d::{self, BoneDef, Pose, SkinMesh};
 use glam::{DMat4, DVec3, Mat4};
 use serde_json::{Map, Value};
@@ -87,7 +94,7 @@ pub fn scene_from_canvas_node_themed(
     height: f32,
     theme: &SceneTheme,
 ) -> Result<Scene3D, CanvasSceneError> {
-    compose(node, width, height, theme, None)
+    compose(node, width, height, theme, None, None)
 }
 
 /// The scene with every `animation` sampled at `elapsed_ms` on the canvas clock: the three host's
@@ -106,7 +113,29 @@ pub fn scene_from_canvas_node_at(
             format!("{elapsed_ms} is not a time on the canvas clock (finite, at least zero)"),
         ));
     }
-    compose(node, width, height, theme, Some(elapsed_ms))
+    compose(node, width, height, theme, Some(elapsed_ms), None)
+}
+
+/// [`scene_from_canvas_node_at`] with the page's wall clock as well: `epoch_ms` is the three host's
+/// `performance.timeOrigin + performance.now()`, the clock `draw-fx-layer` entries are born on (`bornAt`) and sprite
+/// sheets play on. Without it an fx entry's age comes from its ttl, as `fx_projection` defines for a clockless paint.
+pub fn scene_from_canvas_node_at_epoch(
+    node: &Value,
+    width: f32,
+    height: f32,
+    theme: &SceneTheme,
+    elapsed_ms: f64,
+    epoch_ms: f64,
+) -> Result<Scene3D, CanvasSceneError> {
+    for (field, ms) in [("elapsedMs", elapsed_ms), ("epochMs", epoch_ms)] {
+        if !(ms.is_finite() && ms >= 0.0) {
+            return Err(bad(
+                field,
+                format!("{ms} is not a time on the canvas clock (finite, at least zero)"),
+            ));
+        }
+    }
+    compose(node, width, height, theme, Some(elapsed_ms), Some(epoch_ms))
 }
 
 fn compose(
@@ -115,6 +144,7 @@ fn compose(
     height: f32,
     theme: &SceneTheme,
     elapsed_ms: Option<f64>,
+    epoch_ms: Option<f64>,
 ) -> Result<Scene3D, CanvasSceneError> {
     let object = node.as_object().ok_or(CanvasSceneError::NotAnObject)?;
     let fields = object
@@ -183,6 +213,7 @@ fn compose(
         meshes: Vec::new(),
         pick_id: None,
         elapsed_ms,
+        epoch_ms,
         animated: false,
         scopes: vec![HashMap::new()],
         scope: 0,
@@ -243,19 +274,13 @@ fn interaction(
         .and_then(Value::as_str)
         .is_some_and(|m| m == "follow" || m == "chase");
     let mut cells = Vec::new();
-    for (path, node) in nodes {
-        let Some(f) = node.as_object() else { continue };
-        let Some(id) = f.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(pos) = drawn_pos(f, path)? else {
-            continue;
-        };
+    for (pos, id) in drawn_items(nodes)? {
+        let Some(id) = id else { continue };
         if pos[0].fract() == 0.0 && pos[1].fract() == 0.0 {
             cells.push(CellId {
                 x: pos[0] as i64,
                 y: pos[1] as i64,
-                id: id.to_string(),
+                id,
             });
         }
     }
@@ -350,13 +375,7 @@ struct Bounds {
 /// `collectDrawnItems` over the top-level list: scene `x` spans world X, scene `y` spans world Z.
 fn scene_bounds(nodes: &[(String, Value)]) -> Result<Bounds, CanvasSceneError> {
     let mut bounds: Option<Bounds> = None;
-    for (path, node) in nodes {
-        let Some(fields) = node.as_object() else {
-            continue;
-        };
-        let Some(pos) = drawn_pos(fields, path)? else {
-            continue;
-        };
+    for (pos, _) in drawn_items(nodes)? {
         let b = bounds.get_or_insert(Bounds {
             min_x: pos[0],
             max_x: pos[0],
@@ -698,6 +717,8 @@ struct Walk<'a> {
     pick_id: Option<String>,
     /// The canvas clock; `None` leaves animations at rest.
     elapsed_ms: Option<f64>,
+    /// The page's wall clock, when the host gives it.
+    epoch_ms: Option<f64>,
     animated: bool,
     /// `BoneStore`s: the canvas's at 0, one per `skeleton: true` group after it; name → bone world matrix.
     scopes: Vec<HashMap<String, DMat4>>,
@@ -708,6 +729,8 @@ struct Walk<'a> {
 
 struct PendingSkin {
     mesh: usize,
+    /// The outline shell's mesh and how far it stands off the posed surface.
+    hull: Option<(usize, f32)>,
     scope: usize,
     path: String,
     bones: Vec<String>,
@@ -862,10 +885,12 @@ impl Walk<'_> {
             "draw-group" => self.group(fields, path, parent, place, opacity),
             "draw-sprite" => self.sprite(fields, path, parent, place, opacity),
             "draw-skinned-mesh" => self.skinned_mesh(fields, path, parent, place, opacity),
-            "draw-shape" | "draw-text" | "draw-sprite-layer" | "draw-shape-layer"
-            | "draw-text-layer" | "draw-fx-layer" => {
-                Err(undrawn(&format!("{ty} at {path}"), STEP_PARITY))
-            }
+            "draw-shape" => self.shape(fields, path, parent, place, opacity),
+            "draw-text" => self.text(fields, path, parent, place, opacity),
+            "draw-sprite-layer" => self.layer(fields, path, parent, place, opacity, "draw-sprite"),
+            "draw-shape-layer" => self.layer(fields, path, parent, place, opacity, "draw-shape"),
+            "draw-text-layer" => self.layer(fields, path, parent, place, opacity, "draw-text"),
+            "draw-fx-layer" => self.fx_layer(fields, path, parent, place, opacity),
             other => Err(bad(
                 &join(path, "type"),
                 format!("`{other}` is not a drawable"),
@@ -979,15 +1004,7 @@ impl Walk<'_> {
         group_opacity: f64,
     ) -> Result<(), CanvasSceneError> {
         check_keys(f, MESH_KEYS, path)?;
-        if present(f, "outline").is_some() {
-            return Err(undrawn(&join(path, "outline"), STEP_PARITY));
-        }
-        if self.theme.outline > 0.0 {
-            return Err(undrawn(
-                &format!("{path}.outline (theme --material-outline)"),
-                STEP_PARITY,
-            ));
-        }
+        let outline = outline(f, path, self.theme)?;
         let world = place.world(required_pos(f, path)?);
         let shape = match present(f, "shape") {
             None => "box",
@@ -1063,17 +1080,20 @@ impl Walk<'_> {
         let geo = |result: Result<MeshData, geometry::GeometryError>| {
             result.map_err(|e| bad(path, format!("{shape} geometry: {}", e.0)))
         };
-        let (mesh, lift) = match shape {
+        // `size` is `meshGeometry`'s representative extent, which scales the outline shell; a polyhedron has none
+        let (mesh, lift, size) = match shape {
             "box" => (
                 geo(geometry::cuboid(w as f32, h as f32, d as f32))?,
                 h / 2.0,
+                Some(w.max(h).max(d)),
             ),
-            "sphere" => (geo(geometry::sphere(r as f32, seg, seg))?, r),
+            "sphere" => (geo(geometry::sphere(r as f32, seg, seg))?, r, Some(r * 2.0)),
             "capsule" => {
                 let caps = js_round(seg as f64 / 2.0).max(2.0) as usize;
                 (
                     geo(geometry::capsule(r as f32, h as f32, caps, seg))?,
                     h / 2.0 + r,
+                    Some(h + r * 2.0),
                 )
             }
             "cylinder" => {
@@ -1082,11 +1102,13 @@ impl Walk<'_> {
                 (
                     geo(geometry::cylinder(top as f32, bottom as f32, h as f32, seg))?,
                     h / 2.0,
+                    Some(h.max(r * 2.0)),
                 )
             }
             "cone" => (
                 geo(geometry::cylinder(0.0, r as f32, h as f32, seg))?,
                 h / 2.0,
+                Some(h.max(r * 2.0)),
             ),
             "torus" => {
                 let tube = dim("tube", radius / 3.0)? * cell;
@@ -1094,11 +1116,19 @@ impl Walk<'_> {
                 (
                     geo(geometry::torus(r as f32, tube as f32, radial, seg))?,
                     r + tube,
+                    Some((r + tube) * 2.0),
                 )
             }
-            "plane" => (geo(geometry::plane(w as f32, d as f32))?, 0.0),
-            "circle" => (geo(geometry::circle(r as f32, seg))?, 0.0),
-            _ => polyhedron(f, path, cell)?,
+            "plane" => (
+                geo(geometry::plane(w as f32, d as f32))?,
+                0.0,
+                Some(w.max(d)),
+            ),
+            "circle" => (geo(geometry::circle(r as f32, seg))?, 0.0, Some(r * 2.0)),
+            _ => {
+                let (mesh, lift) = polyhedron(f, path, cell)?;
+                (mesh, lift, None)
+            }
         };
         let lift = match opt_str(f, "pivot", path)? {
             None | Some("bottom") => lift,
@@ -1113,18 +1143,20 @@ impl Walk<'_> {
         let state = animated.as_ref().and_then(|(_, state)| state.as_ref());
         let [ax, ay, az] = state.map_or([0.0; 3], |s| s.rotate);
         // three's GROUND_ROTATION lays plane and circle flat; it adds to the authored Euler angles.
-        let oriented = match shape {
-            "plane" | "circle" => euler_xyz([-FRAC_PI_2 + rx + ax, ry + ay, rz + az]),
-            _ => euler_xyz([rx + ax, ry + ay, rz + az]),
+        let ground = if matches!(shape, "plane" | "circle") {
+            -FRAC_PI_2
+        } else {
+            0.0
         };
+        let oriented = euler_xyz([ground + rx + ax, ry + ay, rz + az]);
         // `Mesh3D` moves and scales its outer group, so the scale also carries the pivot lift.
         let (offset, scale) =
             state.map_or((DVec3::ZERO, 1.0), |s| (place.offset(s.offset), s.scale));
-        let transform = parent
+        let group = parent
             * DMat4::from_translation(world + offset)
             * DMat4::from_scale(DVec3::splat(scale))
-            * DMat4::from_translation(DVec3::new(0.0, lift, 0.0))
-            * oriented;
+            * DMat4::from_translation(DVec3::new(0.0, lift, 0.0));
+        let transform = group * oriented;
 
         let material_fields = opt_object(f, "material", path)?;
         let material_opacity = match material_fields {
@@ -1138,6 +1170,7 @@ impl Walk<'_> {
             .unwrap_or(1.0)
             * material_opacity
             * group_opacity;
+        let still_opacity = node_opacity.unwrap_or(1.0) * material_opacity * group_opacity;
         let mut material = material(
             material_fields,
             &join(path, "material"),
@@ -1185,6 +1218,22 @@ impl Walk<'_> {
                 material.emissive_intensity = intensity as f32;
             }
         }
+        // `Mesh3D`'s hull is a sibling of the mesh in the animated group: it keeps the authored rotation and opacity
+        let hull = match (&outline, size) {
+            (Some(o), Some(size)) if size > 0.0 => Some((
+                mesh.clone(),
+                group
+                    * euler_xyz([ground + rx, ry, rz])
+                    * DMat4::from_scale(DVec3::splat(1.0 + o.width * cell / size)),
+            )),
+            (Some(_), Some(_)) => Some((mesh.clone(), group * euler_xyz([ground + rx, ry, rz]))),
+            (Some(o), None) => Some((
+                tessellate::inflate(&mesh, (o.width * cell) as f32)
+                    .map_err(|e| bad(&join(path, "outline"), e))?,
+                group * euler_xyz([ground + rx, ry, rz]),
+            )),
+            (None, _) => None,
+        };
         self.meshes.push(MeshInstance {
             mesh,
             transform: transform.as_mat4().to_cols_array(),
@@ -1193,6 +1242,10 @@ impl Walk<'_> {
             receive_shadow: opt_bool(f, "receiveShadow", path)?.unwrap_or(true),
             id: self.pick_id.clone(),
         });
+        if let (Some(o), Some((mesh, at))) = (outline, hull) {
+            self.meshes
+                .push(o.instance(mesh, at, still_opacity, self.pick_id.clone()));
+        }
         Ok(())
     }
 }
@@ -1303,16 +1356,26 @@ impl Walk<'_> {
             self.theme,
         )?;
         let transform = parent * DMat4::from_translation(world);
+        let outline = outline(f, path, self.theme)?;
         self.meshes.push(MeshInstance {
-            mesh,
+            mesh: mesh.clone(),
             transform: transform.as_mat4().to_cols_array(),
             material,
             cast_shadow: opt_bool(f, "castShadow", path)?.unwrap_or(true),
             receive_shadow: opt_bool(f, "receiveShadow", path)?.unwrap_or(true),
             id: self.pick_id.clone(),
         });
+        let skinned = self.meshes.len() - 1;
+        // three draws no hull on a skinned mesh; ours is the posed surface pushed out along its normals
+        let hull = outline.map(|o| {
+            let width = (o.width * place.cell) as f32;
+            self.meshes
+                .push(o.instance(mesh, transform, opacity, self.pick_id.clone()));
+            (self.meshes.len() - 1, width)
+        });
         self.skins.push(PendingSkin {
-            mesh: self.meshes.len() - 1,
+            hull,
+            mesh: skinned,
             scope: self.scope,
             path: path.to_string(),
             bones,
@@ -1349,12 +1412,17 @@ impl Walk<'_> {
                 pending.bind_inverse.as_mat4(),
             )
             .map_err(|e| bad(&join(&pending.path, "skin"), e))?;
+            if let Some((hull, width)) = pending.hull {
+                let shell = tessellate::inflate(&self.meshes[pending.mesh].mesh, width)
+                    .map_err(|e| bad(&join(&pending.path, "outline"), e))?;
+                self.meshes[hull].mesh = shell;
+            }
         }
         Ok(())
     }
 
-    /// `Sprite3D` with `asset.dimension: "3d"`: `ModelLoader` at the sprite's position, turned by `rotation` (which
-    /// it reads in degrees), scaled to the sprite's size over the model's rest-pose extent, playing `animation`.
+    /// `Sprite3D`: the fallback box when the asset has no url (`spriteAssetState`), a model when it is 3D, else a
+    /// flat image.
     fn sprite(
         &mut self,
         f: &Fields,
@@ -1366,17 +1434,39 @@ impl Walk<'_> {
         check_keys(f, SPRITE_KEYS, path)?;
         let asset_path = join(path, "asset");
         let asset = opt_object(f, "asset", path)?;
-        let (dimension, url) = match asset {
-            Some(a) => (
-                opt_str(a, "dimension", &asset_path)?,
-                opt_str(a, "url", &asset_path)?.filter(|u| !u.is_empty()),
-            ),
-            None => (None, None),
+        if let Some(a) = asset {
+            check_keys(a, ASSET_KEYS, &asset_path)?;
+        }
+        let url = match asset {
+            Some(a) => opt_str(a, "url", &asset_path)?.filter(|u| !u.is_empty()),
+            None => None,
         };
-        let (Some("3d"), Some(asset), Some(url)) = (dimension, asset, url) else {
-            return Err(undrawn(&format!("draw-sprite at {path}"), STEP_PARITY));
+        let (Some(asset), Some(url)) = (asset, url) else {
+            return self.sprite_fallback(f, path, parent, place);
         };
-        check_keys(asset, ASSET_KEYS, &asset_path)?;
+        match opt_str(asset, "dimension", &asset_path)? {
+            Some("3d") => self.model_sprite(f, path, parent, place, group_opacity, asset, url),
+            None | Some("2d") => {
+                self.flat_sprite(f, path, parent, place, group_opacity, asset, url)
+            }
+            Some(_) => Err(bad(&join(&asset_path, "dimension"), "must be 2d or 3d")),
+        }
+    }
+
+    /// `Sprite3D` with `asset.dimension: "3d"`: `ModelLoader` at the sprite's position, turned by `rotation` (which
+    /// it reads in degrees), scaled to the sprite's size over the model's rest-pose extent, playing `animation`.
+    #[allow(clippy::too_many_arguments)]
+    fn model_sprite(
+        &mut self,
+        f: &Fields,
+        path: &str,
+        parent: DMat4,
+        place: Placement,
+        group_opacity: f64,
+        asset: &Fields,
+        url: &str,
+    ) -> Result<(), CanvasSceneError> {
+        let asset_path = join(path, "asset");
         for key in ["atlas", "sprite"] {
             if present(asset, key).is_some() {
                 return Err(bad(
@@ -1610,6 +1700,981 @@ impl Walk<'_> {
     }
 }
 
+const SHAPE_KEYS: &[&str] = &[
+    "type",
+    "id",
+    "shape",
+    "position",
+    "anchor",
+    "width",
+    "height",
+    "radiusX",
+    "radiusY",
+    "offsetX",
+    "offsetY",
+    "points",
+    "d",
+    "fill",
+    "gradient",
+    "fillPattern",
+    "stroke",
+    "strokeWidth",
+    "strokeGradient",
+    "strokeDash",
+    "strokeDashOffset",
+    "blendMode",
+    "blur",
+    "rotate",
+    "pivot",
+    "shadow",
+    "animation",
+    "opacity",
+];
+
+const TEXT_KEYS: &[&str] = &[
+    "type", "id", "text", "position", "anchor", "offsetX", "offsetY", "color", "font", "align",
+    "baseline", "opacity",
+];
+
+const LAYER_KEYS: &[&str] = &["type", "id", "items"];
+
+const FX_LAYER_KEYS: &[&str] = &[
+    "type",
+    "id",
+    "items",
+    "presets",
+    "art",
+    "sprites",
+    "tickMs",
+    "textColor",
+];
+
+/// The shape props a keyframe animates, all drawn here.
+const SHAPE_TRACKS: &[&str] = &[
+    "offsetX",
+    "offsetY",
+    "rotate",
+    "opacity",
+    "radiusX",
+    "radiusY",
+    "width",
+    "height",
+    "strokeWidth",
+    "fill",
+    "stroke",
+];
+
+/// `Shape3D` lifts every shape off the ground; a stroke sits a hair above its own fill so the two never depth-fight.
+const SHAPE_LIFT: f64 = 0.02;
+const STROKE_LIFT: f64 = 0.001;
+/// `Shape3D`'s `ringGeometry(radiusX - 0.08, radiusX, 32)` and `circleGeometry(radiusX, 32)`; a cell is 0.95 wide.
+const RING_WIDTH: f64 = 0.08;
+const SHAPE_SEGMENTS: usize = 32;
+const CELL_FILL: f64 = 0.95;
+/// A path flattens to within a quarter of the 2D painter's pixel at one cell.
+const PATH_TOLERANCE: f32 = 0.25 / TILE_WIDTH;
+/// `SpriteBillboard`: a ground decal floats 0.01 off the ground, its loading placeholder 0.02, at 0.6 opacity.
+const DECAL_LIFT: f64 = 0.01;
+const PLACEHOLDER_LIFT: f64 = 0.02;
+const PLACEHOLDER_OPACITY: f64 = 0.6;
+/// `Text3D`: drei `<Text>` in a `<Billboard>` 1.2 above the position, font size 0.32, a 0.02 black outline.
+const LABEL_LIFT: f64 = 1.2;
+const LABEL_EM: f32 = 0.32;
+const LABEL_OUTLINE: f32 = 0.02;
+/// `DrawFxLayer.tsx`'s declared defaults, and the family the bundled face answers to.
+const FX_TICK_MS: f64 = 500.0;
+const FX_TEXT_COLOR: &str = "#ffe066";
+const FX_FONT_FAMILY: &str = "system-ui, sans-serif";
+
+/// `Mesh3D`'s outline: an unlit back-face shell in `color`, standing `width` cells off the surface.
+struct Outline {
+    color: [f32; 3],
+    width: f64,
+}
+
+impl Outline {
+    fn instance(
+        &self,
+        mesh: MeshData,
+        at: DMat4,
+        opacity: f64,
+        id: Option<String>,
+    ) -> MeshInstance {
+        MeshInstance {
+            mesh,
+            transform: at.as_mat4().to_cols_array(),
+            material: Material {
+                kind: MaterialKind::Basic,
+                color: self.color,
+                opacity: opacity as f32,
+                side: Side::Back,
+                ..Material::default()
+            },
+            cast_shadow: false,
+            receive_shadow: false,
+            id,
+        }
+    }
+}
+
+/// The mesh's authored outline, else the theme's when it draws one (`applySceneMaterials`: the `ink` tone,
+/// `--material-outline` × 0.02 wide).
+fn outline(
+    f: &Fields,
+    path: &str,
+    theme: &SceneTheme,
+) -> Result<Option<Outline>, CanvasSceneError> {
+    let field = join(path, "outline");
+    match opt_object(f, "outline", path)? {
+        Some(o) => {
+            check_keys(o, &["color", "width"], &field)?;
+            let width = opt_number(o, "width", &field)?.unwrap_or(0.05);
+            if width < 0.0 {
+                return Err(bad(&join(&field, "width"), format!("{width} is negative")));
+            }
+            let color = match opt_rgb(o, "color", &field)? {
+                Some(c) => c,
+                None => rgb(&Value::String("#101014".into()), "outline default")?,
+            };
+            Ok(Some(Outline { color, width }))
+        }
+        None if theme.outline > 0.0 => {
+            let color = match theme.tones.get("ink") {
+                Some(css) => rgb(&Value::String(css.clone()), "theme tone ink")?,
+                None => [1.0, 1.0, 1.0],
+            };
+            Ok(Some(Outline {
+                color,
+                width: f64::from(theme.outline) * 0.02,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+/// An unlit, double-sided, blended surface: how `Shape3D` and `SpriteBillboard` draw.
+fn flat_material(flat: Flat, srgb: [f32; 3], opacity: f64, map: Option<String>) -> Material {
+    Material {
+        kind: MaterialKind::Flat(flat),
+        color: srgb_to_linear_rgb(srgb),
+        opacity: opacity as f32,
+        side: Side::Double,
+        map,
+        ..Material::default()
+    }
+}
+
+fn flat_instance(
+    mesh: MeshData,
+    at: DMat4,
+    material: Material,
+    id: Option<String>,
+) -> MeshInstance {
+    MeshInstance {
+        mesh,
+        transform: at.as_mat4().to_cols_array(),
+        material,
+        cast_shadow: false,
+        receive_shadow: false,
+        id,
+    }
+}
+
+/// three's flat shapes are built in XY and laid on the ground facing up: local +Y runs to world −Z.
+fn lay_flat() -> DMat4 {
+    DMat4::from_rotation_x(-FRAC_PI_2)
+}
+
+/// An optional CSS color as straight sRGB RGBA, alpha included.
+fn opt_css(f: &Fields, key: &str, path: &str) -> Result<Option<[f32; 4]>, CanvasSceneError> {
+    present(f, key)
+        .map(|v| css(v, &join(path, key)))
+        .transpose()
+}
+
+fn tess<'a>(path: &'a str, what: &str) -> impl Fn(tessellate::TessError) -> CanvasSceneError + 'a {
+    let what = what.to_owned();
+    move |e| bad(path, format!("{what}: {e}"))
+}
+
+/// A shape `animation`: the keyframe contract `DrawShape` plays, its tracks restricted to what draws here.
+fn shape_animation(value: &Value, path: &str) -> Result<(), CanvasSceneError> {
+    let a = value
+        .as_object()
+        .ok_or_else(|| bad(path, "must be an object"))?;
+    check_keys(a, &["durationMs", "loop", "keyframes"], path)?;
+    let duration = opt_number(a, "durationMs", path)?
+        .ok_or_else(|| bad(&join(path, "durationMs"), "is required"))?;
+    if duration <= 0.0 {
+        return Err(bad(
+            &join(path, "durationMs"),
+            format!("{duration} must be above zero (the three host does not play it)"),
+        ));
+    }
+    opt_bool(a, "loop", path)?;
+    let frames_path = join(path, "keyframes");
+    let frames = present(a, "keyframes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| bad(&frames_path, "is required as an array"))?;
+    if frames.is_empty() {
+        return Err(bad(
+            &frames_path,
+            "is empty (the three host does not play it)",
+        ));
+    }
+    for (i, frame) in frames.iter().enumerate() {
+        let frame_path = format!("{frames_path}[{i}]");
+        let k = frame
+            .as_object()
+            .ok_or_else(|| bad(&frame_path, "must be an object"))?;
+        if present(k, "at").is_none() {
+            return Err(bad(&join(&frame_path, "at"), "is required"));
+        }
+        for (key, v) in k {
+            let field = join(&frame_path, key);
+            match key.as_str() {
+                "fill" | "stroke" => {
+                    css(v, &field)?;
+                }
+                "at" => {
+                    number(v, &field)?;
+                }
+                "strokeDashOffset" | "blur" | "shadow" => {
+                    return Err(undrawn(&field, STEP_PARITY));
+                }
+                track if SHAPE_TRACKS.contains(&track) => {
+                    number(v, &field)?;
+                }
+                _ => return Err(bad(&field, "not a declared keyframe prop")),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The CSS `font` as the 2D painter reads it (size in painter px, weight, monospace), by asking that painter to lay
+/// out one glyph in it, so the two hosts accept exactly the same fonts.
+fn font_of(font: &str) -> Option<(f32, u16, bool)> {
+    let probe = serde_json::json!({"type": "draw-text", "text": "x", "position": {"x": 0, "y": 0},
+        "color": "#000000", "font": font});
+    let projector = Projector::new(1.0, 0.0, Layout2D::Flat);
+    paint_drawables(
+        &[probe],
+        &projector,
+        &|c: &str| c.to_owned(),
+        &|x, y| (x, y),
+        1.0,
+    )
+    .ok()?
+    .into_iter()
+    .find_map(|c| match c {
+        DrawCommand::Text {
+            size, weight, mono, ..
+        } => Some((size, weight, mono)),
+        _ => None,
+    })
+}
+
+/// A sprite `frame`: `{x, y, w, h}` image pixels, a positive size.
+fn frame_rect(f: &Fields, path: &str) -> Result<[f64; 4], CanvasSceneError> {
+    check_keys(f, &["x", "y", "w", "h"], path)?;
+    let mut out = [0.0; 4];
+    for (i, key) in ["x", "y", "w", "h"].into_iter().enumerate() {
+        out[i] = opt_number(f, key, path)?.ok_or_else(|| bad(&join(path, key), "is required"))?;
+    }
+    if out[2] <= 0.0 || out[3] <= 0.0 {
+        return Err(bad(path, "w and h must be above zero"));
+    }
+    Ok(out)
+}
+
+/// Where a flat sprite's pixels come from, in the 2D painter's order.
+enum Source {
+    Rect([f64; 4]),
+    Whole,
+    /// The atlas is still loading.
+    Pending,
+}
+
+impl Walk<'_> {
+    /// The clock a sprite sheet plays on when the sprite names none: the page's wall clock as the 2D painter uses it,
+    /// else the canvas clock, else rest.
+    fn paint_clock(&self) -> f64 {
+        self.epoch_ms.or(self.elapsed_ms).unwrap_or(0.0)
+    }
+
+    /// `Sprite3D`'s unresolvable-asset fallback: a `#9b8f7f` standard box at the position, `width` (0.6) square and
+    /// `height` (0.6) tall.
+    fn sprite_fallback(
+        &mut self,
+        f: &Fields,
+        path: &str,
+        parent: DMat4,
+        place: Placement,
+    ) -> Result<(), CanvasSceneError> {
+        let side = opt_number(f, "width", path)?.unwrap_or(0.6) * place.cell;
+        let height = opt_number(f, "height", path)?.unwrap_or(0.6) * place.cell;
+        let mesh = geometry::cuboid(side as f32, height as f32, side as f32)
+            .map_err(|e| bad(path, format!("fallback box: {}", e.0)))?;
+        let color = rgb(&Value::String("#9b8f7f".into()), "sprite fallback")?;
+        self.meshes.push(MeshInstance {
+            mesh,
+            transform: (parent * DMat4::from_translation(place.world(required_pos(f, path)?)))
+                .as_mat4()
+                .to_cols_array(),
+            material: Material {
+                color,
+                ..Material::default()
+            },
+            cast_shadow: false,
+            receive_shadow: false,
+            id: self.pick_id.clone(),
+        });
+        Ok(())
+    }
+
+    /// `SpriteBillboard`: a `top-left` sprite (the default) is a ground decal `width` × `height` cells with its corner
+    /// at the position; a `ground` or `center` one stands up as a camera-facing billboard `height` cells tall and
+    /// `width` (or the image's aspect) wide. Nearest-sampled, cut out under alpha 0.1, grey while loading and red when
+    /// the image fails. Beyond three: the 2D painter's frame/atlas/sheet source, `rotation` about the center,
+    /// `flipX`, and the enclosing group's opacity on the billboard too.
+    #[allow(clippy::too_many_arguments)]
+    fn flat_sprite(
+        &mut self,
+        f: &Fields,
+        path: &str,
+        parent: DMat4,
+        place: Placement,
+        group_opacity: f64,
+        asset: &Fields,
+        url: &str,
+    ) -> Result<(), CanvasSceneError> {
+        let asset_path = join(path, "asset");
+        if present(f, "shadow").is_some() {
+            return Err(undrawn(&join(path, "shadow"), STEP_PARITY));
+        }
+        let decal = match opt_str(f, "anchor", path)? {
+            None | Some("top-left") => true,
+            Some("ground" | "center") => false,
+            Some(_) => {
+                return Err(bad(
+                    &join(path, "anchor"),
+                    "must be top-left, ground or center",
+                ))
+            }
+        };
+        let looping = opt_bool(f, "loop", path)?;
+        let clock_ms = opt_number(f, "clockMs", path)?;
+        let flip = opt_bool(f, "flipX", path)?.unwrap_or(false);
+        let animation = opt_str(f, "animation", path)?;
+        let sprite_name = opt_str(asset, "sprite", &asset_path)?;
+        let source = match opt_object(f, "frame", path)? {
+            Some(frame) => Source::Rect(frame_rect(frame, &join(path, "frame"))?),
+            None => match opt_str(asset, "atlas", &asset_path)?.filter(|u| !u.is_empty()) {
+                None => Source::Whole,
+                Some(atlas_url) => match atlas::parsed_atlas(atlas_url) {
+                    None if asset::fetch_failed(atlas_url)
+                        || asset::asset_bytes(atlas_url).is_some() =>
+                    {
+                        return Err(bad(
+                            &join(&asset_path, "atlas"),
+                            format!("`{atlas_url}` does not load as an atlas"),
+                        ))
+                    }
+                    None => Source::Pending,
+                    Some(parsed) => match (&*parsed, animation, sprite_name) {
+                        (atlas::ParsedAtlas::SpriteSheet(_), Some(row), _) => {
+                            if clock_ms.is_none() {
+                                self.animated = true;
+                            }
+                            let at = clock_ms.unwrap_or_else(|| self.paint_clock());
+                            let r = atlas::sprite_sheet_frame(&parsed, row, looping, at)
+                                .ok_or_else(|| {
+                                    bad(
+                                        &join(path, "animation"),
+                                        format!("atlas `{atlas_url}` has no animation `{row}`"),
+                                    )
+                                })?;
+                            Source::Rect([r.x, r.y, r.w, r.h].map(f64::from))
+                        }
+                        (_, _, Some(name)) => {
+                            let r = atlas::sub_rect_for(&parsed, name).ok_or_else(|| {
+                                bad(
+                                    &join(&asset_path, "sprite"),
+                                    format!("atlas `{atlas_url}` has no sprite `{name}`"),
+                                )
+                            })?;
+                            Source::Rect([r.x, r.y, r.w, r.h].map(f64::from))
+                        }
+                        _ => Source::Whole,
+                    },
+                },
+            },
+        };
+        let dims = asset::image_info(url);
+        let failed = dims.is_none() && asset::image_failed(url);
+        let (iw, ih) = dims.map_or((1.0, 1.0), |(w, h)| (f64::from(w), f64::from(h)));
+        let crop = match source {
+            Source::Rect(r) => Some(r),
+            Source::Whole | Source::Pending => None,
+        };
+        let cell = place.cell;
+        let width = opt_number(f, "width", path)?;
+        let height = opt_number(f, "height", path)?;
+        let (w, h) = if decal {
+            (width.unwrap_or(1.0) * cell, height.unwrap_or(1.0) * cell)
+        } else {
+            let tall = height.unwrap_or(1.0);
+            let aspect = crop.map_or(iw / ih, |r| r[2] / r[3]);
+            (width.unwrap_or(tall * aspect) * cell, tall * cell)
+        };
+        let rotation = opt_number(f, "rotation", path)?.unwrap_or(0.0);
+        let world = place.world(required_pos(f, path)?);
+        let at = if decal {
+            let lift = if dims.is_some() && !matches!(source, Source::Pending) {
+                DECAL_LIFT
+            } else {
+                PLACEHOLDER_LIFT
+            };
+            parent
+                * DMat4::from_translation(DVec3::new(world.x + w / 2.0, lift, world.z + h / 2.0))
+                * DMat4::from_rotation_y(-rotation)
+                * lay_flat()
+        } else {
+            parent * DMat4::from_translation(world + DVec3::new(0.0, h / 2.0, 0.0))
+        };
+        let quad = |uv: [f32; 4]| {
+            let mut mesh =
+                tessellate::quad(w as f32, h as f32, uv).map_err(tess(path, "sprite"))?;
+            if !decal {
+                tessellate::rotate(&mut mesh, -rotation as f32);
+            }
+            Ok::<_, CanvasSceneError>(mesh)
+        };
+        let ready = dims.is_some() && !matches!(source, Source::Pending);
+        if !ready {
+            if failed {
+                tracing::warn!(target: "almadar::scene3d", url, "sprite image failed; drawing the error placeholder");
+            }
+            let hex = if failed { "#ff4444" } else { "#888888" };
+            let color = css(&Value::String(hex.into()), "sprite placeholder")?;
+            let material = flat_material(
+                Flat::default(),
+                [color[0], color[1], color[2]],
+                PLACEHOLDER_OPACITY,
+                None,
+            );
+            self.meshes.push(flat_instance(
+                quad([0.0, 0.0, 1.0, 1.0])?,
+                at,
+                material,
+                self.pick_id.clone(),
+            ));
+            return Ok(());
+        }
+        let [x0, y0, x1, y1] = match crop {
+            Some([x, y, cw, ch]) => [x / iw, y / ih, (x + cw) / iw, (y + ch) / ih],
+            None => [0.0, 0.0, 1.0, 1.0],
+        };
+        let uv = if flip {
+            [x1, y0, x0, y1]
+        } else {
+            [x0, y0, x1, y1]
+        };
+        let opacity = opt_number(f, "opacity", path)?.unwrap_or(1.0) * group_opacity;
+        let flat = Flat {
+            nearest: true,
+            cutout: true,
+            additive: false,
+            billboard: !decal,
+        };
+        let material = flat_material(flat, [1.0; 3], opacity, Some(url.to_owned()));
+        self.meshes.push(flat_instance(
+            quad(uv.map(|v| v as f32))?,
+            at,
+            material,
+            self.pick_id.clone(),
+        ));
+        Ok(())
+    }
+
+    /// `Shape3D`: the shape built flat and laid on the ground 0.02 above the position, unlit, double-sided, blended,
+    /// in `fill` (else `stroke`, else white): a cell 0.95 wide, a `width` × `height` rect, an ellipse of `radiusX`
+    /// (a 0.08 ring when only stroked), a `points` polygon; and `path` (`d`), which three skips, filled by the nonzero
+    /// rule and stroked as the 2D painter defines it. Beyond three: `radiusY`, `offsetX`/`offsetY` and `rotate` about
+    /// `pivot` (as three's own animation moves the shape), a stroke drawn alongside a fill, `strokeWidth` in painter
+    /// pixels (one cell is `TILE_WIDTH` of them), `lighter` blending, and every keyframe track the 2D painter plays.
+    fn shape(
+        &mut self,
+        f: &Fields,
+        path: &str,
+        parent: DMat4,
+        place: Placement,
+        group_opacity: f64,
+    ) -> Result<(), CanvasSceneError> {
+        check_keys(f, SHAPE_KEYS, path)?;
+        for key in [
+            "gradient",
+            "fillPattern",
+            "strokeGradient",
+            "strokeDashOffset",
+            "blur",
+            "shadow",
+        ] {
+            if present(f, key).is_some() {
+                return Err(undrawn(&join(path, key), STEP_PARITY));
+            }
+        }
+        if present(f, "strokeDash").is_some_and(|v| !v.as_array().is_some_and(Vec::is_empty)) {
+            return Err(undrawn(&join(path, "strokeDash"), STEP_PARITY));
+        }
+        let additive = match opt_str(f, "blendMode", path)? {
+            None | Some("source-over") => false,
+            Some("lighter") => true,
+            Some(_) => return Err(undrawn(&join(path, "blendMode"), STEP_PARITY)),
+        };
+        match opt_str(f, "anchor", path)? {
+            None | Some("center") => {}
+            Some(_) => {
+                return Err(bad(
+                    &join(path, "anchor"),
+                    "a 3D shape is centered on its position (only `center` places it so)",
+                ))
+            }
+        }
+        let world = place.world(required_pos(f, path)?);
+        let animated;
+        let view: &Fields = match present(f, "animation") {
+            None => f,
+            Some(declared) => {
+                shape_animation(declared, &join(path, "animation"))?;
+                self.animated = true;
+                match self.elapsed_ms {
+                    None => f,
+                    Some(t) => {
+                        let mut at = f.clone();
+                        for key in SHAPE_TRACKS {
+                            if let Some(v) = crate::animate::drawable_track(declared, t, key) {
+                                at.insert((*key).to_owned(), v);
+                            }
+                        }
+                        animated = at;
+                        &animated
+                    }
+                }
+            }
+        };
+        let shape = opt_str(view, "shape", path)?
+            .ok_or_else(|| bad(&join(path, "shape"), "is required"))?;
+        let own: &[&str] = match shape {
+            "cell" => &[],
+            "rect" => &["width", "height"],
+            "ellipse" => &["radiusX", "radiusY"],
+            "poly" => &["points"],
+            "path" => &["d"],
+            _ => {
+                return Err(bad(
+                    &join(path, "shape"),
+                    format!("`{shape}` is not a shape"),
+                ))
+            }
+        };
+        for key in ["width", "height", "radiusX", "radiusY", "points", "d"] {
+            if present(view, key).is_some_and(|v| !v.as_array().is_some_and(Vec::is_empty))
+                && !own.contains(&key)
+            {
+                return Err(bad(
+                    &join(path, key),
+                    format!("shape `{shape}` has no {key}"),
+                ));
+            }
+        }
+        let cell = place.cell;
+        let num = |key: &str| opt_number(view, key, path);
+        let fill = opt_css(view, "fill", path)?;
+        let stroke = opt_css(view, "stroke", path)?;
+        let stroke_width = num("strokeWidth")?;
+        if let Some(sw) = stroke_width {
+            if sw <= 0.0 {
+                return Err(bad(
+                    &join(path, "strokeWidth"),
+                    format!("{sw} is not above zero"),
+                ));
+            }
+            if stroke.is_none() {
+                return Err(bad(
+                    &join(path, "strokeWidth"),
+                    "sizes no stroke (stroke is unset)",
+                ));
+            }
+            if fill.is_none() && matches!(shape, "cell" | "rect" | "poly") {
+                return Err(bad(
+                    &join(path, "strokeWidth"),
+                    format!("a stroke-only {shape} is filled in its stroke color (three's Shape3D), so a width sizes nothing"),
+                ));
+            }
+        }
+        // painter pixels to world units: one cell is TILE_WIDTH of them
+        let band = stroke_width.unwrap_or(1.0) * cell / f64::from(TILE_WIDTH);
+        let outline_of = |points: Vec<[f32; 2]>| {
+            tessellate::stroke(
+                &[Subpath {
+                    points,
+                    closed: true,
+                }],
+                band as f32,
+            )
+            .map_err(tess(path, shape))
+        };
+        let rect_points = |w: f64, h: f64| {
+            let (x, y) = ((w / 2.0) as f32, (h / 2.0) as f32);
+            vec![[-x, -y], [x, -y], [x, y], [-x, y]]
+        };
+        let (body, edge) = match shape {
+            "cell" | "rect" => {
+                let (w, h) = if shape == "cell" {
+                    (cell * CELL_FILL, cell * CELL_FILL)
+                } else {
+                    (
+                        num("width")?.unwrap_or(1.0) * cell,
+                        num("height")?.unwrap_or(1.0) * cell,
+                    )
+                };
+                let body = geometry::plane(w as f32, h as f32)
+                    .map_err(|e| bad(path, format!("{shape}: {}", e.0)))?;
+                let edge = match (fill, stroke) {
+                    (Some(_), Some(_)) => Some(outline_of(rect_points(w, h))?),
+                    _ => None,
+                };
+                (Some(body), edge)
+            }
+            "ellipse" => {
+                let rx = num("radiusX")?.unwrap_or(0.4);
+                let ry = num("radiusY")?.unwrap_or(rx);
+                match (fill, stroke) {
+                    (None, Some(_)) => {
+                        let width = stroke_width.map_or(RING_WIDTH, |_| band);
+                        let ring = tessellate::ring(
+                            [(rx - width).max(0.0) as f32, (ry - width).max(0.0) as f32],
+                            [rx as f32, ry as f32],
+                            SHAPE_SEGMENTS,
+                        )
+                        .map_err(tess(path, shape))?;
+                        (Some(ring), None)
+                    }
+                    _ => {
+                        let body = tessellate::ellipse(rx as f32, ry as f32, SHAPE_SEGMENTS)
+                            .map_err(tess(path, shape))?;
+                        let edge = match (fill, stroke) {
+                            (Some(_), Some(_)) => Some(
+                                tessellate::ring(
+                                    [
+                                        (rx - band / 2.0).max(0.0) as f32,
+                                        (ry - band / 2.0).max(0.0) as f32,
+                                    ],
+                                    [(rx + band / 2.0) as f32, (ry + band / 2.0) as f32],
+                                    SHAPE_SEGMENTS,
+                                )
+                                .map_err(tess(path, shape))?,
+                            ),
+                            _ => None,
+                        };
+                        (Some(body), edge)
+                    }
+                }
+            }
+            "poly" => {
+                let p_path = join(path, "points");
+                let list = present(view, "points")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| bad(&p_path, "is required as an array"))?;
+                if list.len() < 3 {
+                    return Err(bad(
+                        &p_path,
+                        format!("{} points enclose no area (a poly needs 3)", list.len()),
+                    ));
+                }
+                let mut points = Vec::with_capacity(list.len());
+                for (i, p) in list.iter().enumerate() {
+                    let field = format!("{p_path}[{i}]");
+                    let o = p.as_object().ok_or_else(|| bad(&field, "must be {x, y}"))?;
+                    check_keys(o, &["x", "y"], &field)?;
+                    let axis = |k: &str| {
+                        opt_number(o, k, &field)?
+                            .ok_or_else(|| bad(&join(&field, k), "is required"))
+                    };
+                    points.push([axis("x")? as f32, axis("y")? as f32]);
+                }
+                let body = tessellate::fill(&[points.clone()]).map_err(tess(path, shape))?;
+                let edge = match (fill, stroke) {
+                    (Some(_), Some(_)) => Some(outline_of(points)?),
+                    _ => None,
+                };
+                (Some(body), edge)
+            }
+            _ => {
+                let d = opt_str(view, "d", path)?
+                    .ok_or_else(|| bad(&join(path, "d"), "is required"))?;
+                let segments = parse_path_data(d, Xf::identity()).ok_or_else(|| {
+                    bad(
+                        &join(path, "d"),
+                        "is not SVG path data the 2D painter reads",
+                    )
+                })?;
+                let subpaths =
+                    tessellate::flatten(&segments, PATH_TOLERANCE).map_err(tess(path, shape))?;
+                let body = match (fill, stroke) {
+                    (None, Some(_)) => None,
+                    _ => {
+                        let rings: Vec<Vec<[f32; 2]>> =
+                            subpaths.iter().map(|s| s.points.clone()).collect();
+                        Some(tessellate::fill(&rings).map_err(tess(path, shape))?)
+                    }
+                };
+                let edge = match stroke {
+                    Some(_) => Some(
+                        tessellate::stroke(&subpaths, band as f32).map_err(tess(path, shape))?,
+                    ),
+                    None => None,
+                };
+                (body, edge)
+            }
+        };
+        let offset = DVec3::new(
+            num("offsetX")?.unwrap_or(0.0) * cell,
+            SHAPE_LIFT,
+            num("offsetY")?.unwrap_or(0.0) * cell,
+        );
+        let pivot = match opt_object(f, "pivot", path)? {
+            None => DVec3::ZERO,
+            Some(p) => {
+                let field = join(path, "pivot");
+                check_keys(p, &["x", "y"], &field)?;
+                let axis = |k: &str| {
+                    opt_number(p, k, &field)?.ok_or_else(|| bad(&join(&field, k), "is required"))
+                };
+                DVec3::new((axis("x")? - 0.5) * cell, 0.0, (axis("y")? - 0.5) * cell)
+            }
+        };
+        let at = parent
+            * DMat4::from_translation(world + offset + pivot)
+            * DMat4::from_rotation_y(-num("rotate")?.unwrap_or(0.0))
+            * DMat4::from_translation(-pivot)
+            * lay_flat();
+        let opacity = num("opacity")?.unwrap_or(1.0) * group_opacity;
+        let flat = Flat {
+            additive,
+            ..Flat::default()
+        };
+        let paint =
+            |c: [f32; 4]| flat_material(flat, [c[0], c[1], c[2]], opacity * f64::from(c[3]), None);
+        let white = [1.0; 4];
+        if let Some(mesh) = body {
+            let color = match shape {
+                "path" => fill.unwrap_or(white),
+                _ => fill.or(stroke).unwrap_or(white),
+            };
+            self.meshes
+                .push(flat_instance(mesh, at, paint(color), self.pick_id.clone()));
+        }
+        if let (Some(mesh), Some(color)) = (edge, stroke) {
+            let lifted = at * DMat4::from_translation(DVec3::new(0.0, 0.0, STROKE_LIFT));
+            self.meshes.push(flat_instance(
+                mesh,
+                lifted,
+                paint(color),
+                self.pick_id.clone(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `Text3D`: drei `<Text>` (size 0.32, centered, a 0.02 black outline) in a camera-facing `<Billboard>` 1.2 above
+    /// the position, in `color` (white when unset). The glyphs are the 2D painter's bundled faces, not troika's
+    /// Roboto. Beyond three: `opacity`, the 2D `font` (its pixels at `TILE_WIDTH` per cell) and weight, `align`,
+    /// `baseline`, and `offsetX`/`offsetY` in cells across and down the label's own plane.
+    fn text(
+        &mut self,
+        f: &Fields,
+        path: &str,
+        parent: DMat4,
+        place: Placement,
+        group_opacity: f64,
+    ) -> Result<(), CanvasSceneError> {
+        check_keys(f, TEXT_KEYS, path)?;
+        let world = place.world(required_pos(f, path)?);
+        match opt_str(f, "anchor", path)? {
+            None | Some("center") => {}
+            Some(_) => {
+                return Err(bad(
+                    &join(path, "anchor"),
+                    "a 3D label stands over its position (only `center` places it so)",
+                ))
+            }
+        }
+        let color = match opt_str(f, "color", path)? {
+            None | Some("") => [1.0; 4],
+            Some(c) => css(&Value::String(c.to_owned()), &join(path, "color"))?,
+        };
+        let (em, bold, mono) = match opt_str(f, "font", path)? {
+            None => (LABEL_EM, false, false),
+            Some(font) => {
+                let (px, weight, mono) = font_of(font).ok_or_else(|| {
+                    bad(
+                        &join(path, "font"),
+                        format!("`{font}` is not a font the bundled faces draw"),
+                    )
+                })?;
+                (
+                    (f64::from(px) * place.cell / f64::from(TILE_WIDTH)) as f32,
+                    weight >= 600,
+                    mono,
+                )
+            }
+        };
+        let across = match opt_str(f, "align", path)? {
+            None | Some("center") => 0.0,
+            Some("left" | "start") => 0.5,
+            Some("right" | "end") => -0.5,
+            Some(_) => {
+                return Err(bad(
+                    &join(path, "align"),
+                    "must be center, left, start, right or end",
+                ))
+            }
+        };
+        let baseline = opt_str(f, "baseline", path)?;
+        if let Some(b) =
+            baseline.filter(|b| !matches!(*b, "middle" | "alphabetic" | "top" | "bottom"))
+        {
+            return Err(match b {
+                "hanging" | "ideographic" => undrawn(&join(path, "baseline"), STEP_PARITY),
+                _ => bad(&join(path, "baseline"), "not a declared baseline"),
+            });
+        }
+        let opacity = opt_number(f, "opacity", path)?.unwrap_or(1.0) * group_opacity;
+        let (ox, oy) = (
+            opt_number(f, "offsetX", path)?.unwrap_or(0.0) * place.cell,
+            opt_number(f, "offsetY", path)?.unwrap_or(0.0) * place.cell,
+        );
+        let text = opt_str(f, "text", path)?.unwrap_or("");
+        if text.is_empty() {
+            return Ok(());
+        }
+        let style = LabelStyle {
+            em,
+            bold,
+            mono,
+            color,
+            halo: LABEL_OUTLINE,
+            halo_color: [0.0, 0.0, 0.0, 1.0],
+        };
+        let l = label(text, &style).map_err(|e| bad(&join(path, "text"), e))?;
+        let (asc, desc) = (l.ascent, l.descent);
+        let up = match baseline {
+            Some("alphabetic") => (asc + desc) / 2.0,
+            Some("top") => -(asc - desc) / 2.0,
+            Some("bottom") => (asc - desc) / 2.0,
+            _ => 0.0,
+        };
+        let mut mesh = tessellate::quad(l.width, l.height, [0.0, 0.0, 1.0, 1.0])
+            .map_err(tess(path, "label"))?;
+        tessellate::translate(
+            &mut mesh,
+            [across * l.text_width + ox as f32, up - oy as f32],
+        );
+        let flat = Flat {
+            billboard: true,
+            ..Flat::default()
+        };
+        let at = parent * DMat4::from_translation(world + DVec3::new(0.0, LABEL_LIFT, 0.0));
+        let material = flat_material(flat, [1.0; 3], opacity, Some(l.key));
+        self.meshes
+            .push(flat_instance(mesh, at, material, self.pick_id.clone()));
+        Ok(())
+    }
+
+    /// `draw-sprite-layer` / `draw-shape-layer` / `draw-text-layer`: each item drawn as its atom, picked by its own id.
+    #[allow(clippy::too_many_arguments)]
+    fn layer(
+        &mut self,
+        f: &Fields,
+        path: &str,
+        parent: DMat4,
+        place: Placement,
+        opacity: f64,
+        atom: &str,
+    ) -> Result<(), CanvasSceneError> {
+        check_keys(f, LAYER_KEYS, path)?;
+        let items_path = join(path, "items");
+        let items = present(f, "items")
+            .ok_or_else(|| bad(&items_path, "is required"))?
+            .as_array()
+            .ok_or_else(|| bad(&items_path, "must be an array"))?;
+        let outer = self.pick_id.clone();
+        for (i, item) in items.iter().enumerate() {
+            let item_path = format!("{items_path}[{i}]");
+            let fields = item
+                .as_object()
+                .ok_or_else(|| bad(&item_path, "not a drawable node"))?;
+            if fields.get("type").and_then(Value::as_str) != Some(atom) {
+                return Err(bad(&join(&item_path, "type"), format!("must be `{atom}`")));
+            }
+            self.pick_id = fields
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| outer.clone());
+            let drawn = match atom {
+                "draw-sprite" => self.sprite(fields, &item_path, parent, place, opacity),
+                "draw-shape" => self.shape(fields, &item_path, parent, place, opacity),
+                _ => self.text(fields, &item_path, parent, place, opacity),
+            };
+            self.pick_id = outer.clone();
+            drawn?;
+        }
+        Ok(())
+    }
+
+    /// `FxLayer3D`: the layer expanded by the shared projection (`fx_projection`, as the 2D painter expands it) on the
+    /// page clock, its pieces drawn as their atoms; a live layer keeps the host mapping frames.
+    fn fx_layer(
+        &mut self,
+        f: &Fields,
+        path: &str,
+        parent: DMat4,
+        place: Placement,
+        opacity: f64,
+    ) -> Result<(), CanvasSceneError> {
+        check_keys(f, FX_LAYER_KEYS, path)?;
+        let mut layer = f.clone();
+        if present(&layer, "tickMs").is_none() {
+            layer.insert("tickMs".into(), FX_TICK_MS.into());
+        }
+        if present(&layer, "textColor").is_none() {
+            layer.insert("textColor".into(), FX_TEXT_COLOR.into());
+        }
+        layer.insert("fontFamily".into(), FX_FONT_FAMILY.into());
+        let layer = Value::Object(layer);
+        if layer["items"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+        {
+            self.animated = true;
+        }
+        let pieces = crate::fx_projection::expand_layer(
+            &layer,
+            self.epoch_ms.unwrap_or(0.0),
+            "3d",
+            f64::from(TILE_WIDTH),
+        )?;
+        for (i, piece) in pieces.iter().enumerate() {
+            self.drawable(piece, &format!("{path}.fx[{i}]"), parent, place, opacity)?;
+        }
+        Ok(())
+    }
+}
+
 fn skin_list<'a>(
     skin: &'a Fields,
     key: &str,
@@ -1658,14 +2723,33 @@ fn skin_rows(
         .collect()
 }
 
-/// `collectDrawnItems`: a drawable's scene position for the bounds and the hit index; a skinned mesh's is offset
-/// by its posed hull's local minimum (`skinnedMeshDrawnItem`), others are their position.
-fn drawn_pos(f: &Fields, path: &str) -> Result<Option<[f64; 3]>, CanvasSceneError> {
-    match f.get("type").and_then(Value::as_str) {
-        Some("draw-mesh" | "draw-group" | "draw-sprite") => required_pos(f, path).map(Some),
-        Some("draw-skinned-mesh") => skinned_mesh_pos(f, path).map(Some),
-        _ => Ok(None),
+/// `collectDrawnItems` over the top-level list: each drawable's scene position and hit id for the bounds and the
+/// hit index, a layer's items by their own, an fx layer none (its effects are never click targets). A skinned mesh's
+/// position is offset by its posed hull's local minimum (`skinnedMeshDrawnItem`).
+fn drawn_items(
+    nodes: &[(String, Value)],
+) -> Result<Vec<([f64; 3], Option<String>)>, CanvasSceneError> {
+    let id_of = |f: &Fields| f.get("id").and_then(Value::as_str).map(str::to_string);
+    let mut out = Vec::new();
+    for (path, node) in nodes {
+        let Some(f) = node.as_object() else { continue };
+        match f.get("type").and_then(Value::as_str) {
+            Some("draw-mesh" | "draw-group" | "draw-sprite" | "draw-shape" | "draw-text") => {
+                out.push((required_pos(f, path)?, id_of(f)));
+            }
+            Some("draw-skinned-mesh") => out.push((skinned_mesh_pos(f, path)?, id_of(f))),
+            Some("draw-sprite-layer" | "draw-shape-layer" | "draw-text-layer") => {
+                let items = present(f, "items").and_then(Value::as_array);
+                for (i, item) in items.into_iter().flatten().enumerate() {
+                    // a malformed item is refused by name when the walk draws it
+                    let Some(it) = item.as_object() else { continue };
+                    out.push((required_pos(it, &format!("{path}.items[{i}]"))?, id_of(it)));
+                }
+            }
+            _ => {}
+        }
     }
+    Ok(out)
 }
 
 fn skinned_mesh_pos(f: &Fields, path: &str) -> Result<[f64; 3], CanvasSceneError> {
@@ -1843,7 +2927,7 @@ fn material(
             "roughness",
             "flatShading",
         ],
-        MaterialKind::Physical => MATERIAL_KEYS,
+        MaterialKind::Physical | MaterialKind::Flat(_) => MATERIAL_KEYS,
     };
     for (key, value) in m {
         if !value.is_null() && !drawn.contains(&key.as_str()) {
@@ -1926,6 +3010,7 @@ fn kind_name(kind: MaterialKind) -> &'static str {
         MaterialKind::Standard => "standard",
         MaterialKind::Physical => "physical",
         MaterialKind::Toon => "toon",
+        MaterialKind::Flat(_) => "flat",
     }
 }
 
@@ -2418,12 +3503,13 @@ mod tests {
             "drawables": [{"type": "draw-mesh", "position": {"x": 0, "y": 0}, "wobble": 1}]
         })));
         assert_eq!(unknown, "drawables[0].wobble: not a declared prop");
-        let outline = message(scene(json!({
-            "drawables": [{"type": "draw-mesh", "position": {"x": 0, "y": 0}, "outline": {"width": 0.1}}]
+        let gradient = message(scene(json!({
+            "drawables": [{"type": "draw-shape", "shape": "rect", "position": {"x": 0, "y": 0},
+                "gradient": {"kind": "linear", "stops": []}}]
         })));
         assert_eq!(
-            outline,
-            "drawables[0].outline: not yet drawn by orbital-canvas (P-025 step 4)"
+            gradient,
+            "drawables[0].gradient: not yet drawn by orbital-canvas (P-025 step 4)"
         );
         let grid = scene_from_canvas_node(&json!({"type": "canvas", "mode": "3d"}), 800.0, 600.0)
             .unwrap()
@@ -2434,12 +3520,12 @@ mod tests {
             ([4.5, 0.0, 4.5], [12.0, 12.0]),
             "the empty scene's 0..10 bounds"
         );
-        let sprite = message(scene(
-            json!({"drawables": [{"type": "draw-sprite", "position": {"x": 0, "y": 0}}]}),
-        ));
+        let shadow = message(scene(json!({"drawables": [{"type": "draw-sprite",
+            "position": {"x": 0, "y": 0}, "asset": {"url": "a.png", "role": "unit", "category": "c"},
+            "shadow": {"color": "#000000", "blur": 2}}]})));
         assert_eq!(
-            sprite,
-            "draw-sprite at drawables[0]: not yet drawn by orbital-canvas (P-025 step 4)"
+            shadow,
+            "drawables[0].shadow: not yet drawn by orbital-canvas (P-025 step 4)"
         );
         let ignored = message(scene(json!({
             "drawables": [{"type": "draw-mesh", "position": {"x": 0, "y": 0}, "material": {"kind": "basic", "metalness": 1}}]
@@ -2736,14 +3822,11 @@ mod tests {
             faded,
             "drawables[0].opacity: a 3D model does not draw it (the three host ignores it)"
         );
-        let billboard = message(scene(
+        let dimension = message(scene(
             json!({"drawables": [{"type": "draw-sprite", "position": {"x": 0, "y": 0},
-            "asset": {"url": "a.png", "role": "unit", "category": "c"}}]}),
+            "asset": {"url": "a.png", "role": "unit", "category": "c", "dimension": "4d"}}]}),
         ));
-        assert_eq!(
-            billboard,
-            "draw-sprite at drawables[0]: not yet drawn by orbital-canvas (P-025 step 4)"
-        );
+        assert_eq!(dimension, "drawables[0].asset.dimension: must be 2d or 3d");
     }
 
     #[test]
@@ -2781,5 +3864,453 @@ mod tests {
             "ghost": {"frame": 0, "opacity": 0.5}
         }]})));
         assert!(ghost.starts_with("drawables[0].ghost"), "{ghost}");
+    }
+
+    fn flat(m: &Material) -> Flat {
+        match m.kind {
+            MaterialKind::Flat(flat) => flat,
+            other => panic!("expected a flat material, got {other:?}"),
+        }
+    }
+
+    fn origin(t: [f32; 16]) -> [f32; 3] {
+        [t[12], t[13], t[14]]
+    }
+
+    fn png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(width, height, image::Rgba(rgba));
+        let mut out = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
+    fn register_png(url: &str, width: u32, height: u32) {
+        crate::asset::register_asset(
+            url,
+            png(width, height, [255, 255, 255, 255]).into(),
+            Some("image/png"),
+        );
+    }
+
+    fn shape_scene(shape: Value) -> Result<Scene3D, CanvasSceneError> {
+        let mut node = json!({"type": "draw-shape", "position": {"x": 0, "y": 0}});
+        for (key, value) in shape.as_object().unwrap() {
+            node[key] = value.clone();
+        }
+        scene(json!({ "drawables": [node] }))
+    }
+
+    #[test]
+    fn each_shape_kind_lies_flat_lifted_unlit_in_its_fill() {
+        for (shape, extra, vertices) in [
+            ("cell", json!({}), 4),
+            ("rect", json!({"width": 2, "height": 1}), 4),
+            ("ellipse", json!({"radiusX": 0.5}), 34),
+            (
+                "poly",
+                json!({"points": [{"x": 0, "y": 0}, {"x": 1, "y": 0}, {"x": 0, "y": 1}]}),
+                3,
+            ),
+            ("path", json!({"d": "M0 0 L1 0 L1 1 Z"}), 3),
+        ] {
+            let mut node = json!({"shape": shape, "fill": "#ff0000", "opacity": 0.5});
+            for (key, value) in extra.as_object().unwrap() {
+                node[key] = value.clone();
+            }
+            let s = shape_scene(node).unwrap();
+            assert_eq!(s.meshes.len(), 1, "{shape}");
+            let mesh = &s.meshes[0];
+            assert_eq!(mesh.mesh.positions.len(), vertices, "{shape}");
+            assert_eq!(flat(&mesh.material), Flat::default(), "{shape}");
+            assert_eq!(mesh.material.color, [1.0, 0.0, 0.0], "{shape}");
+            assert_eq!(
+                (mesh.material.opacity, mesh.material.side),
+                (0.5, Side::Double)
+            );
+            assert!(!mesh.cast_shadow && !mesh.receive_shadow);
+            let t = mesh.transform;
+            close(origin(t), [0.0, 0.02, 0.0]);
+            // three's local +Y runs to world −Z, its face up
+            close([t[4], t[5], t[6]], [0.0, 0.0, -1.0]);
+            close([t[8], t[9], t[10]], [0.0, 1.0, 0.0]);
+        }
+        let cell = shape_scene(json!({"shape": "cell"})).unwrap();
+        assert_eq!(cell.meshes[0].mesh.positions[1], [0.475, 0.475, 0.0]);
+        assert_eq!(
+            cell.meshes[0].material.color,
+            [1.0, 1.0, 1.0],
+            "control: no paint is white"
+        );
+    }
+
+    #[test]
+    fn a_stroke_only_ellipse_is_three_ring_and_control_a_filled_one_adds_a_stroke_band() {
+        let ring =
+            shape_scene(json!({"shape": "ellipse", "radiusX": 0.5, "stroke": "#00ff00"})).unwrap();
+        assert_eq!(ring.meshes.len(), 1);
+        let radii: Vec<f32> = ring.meshes[0]
+            .mesh
+            .positions
+            .iter()
+            .map(|p| p[0].hypot(p[1]))
+            .collect();
+        let (lo, hi) = radii
+            .iter()
+            .fold((f32::MAX, 0.0f32), |(a, b), r| (a.min(*r), b.max(*r)));
+        assert!(
+            (lo - 0.42).abs() < 1e-5 && (hi - 0.5).abs() < 1e-5,
+            "{lo} {hi}"
+        );
+        assert_eq!(ring.meshes[0].material.color, [0.0, 1.0, 0.0]);
+
+        let both = shape_scene(
+            json!({"shape": "rect", "fill": "#ff0000", "stroke": "#0000ff", "strokeWidth": 25.6}),
+        )
+        .unwrap();
+        assert_eq!(both.meshes.len(), 2);
+        assert_eq!(both.meshes[1].material.color, [0.0, 0.0, 1.0]);
+        let edge_x = both.meshes[1]
+            .mesh
+            .positions
+            .iter()
+            .map(|p| p[0])
+            .fold(0.0f32, f32::max);
+        // 25.6 painter px is a tenth of a cell, centered on the 0.5 edge
+        assert!((edge_x - 0.55).abs() < 1e-5, "{edge_x}");
+        assert!(both.meshes[1].transform[13] > both.meshes[0].transform[13]);
+    }
+
+    #[test]
+    fn a_shape_offset_rotation_and_animation_move_it_on_the_ground() {
+        let s = shape_scene(json!({"shape": "cell", "offsetX": 1, "offsetY": 2, "rotate": std::f64::consts::FRAC_PI_2}))
+            .unwrap();
+        let t = s.meshes[0].transform;
+        close(origin(t), [1.0, 0.02, 2.0]);
+        // the yaw is −rotate (2D turns clockwise): a quarter turn takes the shape's X to world +Z
+        close([t[0], t[1], t[2]], [0.0, 0.0, 1.0]);
+        let moving = json!({"shape": "cell", "animation": {"durationMs": 1000, "keyframes": [
+            {"at": 0, "offsetX": 0, "fill": "#ff0000"}, {"at": 1, "offsetX": 2, "fill": "#0000ff"}]}});
+        let at_rest = shape_scene(moving.clone()).unwrap();
+        assert!(at_rest.animated);
+        close(origin(at_rest.meshes[0].transform), [0.0, 0.02, 0.0]);
+        let mut canvas = json!({"type": "canvas", "mode": "3d", "showGrid": false,
+            "drawables": [{"type": "draw-shape", "position": {"x": 0, "y": 0}}]});
+        for (key, value) in moving.as_object().unwrap() {
+            canvas["drawables"][0][key] = value.clone();
+        }
+        let half = scene_from_canvas_node_at(&canvas, 800.0, 600.0, &SceneTheme::default(), 500.0)
+            .unwrap();
+        close(origin(half.meshes[0].transform), [1.0, 0.02, 0.0]);
+        assert_eq!(
+            half.meshes[0].material.color,
+            [1.0, 0.0, 0.0],
+            "a color track holds until the next key"
+        );
+    }
+
+    #[test]
+    fn control_shape_props_without_a_3d_drawing_error_by_name() {
+        let cases = [
+            (
+                json!({"shape": "rect", "anchor": "top-left"}),
+                "drawables[0].anchor: ",
+            ),
+            (
+                json!({"shape": "rect", "stroke": "#fff", "strokeWidth": 2}),
+                "drawables[0].strokeWidth: ",
+            ),
+            (
+                json!({"shape": "cell", "radiusX": 1}),
+                "drawables[0].radiusX: ",
+            ),
+            (
+                json!({"shape": "rect", "blendMode": "multiply"}),
+                "drawables[0].blendMode: ",
+            ),
+            (
+                json!({"shape": "rect", "strokeDash": [2, 2]}),
+                "drawables[0].strokeDash: ",
+            ),
+            (
+                json!({"shape": "poly", "points": [{"x": 0, "y": 0}, {"x": 1, "y": 1}]}),
+                "drawables[0].points: ",
+            ),
+            (
+                json!({"shape": "path", "d": "M0 0 L1 1 L1 0 L0 1 Z"}),
+                "drawables[0]: path: ",
+            ),
+            (
+                json!({"shape": "cell", "animation": {"durationMs": 100, "keyframes": [{"at": 0, "blur": 2}]}}),
+                "drawables[0].animation.keyframes[0].blur: ",
+            ),
+        ];
+        for (shape, prefix) in cases {
+            let m = message(shape_scene(shape));
+            assert!(m.starts_with(prefix), "{m}");
+        }
+        let lighter = shape_scene(json!({"shape": "cell", "blendMode": "lighter"})).unwrap();
+        assert!(flat(&lighter.meshes[0].material).additive);
+    }
+
+    #[test]
+    fn a_label_is_a_billboard_lifted_over_its_position_and_control_empty_text_draws_nothing() {
+        let s = scene(
+            json!({"drawables": [{"type": "draw-text", "id": "hp", "text": "HP 3",
+            "position": {"x": 0, "y": 0}, "color": "#ffcc00", "opacity": 0.5}]}),
+        )
+        .unwrap();
+        assert_eq!(s.meshes.len(), 1);
+        let mesh = &s.meshes[0];
+        assert_eq!(
+            flat(&mesh.material),
+            Flat {
+                billboard: true,
+                ..Flat::default()
+            }
+        );
+        close(origin(mesh.transform), [0.0, 1.2, 0.0]);
+        assert_eq!(mesh.material.opacity, 0.5);
+        assert_eq!(mesh.id.as_deref(), Some("hp"));
+        let key = mesh.material.map.clone().unwrap();
+        assert!(
+            crate::asset::image_info(&key).is_some(),
+            "the label raster is in the asset cache"
+        );
+        // the quad is centered: troika's anchorX center / anchorY middle
+        let xs: Vec<f32> = mesh.mesh.positions.iter().map(|p| p[0]).collect();
+        assert!((xs[0] + xs[1]).abs() < 1e-5);
+        let empty = scene(
+            json!({"drawables": [{"type": "draw-text", "text": "", "position": {"x": 0, "y": 0}}]}),
+        )
+        .unwrap();
+        assert!(empty.meshes.is_empty());
+        let aligned = scene(
+            json!({"drawables": [{"type": "draw-text", "text": "HP 3", "align": "left",
+            "position": {"x": 0, "y": 0}}]}),
+        )
+        .unwrap();
+        let left = aligned.meshes[0]
+            .mesh
+            .positions
+            .iter()
+            .map(|p| p[0])
+            .fold(f32::MAX, f32::min);
+        assert!(
+            left < 0.0 && left > -0.05,
+            "a left-aligned label starts at its position: {left}"
+        );
+        let font = message(scene(
+            json!({"drawables": [{"type": "draw-text", "text": "x",
+            "font": "12px Papyrus", "position": {"x": 0, "y": 0}}]}),
+        ));
+        assert!(font.starts_with("drawables[0].font: "), "{font}");
+    }
+
+    #[test]
+    fn a_sprite_is_a_nearest_cut_out_ground_decal_by_default_and_a_billboard_when_standing() {
+        let url = "test://canvas-scene3d/tile.png";
+        register_png(url, 32, 16);
+        let asset = json!({"url": url, "role": "tile", "category": "c"});
+        let decal = scene(
+            json!({"drawables": [{"type": "draw-sprite", "position": {"x": 0, "y": 0},
+            "asset": asset, "width": 2}]}),
+        )
+        .unwrap();
+        let mesh = &decal.meshes[0];
+        assert_eq!(
+            flat(&mesh.material),
+            Flat {
+                nearest: true,
+                cutout: true,
+                ..Flat::default()
+            }
+        );
+        assert_eq!(mesh.material.map.as_deref(), Some(url));
+        close(origin(mesh.transform), [1.0, 0.01, 0.5]);
+        close(
+            [mesh.transform[8], mesh.transform[9], mesh.transform[10]],
+            [0.0, 1.0, 0.0],
+        );
+
+        let standing = scene(
+            json!({"drawables": [{"type": "draw-sprite", "position": {"x": 0, "y": 0},
+            "asset": asset, "anchor": "ground", "height": 2, "flipX": true,
+            "frame": {"x": 8, "y": 0, "w": 8, "h": 16}}]}),
+        )
+        .unwrap();
+        let mesh = &standing.meshes[0];
+        assert!(flat(&mesh.material).billboard);
+        close(origin(mesh.transform), [0.0, 1.0, 0.0]);
+        // the frame's 1:2 aspect makes it one cell wide; flipX mirrors its u range
+        assert!((mesh.mesh.positions[1][0] - 0.5).abs() < 1e-5);
+        assert_eq!(mesh.mesh.uvs[0], [0.5, 0.0]);
+        assert_eq!(mesh.mesh.uvs[1], [0.25, 0.0]);
+    }
+
+    #[test]
+    fn a_failed_sprite_draws_three_red_placeholder_and_no_asset_draws_the_fallback_box() {
+        let broken = "test://canvas-scene3d/broken.png";
+        crate::asset::register_asset(broken, b"not a png".to_vec().into(), Some("image/png"));
+        let s = scene(
+            json!({"drawables": [{"type": "draw-sprite", "position": {"x": 0, "y": 0},
+            "asset": {"url": broken, "role": "unit", "category": "c"}, "anchor": "center"}]}),
+        )
+        .unwrap();
+        let mesh = &s.meshes[0];
+        let channel = |byte: u8| srgb_to_linear(byte as f32 / 255.0);
+        assert_eq!(
+            mesh.material.color,
+            [channel(0xff), channel(0x44), channel(0x44)]
+        );
+        assert!((mesh.material.opacity - 0.6).abs() < 1e-6);
+        assert!(
+            !flat(&mesh.material).billboard,
+            "three's placeholder is a plain plane"
+        );
+        assert_eq!(mesh.material.map, None);
+
+        let unset =
+            scene(json!({"drawables": [{"type": "draw-sprite", "position": {"x": 0, "y": 0}}]}))
+                .unwrap();
+        let mesh = &unset.meshes[0];
+        assert_eq!(mesh.material.kind, MaterialKind::Standard);
+        assert_eq!(
+            mesh.material.color,
+            [channel(0x9b), channel(0x8f), channel(0x7f)]
+        );
+        assert_eq!(mesh.mesh.positions.len(), 24, "a box");
+    }
+
+    #[test]
+    fn layers_draw_each_item_as_its_atom_picked_by_its_id() {
+        let s = scene(json!({"drawables": [
+            {"type": "draw-shape-layer", "items": [
+                {"type": "draw-shape", "id": "a", "shape": "cell", "position": {"x": 0, "y": 0}},
+                {"type": "draw-shape", "id": "b", "shape": "cell", "position": {"x": 4, "y": 2}}
+            ]},
+            {"type": "draw-text-layer", "items": [
+                {"type": "draw-text", "text": "hi", "position": {"x": 1, "y": 1}}
+            ]}
+        ]}))
+        .unwrap();
+        assert_eq!(s.meshes.len(), 3);
+        assert_eq!(s.meshes[0].id.as_deref(), Some("a"));
+        assert_eq!(s.meshes[1].id.as_deref(), Some("b"));
+        close(origin(s.meshes[1].transform), [4.0, 0.02, 2.0]);
+        // the layer items frame the camera as collectDrawnItems counts them
+        close(s.camera.target, [2.0, 0.0, 1.0]);
+        assert_eq!(s.interaction.cells.len(), 2);
+        let wrong = message(scene(
+            json!({"drawables": [{"type": "draw-shape-layer", "items": [
+            {"type": "draw-text", "text": "x", "position": {"x": 0, "y": 0}}]}]}),
+        ));
+        assert_eq!(wrong, "drawables[0].items[0].type: must be `draw-shape`");
+    }
+
+    #[test]
+    fn an_fx_layer_expands_on_the_page_clock_and_keeps_the_host_mapping() {
+        let fx = json!({"type": "draw-fx-layer", "items": [{"id": "hit-1", "type": "hit",
+            "position": {"x": 2, "y": 3}, "ttl": 2, "maxTtl": 4, "bornAt": 1000}],
+            "presets": [{"type": "hit", "shape": "puff", "size": 0.5, "count": 3, "color": "#00ff00",
+                "vx": 0, "vy": 0, "vz": 0, "gravity": 0}]});
+        let canvas = json!({"type": "canvas", "mode": "3d", "showGrid": false, "drawables": [fx]});
+        let s = scene_from_canvas_node_at_epoch(
+            &canvas,
+            800.0,
+            600.0,
+            &SceneTheme::default(),
+            0.0,
+            1500.0,
+        )
+        .unwrap();
+        assert!(s.animated);
+        assert_eq!(s.meshes.len(), 3, "three puffs");
+        for mesh in &s.meshes {
+            assert_eq!(mesh.material.color, [0.0, 1.0, 0.0]);
+            // fade 0.75 × the puff's 0.6
+            assert!((mesh.material.opacity - 0.45).abs() < 1e-6);
+        }
+        let empty = json!({"type": "canvas", "mode": "3d", "showGrid": false,
+            "drawables": [{"type": "draw-fx-layer", "items": []}]});
+        let rest = scene_from_canvas_node(&empty, 800.0, 600.0).unwrap();
+        assert!(
+            !rest.animated && rest.meshes.is_empty(),
+            "control: no live entry, nothing to redraw"
+        );
+    }
+
+    #[test]
+    fn a_mesh_outline_is_a_scaled_back_face_hull_and_on_a_polyhedron_a_pushed_out_shell() {
+        let s = scene(
+            json!({"drawables": [{"type": "draw-mesh", "position": {"x": 0, "y": 0},
+            "opacity": 0.5, "outline": {"color": "#00ff00", "width": 0.1}}]}),
+        )
+        .unwrap();
+        assert_eq!(s.meshes.len(), 2);
+        let hull = &s.meshes[1];
+        assert_eq!(
+            (
+                hull.material.kind,
+                hull.material.side,
+                hull.material.color,
+                hull.material.opacity
+            ),
+            (MaterialKind::Basic, Side::Back, [0.0, 1.0, 0.0], 0.5)
+        );
+        assert_eq!(hull.mesh, s.meshes[0].mesh);
+        let t = hull.transform;
+        close([t[0], t[5], t[10]], [1.1, 1.1, 1.1]);
+        close(origin(t), [0.0, 0.5, 0.0]);
+        assert!(!hull.cast_shadow);
+
+        let poly = scene(json!({"drawables": [{"type": "draw-mesh", "shape": "polyhedron",
+            "position": {"x": 0, "y": 0}, "vertices": [[0, 0, 0], [1, 0, 0], [0, 1, 0]], "faces": [[0, 1, 2]],
+            "outline": {"width": 0.25}}]}))
+        .unwrap();
+        let (body, shell) = (&poly.meshes[0].mesh, &poly.meshes[1].mesh);
+        for (p, q) in body.positions.iter().zip(&shell.positions) {
+            close(*q, [p[0], p[1] + 0.25, p[2]]);
+        }
+
+        let theme = SceneTheme {
+            outline: 2.0,
+            ..SceneTheme::default()
+        };
+        let canvas = json!({"type": "canvas", "mode": "3d", "showGrid": false,
+            "drawables": [{"type": "draw-mesh", "position": {"x": 0, "y": 0}}]});
+        let themed = scene_from_canvas_node_themed(&canvas, 800.0, 600.0, &theme).unwrap();
+        assert_eq!(themed.meshes.len(), 2, "the theme's outline");
+        close([themed.meshes[1].transform[0], 0.0, 0.0], [1.04, 0.0, 0.0]);
+        assert_eq!(
+            scene_from_canvas_node(&canvas, 800.0, 600.0)
+                .unwrap()
+                .meshes
+                .len(),
+            1,
+            "control: no outline drawn when neither the mesh nor the theme asks"
+        );
+    }
+
+    #[test]
+    fn a_skinned_polyhedron_outline_follows_the_posed_surface() {
+        let mut rig = rig_group(false, json!(["root", "tip"]));
+        rig["drawables"][0]["items"][2]["outline"] = json!({"width": 0.1});
+        let s = scene(rig).unwrap();
+        assert_eq!(s.meshes.len(), 2);
+        let (body, shell) = (&s.meshes[0].mesh, &s.meshes[1].mesh);
+        for (i, (p, q)) in body.positions.iter().zip(&shell.positions).enumerate() {
+            let n = body.normals[i];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            close(
+                *q,
+                [
+                    p[0] + n[0] / len * 0.1,
+                    p[1] + n[1] / len * 0.1,
+                    p[2] + n[2] / len * 0.1,
+                ],
+            );
+        }
     }
 }

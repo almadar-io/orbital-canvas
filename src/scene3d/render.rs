@@ -1,7 +1,7 @@
 //! Draws a [`Scene3D`] on the GPU: vertex transforms, lighting and shadows run in shaders, meshes upload once and are
 //! cached by content, and the frame renders multisampled into any target texture of the renderer's device.
 
-use super::model::{MaterialKind, MeshData, Projection, Scene3D, Side};
+use super::model::{Flat, MaterialKind, MeshData, Projection, Scene3D, Side};
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -26,6 +26,8 @@ struct FrameUniform {
     point_pos: [[f32; 4]; MAX_POINTS],
     point_color: [[f32; 4]; MAX_POINTS],
     options: [f32; 4],
+    camera_right: [f32; 4],
+    camera_up: [f32; 4],
 }
 
 #[repr(C)]
@@ -60,6 +62,8 @@ struct Vertex {
 const FLAG_FLAT: u32 = 1;
 const FLAG_RECEIVE_SHADOW: u32 = 2;
 const FLAG_MAP: u32 = 4;
+const FLAG_CUTOUT: u32 = 8;
+const FLAG_BILLBOARD: u32 = 16;
 
 struct GpuMesh {
     vertices: wgpu::Buffer,
@@ -74,6 +78,19 @@ struct PipelineKey {
     samples: u32,
     side: Side,
     transparent: bool,
+    additive: bool,
+}
+
+/// One mesh's draw: its object slot, cached mesh, view depth and the state its pipeline and map are chosen by.
+struct Draw {
+    slot: usize,
+    mesh: u64,
+    depth: f32,
+    transparent: bool,
+    additive: bool,
+    side: Side,
+    map: Option<(String, bool)>,
+    cast_shadow: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -117,11 +134,13 @@ pub struct Renderer3D {
     object_buffer: wgpu::Buffer,
     object_capacity: u64,
     color_sampler: wgpu::Sampler,
+    nearest_sampler: wgpu::Sampler,
     shadow_sampler: wgpu::Sampler,
     shadow_map: Option<(u32, wgpu::TextureView)>,
     placeholder_shadow: wgpu::TextureView,
     white_map: wgpu::BindGroup,
-    maps: HashMap<String, (wgpu::BindGroup, u64)>,
+    /// Keyed by the image and whether it samples nearest.
+    maps: HashMap<(String, bool), (wgpu::BindGroup, u64)>,
     meshes: HashMap<u64, GpuMesh>,
     targets: Option<Targets>,
     clock: u64,
@@ -336,6 +355,14 @@ impl Renderer3D {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("scene3d nearest map sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("scene3d shadow sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -366,6 +393,7 @@ impl Renderer3D {
             object_buffer,
             object_capacity,
             color_sampler,
+            nearest_sampler,
             shadow_sampler,
             shadow_map: None,
             placeholder_shadow,
@@ -404,7 +432,11 @@ impl Renderer3D {
                     entry_point: Some("fs_main"),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: key.format,
-                        blend: key.transparent.then_some(wgpu::BlendState::ALPHA_BLENDING),
+                        blend: match (key.transparent, key.additive) {
+                            (_, true) => Some(ADDITIVE),
+                            (true, false) => Some(wgpu::BlendState::ALPHA_BLENDING),
+                            (false, false) => None,
+                        },
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                     compilation_options: Default::default(),
@@ -522,11 +554,13 @@ impl Renderer3D {
         key
     }
 
-    /// The bind group of the image at `url`, uploaded as sRGB; `None` until the asset has loaded or when it fails.
-    fn map(&mut self, url: &str) -> Option<&wgpu::BindGroup> {
+    /// The bind group of the image at `url`, uploaded as sRGB and sampled nearest or linear; `None` until the asset
+    /// has loaded or when it fails.
+    fn map(&mut self, url: &str, nearest: bool) -> Option<&wgpu::BindGroup> {
         let clock = self.clock;
-        if self.maps.contains_key(url) {
-            let entry = self.maps.get_mut(url)?;
+        let key = (url.to_string(), nearest);
+        if self.maps.contains_key(&key) {
+            let entry = self.maps.get_mut(&key)?;
             entry.1 = clock;
             return Some(&entry.0);
         }
@@ -549,14 +583,14 @@ impl Renderer3D {
         };
         let (w, h) = rgba.dimensions();
         let texture = upload_rgba(&self.device, &self.queue, w, h, rgba.as_raw());
-        let group = map_bind_group(
-            &self.device,
-            &self.map_layout,
-            &texture,
-            &self.color_sampler,
-        );
-        self.maps.insert(url.to_string(), (group, clock));
-        self.maps.get(url).map(|entry| &entry.0)
+        let sampler = if nearest {
+            &self.nearest_sampler
+        } else {
+            &self.color_sampler
+        };
+        let group = map_bind_group(&self.device, &self.map_layout, &texture, sampler);
+        self.maps.insert(key.clone(), (group, clock));
+        self.maps.get(&key).map(|entry| &entry.0)
     }
 
     fn ensure_targets(
@@ -650,6 +684,12 @@ impl Renderer3D {
         }
         let aspect = width as f32 / height.max(1) as f32;
         let view_proj = view_projection(scene, aspect);
+        let view = Mat4::look_at_rh(
+            Vec3::from(scene.camera.eye),
+            Vec3::from(scene.camera.target),
+            Vec3::from(scene.camera.up),
+        );
+        let (right, up) = (view.row(0), view.row(1));
 
         let shadow = scene
             .lights
@@ -699,6 +739,8 @@ impl Renderer3D {
                 (!format.is_srgb()) as u32 as f32,
                 0.0,
             ],
+            camera_right: [right.x, right.y, right.z, 0.0],
+            camera_up: [up.x, up.y, up.z, 0.0],
         };
         if let Some(light) = scene.lights.directional {
             let to_light =
@@ -747,11 +789,22 @@ impl Renderer3D {
             if m.map.is_some() {
                 flags |= FLAG_MAP;
             }
+            let flat = match m.kind {
+                MaterialKind::Flat(flat) => flat,
+                _ => Flat::default(),
+            };
+            if flat.cutout {
+                flags |= FLAG_CUTOUT;
+            }
+            if flat.billboard {
+                flags |= FLAG_BILLBOARD;
+            }
             let kind = match m.kind {
                 MaterialKind::Basic => 0.0,
                 MaterialKind::Standard => 1.0,
                 MaterialKind::Physical => 2.0,
                 MaterialKind::Toon => 3.0,
+                MaterialKind::Flat(_) => 4.0,
             };
             let uniform = ObjectUniform {
                 model: model.to_cols_array_2d(),
@@ -763,18 +816,22 @@ impl Renderer3D {
             let offset = i * OBJECT_STRIDE as usize;
             objects[offset..offset + std::mem::size_of::<ObjectUniform>()]
                 .copy_from_slice(bytemuck::bytes_of(&uniform));
-            let key = self.mesh(&instance.mesh);
-            let center = model.transform_point3(centroid(&instance.mesh));
-            let depth = view_proj.project_point3(center).z;
-            draws.push((
-                i,
-                key,
-                depth,
-                m.is_transparent(),
-                m.side,
-                m.map.clone(),
-                instance.cast_shadow,
-            ));
+            let mesh = self.mesh(&instance.mesh);
+            let center = if flat.billboard {
+                model.transform_point3(Vec3::ZERO)
+            } else {
+                model.transform_point3(centroid(&instance.mesh))
+            };
+            draws.push(Draw {
+                slot: i,
+                mesh,
+                depth: view_proj.project_point3(center).z,
+                transparent: m.is_transparent(),
+                additive: flat.additive,
+                side: m.side,
+                map: m.map.clone().map(|url| (url, flat.nearest)),
+                cast_shadow: instance.cast_shadow,
+            });
         }
         self.queue.write_buffer(&self.object_buffer, 0, &objects);
         let object_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -818,12 +875,16 @@ impl Renderer3D {
                 });
                 pass.set_pipeline(&self.shadow_pipeline);
                 pass.set_bind_group(0, &frame_group, &[]);
-                for (i, key, _, transparent, _, _, cast) in &draws {
-                    if !cast || *transparent {
+                for draw in &draws {
+                    if !draw.cast_shadow || draw.transparent {
                         continue;
                     }
-                    let mesh = &self.meshes[key];
-                    pass.set_bind_group(1, &object_group, &[(*i as u64 * OBJECT_STRIDE) as u32]);
+                    let mesh = &self.meshes[&draw.mesh];
+                    pass.set_bind_group(
+                        1,
+                        &object_group,
+                        &[(draw.slot as u64 * OBJECT_STRIDE) as u32],
+                    );
                     pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                     pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.count, 0, 0..1);
@@ -857,24 +918,29 @@ impl Renderer3D {
         let mut order: Vec<usize> = (0..draws.len()).collect();
         order.sort_by(|&a, &b| {
             let (da, db) = (&draws[a], &draws[b]);
-            da.3.cmp(&db.3).then_with(|| {
-                if da.3 {
-                    db.2.total_cmp(&da.2)
+            da.transparent.cmp(&db.transparent).then_with(|| {
+                if da.transparent {
+                    db.depth.total_cmp(&da.depth)
                 } else {
-                    da.2.total_cmp(&db.2)
+                    da.depth.total_cmp(&db.depth)
                 }
             })
         });
         let mut map_groups: Vec<Option<wgpu::BindGroup>> = Vec::with_capacity(draws.len());
         for draw in &draws {
-            map_groups.push(draw.5.as_deref().and_then(|url| self.map(url).cloned()));
+            map_groups.push(
+                draw.map
+                    .as_ref()
+                    .and_then(|(url, nearest)| self.map(url, *nearest).cloned()),
+            );
         }
         for draw in &draws {
             self.pipeline(PipelineKey {
                 format,
                 samples,
-                side: draw.4,
-                transparent: draw.3,
+                side: draw.side,
+                transparent: draw.transparent,
+                additive: draw.additive,
             });
         }
         let grid_draw = match &scene.grid {
@@ -970,10 +1036,11 @@ impl Renderer3D {
         pass.set_bind_group(0, &frame_group, &[]);
         let mut grid_pending = grid_draw.as_ref();
         for index in order {
-            let (i, key, depth, transparent, side, _, _) = &draws[index];
+            let draw = &draws[index];
             // the grid is a transparent object: drawn among them, back to front
-            if *transparent {
-                if let Some((_, frame_only, params)) = grid_pending.filter(|(d, _, _)| *d >= *depth)
+            if draw.transparent {
+                if let Some((_, frame_only, params)) =
+                    grid_pending.filter(|(d, _, _)| *d >= draw.depth)
                 {
                     pass.set_pipeline(&self.grid_pipelines[&GridKey { format, samples }]);
                     pass.set_bind_group(0, frame_only, &[]);
@@ -986,12 +1053,17 @@ impl Renderer3D {
             let pipeline = &self.pipelines[&PipelineKey {
                 format,
                 samples,
-                side: *side,
-                transparent: *transparent,
+                side: draw.side,
+                transparent: draw.transparent,
+                additive: draw.additive,
             }];
-            let mesh = &self.meshes[key];
+            let mesh = &self.meshes[&draw.mesh];
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(1, &object_group, &[(*i as u64 * OBJECT_STRIDE) as u32]);
+            pass.set_bind_group(
+                1,
+                &object_group,
+                &[(draw.slot as u64 * OBJECT_STRIDE) as u32],
+            );
             pass.set_bind_group(
                 2,
                 map_groups[index].as_ref().unwrap_or(&self.white_map),
@@ -1016,6 +1088,20 @@ impl Renderer3D {
         Ok(())
     }
 }
+
+/// three's `AdditiveBlending` (no premultiplied alpha): source times its alpha, added to what is there.
+const ADDITIVE: wgpu::BlendState = wgpu::BlendState {
+    color: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::SrcAlpha,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+    alpha: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::SrcAlpha,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+};
 
 fn linear_to_srgb(c: f32) -> f32 {
     let c = c.clamp(0.0, 1.0);

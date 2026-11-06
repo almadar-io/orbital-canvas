@@ -176,8 +176,12 @@ impl WebCanvas3D {
             return Ok(());
         };
         let (width, height) = self.css_size;
-        let scene = match self.origin_ms {
-            Some(_) if !self.reduced_motion => {
+        let pattern = node.get("type").and_then(serde_json::Value::as_str);
+        let scene = match (pattern, self.origin_ms) {
+            (Some("physics-canvas" | "biology-canvas" | "chemistry-canvas"), _) => {
+                crate::mappers::learning_scene3d::learning_scene3d(node, width, height, theme)
+            }
+            (_, Some(_)) if !self.reduced_motion => {
                 scene_from_canvas_node_at(node, width, height, theme, self.elapsed_ms)
             }
             _ => scene_from_canvas_node_themed(node, width, height, theme),

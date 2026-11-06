@@ -170,6 +170,23 @@ pub enum MaterialKind {
     Standard,
     Physical,
     Toon,
+    Flat(Flat),
+}
+
+/// An unlit, always-blended surface as three draws its 2D drawables in a 3D scene (`MeshBasicMaterial` with
+/// `transparent`): sprites, labels and ground shapes. It lives on the material kind because these switches change how
+/// the renderer samples, blends and places the surface, and every other kind leaves them off.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct Flat {
+    /// Sample the map with nearest filtering (three's `NearestFilter` on sprite textures), else linear.
+    pub nearest: bool,
+    /// Discard fragments whose alpha (map × opacity) is below 0.1, three's sprite `alphaTest`.
+    pub cutout: bool,
+    /// Add to what is behind (three's `AdditiveBlending`, the canvas `lighter` blend mode) instead of blending over it.
+    pub additive: bool,
+    /// Turn to face the camera as drei's `Billboard` does: the mesh keeps its world origin and scale, and its local X/Y
+    /// axes follow the camera's right and up vectors.
+    pub billboard: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -220,7 +237,7 @@ impl Default for Material {
 
 impl Material {
     pub fn is_transparent(&self) -> bool {
-        self.opacity < 1.0
+        self.opacity < 1.0 || matches!(self.kind, MaterialKind::Flat(_))
     }
 }
 

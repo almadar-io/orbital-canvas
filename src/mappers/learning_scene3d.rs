@@ -2082,9 +2082,9 @@ mod tests {
         );
 
         let labelled = json!({"type": "physics-canvas", "mode": "3d", "bodies": [{"x": 0, "y": 0, "label": "m"}]});
-        assert!(
-            learning_scene3d(&labelled, 600.0, 400.0, &theme).is_err(),
-            "labels wait for 3D text"
-        );
+        let unlabelled = json!({"type": "physics-canvas", "mode": "3d", "bodies": [{"x": 0, "y": 0}]});
+        let with = learning_scene3d(&labelled, 600.0, 400.0, &theme).expect("a label draws as 3D text");
+        let without = learning_scene3d(&unlabelled, 600.0, 400.0, &theme).expect("control");
+        assert_eq!(with.meshes.len(), without.meshes.len() + 1, "the label is one billboard more");
     }
 }

@@ -4,9 +4,11 @@
 pub mod animation;
 pub mod geometry;
 pub mod gltf;
+pub mod label;
 pub mod model;
 pub mod render;
 pub mod skin;
+pub mod tessellate;
 pub mod view;
 
 pub use model::*;

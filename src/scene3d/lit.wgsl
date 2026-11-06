@@ -5,13 +5,16 @@ struct Object {
   normal_model: mat4x4<f32>,
   color: vec4<f32>,
   emissive: vec4<f32>,
-  // x: metalness, y: roughness, z: kind (0 basic, 1 standard, 2 physical, 3 toon), w: flags
+  // x: metalness, y: roughness, z: kind (0 basic, 1 standard, 2 physical, 3 toon, 4 flat), w: flags
   params: vec4<f32>,
 };
 
 const FLAG_FLAT: u32 = 1u;
 const FLAG_RECEIVE_SHADOW: u32 = 2u;
 const FLAG_MAP: u32 = 4u;
+const FLAG_CUTOUT: u32 = 8u;
+const FLAG_BILLBOARD: u32 = 16u;
+const ALPHA_TEST: f32 = 0.1;
 
 @group(0) @binding(1) var shadow_map: texture_depth_2d;
 @group(0) @binding(2) var shadow_sampler: sampler_comparison;
@@ -33,10 +36,28 @@ struct VertexOut {
   @location(3) shadow_coord: vec4<f32>,
 };
 
+// drei's Billboard: the camera's rotation with the object's own origin and scale
+fn world_position(position: vec3<f32>) -> vec4<f32> {
+  if ((u32(object.params.w) & FLAG_BILLBOARD) == 0u) {
+    return object.model * vec4<f32>(position, 1.0);
+  }
+  let origin = object.model[3].xyz;
+  let sx = length(object.model[0].xyz);
+  let sy = length(object.model[1].xyz);
+  return vec4<f32>(origin + frame.camera_right.xyz * (position.x * sx) + frame.camera_up.xyz * (position.y * sy), 1.0);
+}
+
+fn world_normal(normal: vec3<f32>) -> vec3<f32> {
+  if ((u32(object.params.w) & FLAG_BILLBOARD) == 0u) {
+    return normalize((object.normal_model * vec4<f32>(normal, 0.0)).xyz);
+  }
+  return normalize(cross(frame.camera_right.xyz, frame.camera_up.xyz));
+}
+
 @vertex
 fn vs_main(in: VertexIn) -> VertexOut {
-  let world = object.model * vec4<f32>(in.position, 1.0);
-  let normal = normalize((object.normal_model * vec4<f32>(in.normal, 0.0)).xyz);
+  let world = world_position(in.position);
+  let normal = world_normal(in.normal);
   var out: VertexOut;
   out.clip = frame.view_proj * world;
   out.world = world.xyz;
@@ -48,7 +69,7 @@ fn vs_main(in: VertexIn) -> VertexOut {
 
 @vertex
 fn vs_shadow(in: VertexIn) -> @builtin(position) vec4<f32> {
-  return frame.light_view_proj * (object.model * vec4<f32>(in.position, 1.0));
+  return frame.light_view_proj * world_position(in.position);
 }
 
 fn shadow_factor(coord: vec4<f32>) -> f32 {
@@ -117,14 +138,19 @@ fn direct(s: Surface, n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, radiance: vec3<f
 fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
   let flags = u32(object.params.w);
   let texel = textureSample(color_map, color_sampler, in.uv);
+  // derivatives before the cutout's discard, which leaves the rest of the shader in non-uniform control flow
+  let face = cross(dpdx(in.world), dpdy(in.world));
   let base = object.color * select(vec4<f32>(1.0), texel, (flags & FLAG_MAP) != 0u);
   let kind = u32(object.params.z);
-  if (kind == 0u) {
+  if (kind == 0u || kind == 4u) {
+    if ((flags & FLAG_CUTOUT) != 0u && base.a < ALPHA_TEST) {
+      discard;
+    }
     return finish(base.rgb, base.a);
   }
   var n = normalize(in.normal);
   if ((flags & FLAG_FLAT) != 0u) {
-    n = normalize(cross(dpdx(in.world), dpdy(in.world)));
+    n = normalize(face);
   }
   let v = normalize(frame.camera_pos.xyz - in.world);
   if ((flags & FLAG_FLAT) != 0u) {

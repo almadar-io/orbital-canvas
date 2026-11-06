@@ -397,7 +397,9 @@ fn a_mapped_canvas_scene_renders_its_meshes_over_the_grid() {
         "mode": "3d",
         "backgroundColor": "#1b1f2a",
         "drawables": [
-            {"type": "draw-mesh", "shape": "box", "position": {"x": 0, "y": 0}, "material": {"color": "#e05a47"}},
+            {"type": "draw-mesh", "shape": "box", "position": {"x": 0, "y": 0}, "material": {"color": "#e05a47"}, "outline": {"color": "#ffffff", "width": 0.06}},
+            {"type": "draw-text", "text": "orbital", "position": {"x": 3, "y": 1}},
+            {"type": "draw-shape", "shape": "ellipse", "position": {"x": 2, "y": 4}, "radiusX": 0.6, "fill": "#c03dd9"},
             {"type": "draw-mesh", "shape": "sphere", "radius": 0.6, "position": {"x": 3, "y": 1}, "material": {"color": "#4a90d9", "metalness": 0.3, "roughness": 0.4}},
             {"type": "draw-mesh", "shape": "torus", "radius": 0.6, "tube": 0.2, "position": {"x": 1, "y": 3}, "material": {"color": "#f2c14e"}},
             {"type": "draw-mesh", "shape": "cone", "radius": 0.5, "height": 1.4, "position": {"x": 4, "y": 4}, "material": {"color": "#5cb85c", "kind": "toon"}}
@@ -495,4 +497,180 @@ fn a_non_srgb_target_clears_to_the_authored_background_and_control_an_srgb_one_t
             "{format:?}: {p:?}"
         );
     }
+}
+
+fn flat_white(flat: Flat) -> Material {
+    Material {
+        kind: MaterialKind::Flat(flat),
+        color: [1.0, 1.0, 1.0],
+        side: Side::Double,
+        ..Material::default()
+    }
+}
+
+fn png(image: &image::RgbaImage) -> Vec<u8> {
+    let mut out = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .expect("png");
+    out
+}
+
+/// A canvas node mapped at the test target's size.
+fn mapped(node: serde_json::Value) -> Scene3D {
+    crate::mappers::canvas_scene3d::scene_from_canvas_node(&node, SIZE as f32, SIZE as f32)
+        .expect("maps")
+}
+
+fn screen(scene: &Scene3D, world: [f32; 3]) -> (f32, f32) {
+    let ndc = super::view_projection(scene, 1.0).project_point3(world.into());
+    (
+        (ndc.x * 0.5 + 0.5) * SIZE as f32,
+        (0.5 - ndc.y * 0.5) * SIZE as f32,
+    )
+}
+
+#[test]
+fn a_billboard_faces_the_camera_after_an_orbit_and_control_a_plain_quad_turns_edge_on() {
+    let Some(mut r) = renderer() else { return };
+    let quad = super::tessellate::quad(2.0, 2.0, [0.0, 0.0, 1.0, 1.0]).unwrap();
+    let billboard = instance(
+        quad.clone(),
+        Mat4::IDENTITY,
+        flat_white(Flat {
+            billboard: true,
+            ..Flat::default()
+        }),
+    );
+    let lit = |rgba: &[u8]| rgba.chunks(4).filter(|p| p[0] > 200).count();
+    for eye in [
+        [0.0, 0.0, 8.0],
+        [8.0, 0.0, 0.0],
+        [0.0, 5.6, 5.6],
+        [-5.6, 0.0, -5.6],
+    ] {
+        let mut s = scene(vec![billboard.clone()], Lights::default(), false);
+        s.camera = camera(eye, [0.0, 0.0, 0.0]);
+        let rgba = draw(&mut r, &s, 1);
+        assert!(
+            lit(&rgba) > 200,
+            "the quad faces a camera at {eye:?}: {}",
+            lit(&rgba)
+        );
+    }
+    let plain = instance(quad, Mat4::IDENTITY, flat_white(Flat::default()));
+    let mut side = scene(vec![plain], Lights::default(), false);
+    side.camera = camera([8.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+    assert!(
+        lit(&draw(&mut r, &side, 1)) < 10,
+        "control: an unturned quad is edge-on from the side"
+    );
+}
+
+#[test]
+fn a_sprite_cuts_out_texels_under_a_tenth_alpha_and_control_without_cutout_blends_them() {
+    let Some(mut r) = renderer() else { return };
+    let url = "test://scene3d/cutout.png";
+    let mut image = image::RgbaImage::new(2, 1);
+    image.put_pixel(0, 0, image::Rgba([255, 255, 255, 13]));
+    image.put_pixel(1, 0, image::Rgba([255, 255, 255, 255]));
+    crate::asset::register_asset(url, png(&image).into(), Some("image/png"));
+    let quad = super::tessellate::quad(4.0, 4.0, [0.0, 0.0, 1.0, 1.0]).unwrap();
+    let sprite = |cutout: bool| {
+        let mut s = scene(
+            vec![instance(
+                quad.clone(),
+                Mat4::IDENTITY,
+                Material {
+                    map: Some(url.into()),
+                    ..flat_white(Flat {
+                        nearest: true,
+                        cutout,
+                        ..Flat::default()
+                    })
+                },
+            )],
+            Lights::default(),
+            false,
+        );
+        s.camera = camera([0.0, 0.0, 8.0], [0.0, 0.0, 0.0]);
+        s
+    };
+    let (cut, soft) = (
+        draw(&mut r, &sprite(true), 1),
+        draw(&mut r, &sprite(false), 1),
+    );
+    let (faint, solid) = ((SIZE / 2 - 8, SIZE / 2), (SIZE / 2 + 8, SIZE / 2));
+    assert_eq!(pixel(&cut, faint.0, faint.1), [0, 0, 0, 255], "cut out");
+    assert!(
+        pixel(&cut, solid.0, solid.1)[0] > 200,
+        "the opaque half draws"
+    );
+    assert!(
+        pixel(&soft, faint.0, faint.1)[0] > 20,
+        "control: without the cutout the faint half blends in: {:?}",
+        pixel(&soft, faint.0, faint.1)
+    );
+}
+
+#[test]
+fn a_mapped_label_draws_its_glyphs_above_its_anchor() {
+    let Some(mut r) = renderer() else { return };
+    let node = |text: &str| {
+        serde_json::json!({"type": "canvas", "mode": "3d", "showGrid": false, "backgroundColor": "#000000",
+            "camera": {"mode": "front"}, "lighting": {"toneMapping": "none"},
+            "drawables": [{"type": "draw-text", "text": text, "position": {"x": 0, "y": 0},
+                "color": "#ffffff", "font": "bold 256px sans-serif"}]})
+    };
+    let s = mapped(node("HH"));
+    let rgba = draw(&mut r, &s, 1);
+    dump("label", &rgba);
+    let white: Vec<(u32, u32)> = (0..SIZE)
+        .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+        .filter(|&(x, y)| pixel(&rgba, x, y)[..3].iter().all(|c| *c > 200))
+        .collect();
+    assert!(white.len() > 10, "glyph pixels: {}", white.len());
+    let (_, anchor_y) = screen(&s, [0.0, 0.0, 0.0]);
+    let (_, label_y) = screen(&s, [0.0, 1.2, 0.0]);
+    assert!(
+        white.iter().all(|&(_, y)| (y as f32) < anchor_y),
+        "every glyph pixel is above the anchor"
+    );
+    let mean = white.iter().map(|&(_, y)| y as f32).sum::<f32>() / white.len() as f32;
+    assert!(
+        (mean - label_y).abs() < 6.0,
+        "the glyphs center on the lifted label: {mean} vs {label_y}"
+    );
+    let blank = draw(&mut r, &mapped(node("")), 1);
+    assert!(
+        blank.chunks(4).all(|p| p[..3].iter().all(|c| *c < 40)),
+        "control: an empty label draws nothing"
+    );
+}
+
+#[test]
+fn a_mapped_outline_shows_a_rim_around_its_mesh_and_control_none_without_it() {
+    let Some(mut r) = renderer() else { return };
+    let node = |outline: serde_json::Value| {
+        serde_json::json!({"type": "canvas", "mode": "3d", "showGrid": false, "backgroundColor": "#000000",
+            "shadows": false, "lighting": {"toneMapping": "none"},
+            "drawables": [{"type": "draw-mesh", "shape": "sphere", "radius": 1, "pivot": "center",
+                "position": {"x": 0, "y": 0}, "material": {"kind": "basic", "color": "#ff0000"},
+                "outline": outline}]})
+    };
+    let green = |rgba: &[u8]| rgba.chunks(4).filter(|p| p[1] > 150 && p[0] < 80).count();
+    let rimmed = draw(
+        &mut r,
+        &mapped(node(serde_json::json!({"color": "#00ff00", "width": 0.5}))),
+        1,
+    );
+    dump("outline", &rimmed);
+    assert!(green(&rimmed) > 20, "a green rim: {}", green(&rimmed));
+    let red = rimmed.chunks(4).filter(|p| p[0] > 200 && p[1] < 50).count();
+    assert!(red > 100, "the mesh still shows inside its rim: {red}");
+    assert_eq!(
+        green(&draw(&mut r, &mapped(node(serde_json::Value::Null)), 1)),
+        0,
+        "control: no outline, no rim"
+    );
 }

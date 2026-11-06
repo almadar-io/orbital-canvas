@@ -10,3 +10,5 @@ pub mod mini_map;
 pub mod platformer_canvas;
 pub mod scene;
 pub mod skinned_mesh_2d;
+pub mod canvas3d_props;
+pub mod learning_overlay3d;

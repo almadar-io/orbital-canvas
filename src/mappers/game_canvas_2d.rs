@@ -1487,7 +1487,7 @@ fn push_shape_stroke(points: &[Vec2], stroke: Option<Stroke>, out: &mut Vec<Draw
 
 /// Background image: atlas slices cover the viewport; whole images tile at
 /// native pixel size with the camera phase, as in the existing web painter.
-fn background_sprites(bg: &Value, width: f32, height: f32, cam: (f32, f32)) -> Vec<DrawCommand> {
+pub(crate) fn background_sprites(bg: &Value, width: f32, height: f32, cam: (f32, f32)) -> Vec<DrawCommand> {
     let url = match bg {
         Value::String(s) => s.as_str(),
         Value::Object(_) => match bg.get("url").and_then(Value::as_str) {
