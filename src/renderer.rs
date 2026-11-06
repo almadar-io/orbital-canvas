@@ -640,6 +640,7 @@ pub struct SharedDeviceRenderer {
     /// referenced by this frame's draw list and must not be evicted.
     frame_epoch: u64,
     render_depth: usize,
+    scene3d: Option<crate::scene3d::Renderer3D>,
 }
 
 impl SharedDeviceRenderer {
@@ -706,6 +707,7 @@ impl SharedDeviceRenderer {
             use_clock: 0,
             frame_epoch: 0,
             render_depth: 0,
+            scene3d: None,
         }
     }
 
@@ -1219,6 +1221,23 @@ impl SharedDeviceRenderer {
 
         let mut clear_color = wgpu::Color::TRANSPARENT;
         let mut drew = false;
+        let mut load_3d = false;
+        for command in &packet.draw_commands {
+            if let DrawCommand::Scene3D { scene } = command {
+                let renderer = self.scene3d.get_or_insert_with(|| {
+                    crate::scene3d::Renderer3D::new(self.device.clone(), self.queue.clone())
+                });
+                match renderer.encode(&mut encoder, scene, target, 4) {
+                    Ok(()) => {
+                        load_3d = true;
+                        drew = true;
+                    }
+                    Err(error) => {
+                        tracing::error!(target: "almadar::game_renderer", %error, "3D scene not drawn")
+                    }
+                }
+            }
+        }
 
         // Resolve every command into a sequenced draw list FIRST (GPU uploads
         // borrow &mut self; the pass borrows &self). Quads coalesce into one
@@ -1448,7 +1467,11 @@ impl SharedDeviceRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
+                        load: if load_3d {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(clear_color)
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                 })],

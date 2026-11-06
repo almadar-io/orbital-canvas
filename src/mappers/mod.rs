@@ -1,5 +1,6 @@
 //! Pattern-specific prop → [`GameRenderPacket`] mappers.
 
+pub mod canvas_scene3d;
 pub mod diagram;
 pub mod game_canvas_2d;
 pub mod game_canvas_3d;

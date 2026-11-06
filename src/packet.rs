@@ -304,6 +304,9 @@ pub enum DrawCommand {
     Quad { rect: Rect, color: [f32; 4] },
     /// Draw a filled convex polygon (triangle fan from `points[0]`).
     Poly { points: Vec<Vec2>, color: [f32; 4] },
+    /// A whole 3D scene drawn by [`crate::scene3d::Renderer3D`] across the surface, before the 2D commands, which
+    /// paint over it.
+    Scene3D { scene: Box<crate::scene3d::Scene3D> },
     /// Depth-tested projected mesh triangles. The scene mapper owns projection,
     /// geometry, material, and skinning; this packet preserves their depth.
     Mesh3D { vertices: Vec<MeshVertex> },

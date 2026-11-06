@@ -117,6 +117,11 @@ fn luma(p: [u8; 4]) -> u32 {
     p[0] as u32 + p[1] as u32 + p[2] as u32
 }
 
+/// three's ground rotation: a plane built in XY laid flat, facing up.
+fn ground() -> Mat4 {
+    Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2)
+}
+
 fn white() -> Material {
     Material {
         kind: MaterialKind::Standard,
@@ -130,7 +135,7 @@ fn a_lit_sphere_is_brighter_on_the_side_facing_its_light() {
     let Some(mut r) = renderer() else { return };
     let mut s = scene(
         vec![instance(
-            geometry::sphere(1.5, 32).unwrap(),
+            geometry::sphere(1.5, 32, 32).unwrap(),
             Mat4::IDENTITY,
             white(),
         )],
@@ -159,7 +164,7 @@ fn a_box_casts_a_shadow_on_the_floor_and_control_without_shadows_it_does_not() {
     let Some(mut r) = renderer() else { return };
     let floor = instance(
         geometry::plane(10.0, 10.0).unwrap(),
-        Mat4::IDENTITY,
+        Mat4::IDENTITY * ground(),
         white(),
     );
     let block = instance(
@@ -209,7 +214,7 @@ fn a_basic_material_ignores_light_and_paints_its_color() {
     let mut s = scene(
         vec![instance(
             geometry::plane(20.0, 20.0).unwrap(),
-            Mat4::IDENTITY,
+            Mat4::IDENTITY * ground(),
             basic,
         )],
         Lights::default(),
@@ -234,12 +239,12 @@ fn a_half_transparent_plane_blends_over_what_is_behind_it() {
     };
     let back = instance(
         geometry::plane(20.0, 20.0).unwrap(),
-        Mat4::IDENTITY,
+        Mat4::IDENTITY * ground(),
         basic([0.0, 0.0, 1.0], 1.0),
     );
     let front = instance(
         geometry::plane(20.0, 20.0).unwrap(),
-        Mat4::from_translation([0.0, 1.0, 0.0].into()),
+        Mat4::from_translation([0.0, 1.0, 0.0].into()) * ground(),
         basic([1.0, 0.0, 0.0], 0.5),
     );
     let mut s = scene(vec![front, back], Lights::default(), false);
@@ -261,7 +266,11 @@ fn multisampling_softens_an_edge_that_a_single_sample_leaves_hard() {
     };
     let tilted = Mat4::from_rotation_y(0.3);
     let mut s = scene(
-        vec![instance(geometry::plane(3.0, 3.0).unwrap(), tilted, basic)],
+        vec![instance(
+            geometry::plane(3.0, 3.0).unwrap(),
+            tilted * ground(),
+            basic,
+        )],
         Lights::default(),
         false,
     );
@@ -279,7 +288,7 @@ fn multisampling_softens_an_edge_that_a_single_sample_leaves_hard() {
 #[test]
 fn a_mesh_drawn_twice_uploads_once() {
     let Some(mut r) = renderer() else { return };
-    let mesh = geometry::sphere(1.0, 12).unwrap();
+    let mesh = geometry::sphere(1.0, 12, 12).unwrap();
     let s = scene(
         vec![
             instance(mesh.clone(), Mat4::IDENTITY, white()),
@@ -294,4 +303,54 @@ fn a_mesh_drawn_twice_uploads_once() {
     );
     draw(&mut r, &s, 1);
     assert_eq!(r.cached_meshes(), 1);
+}
+
+#[test]
+fn a_packet_draws_its_3d_scene_first_and_2d_commands_over_it() {
+    if crate::device::shared_device().is_err() {
+        return;
+    }
+    let mut canvas = crate::Canvas::new_headless().expect("headless canvas");
+    let basic = Material {
+        kind: MaterialKind::Basic,
+        color: [0.0, 0.0, 1.0],
+        ..Material::default()
+    };
+    let mut s = scene(
+        vec![instance(
+            geometry::plane(20.0, 20.0).unwrap(),
+            Mat4::IDENTITY * ground(),
+            basic,
+        )],
+        Lights::default(),
+        false,
+    );
+    s.camera = camera([0.0, 5.0, 0.01], [0.0, 0.0, 0.0]);
+    let packet = crate::packet::GameRenderPacket {
+        width: SIZE as f32,
+        height: SIZE as f32,
+        draw_commands: vec![
+            crate::packet::DrawCommand::Scene3D { scene: Box::new(s) },
+            crate::packet::DrawCommand::Quad {
+                rect: crate::packet::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 8.0,
+                    h: 8.0,
+                },
+                color: [1.0, 0.0, 0.0, 1.0],
+            },
+        ],
+        ..Default::default()
+    };
+    let rgba = canvas.render_packet_to_rgba(&packet).expect("render");
+    let (overlay, scene) = (pixel(&rgba, 2, 2), pixel(&rgba, SIZE / 2, SIZE / 2));
+    assert!(
+        overlay[0] > 200 && overlay[2] < 50,
+        "the 2D quad paints over the scene: {overlay:?}"
+    );
+    assert!(
+        scene[2] > 200 && scene[0] < 50,
+        "the scene shows where nothing covers it: {scene:?}"
+    );
 }

@@ -1,5 +1,6 @@
-//! Mesh builders in local Y-up space, centered on the origin unless stated: positions, normals and UVs per vertex,
-//! counter-clockwise front faces. Segment counts are clamped to 3..=128.
+//! Mesh builders that reproduce three.js r160's geometries vertex for vertex (positions, normals, UVs, index order and
+//! each one's local frame), so a scene moved off three.js tessellates and textures the same. Front faces wind
+//! counter-clockwise.
 
 use super::model::MeshData;
 use std::f32::consts::{PI, TAU};
@@ -18,138 +19,109 @@ fn finite_positive(values: &[(f32, &str)]) -> Result<(), GeometryError> {
     Ok(())
 }
 
-fn segments(count: usize) -> usize {
-    count.clamp(3, 128)
-}
-
-/// An axis-aligned box, 24 vertices so each face keeps its own normal and UVs.
+/// three.js `BoxGeometry(width, height, depth)` with one segment per side: six faces in three's order (+x, -x, +y,
+/// -y, +z, -z), each with its own normal and UVs.
 pub fn cuboid(width: f32, height: f32, depth: f32) -> Result<MeshData, GeometryError> {
     finite_positive(&[(width, "width"), (height, "height"), (depth, "depth")])?;
-    let (x, y, z) = (width * 0.5, height * 0.5, depth * 0.5);
     let mut mesh = MeshData::default();
-    // normal, then u and v axes of the face, each scaled to the half extents
-    let faces: [([f32; 3], [f32; 3], [f32; 3]); 6] = [
-        ([1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),
-        ([-1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]),
-        ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
-        ([0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
-        ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
-        ([0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+    // (u axis, v axis, w axis, udir, vdir, plane width, plane height, plane depth)
+    let sides: [(usize, usize, usize, f32, f32, f32, f32, f32); 6] = [
+        (2, 1, 0, -1.0, -1.0, depth, height, width),
+        (2, 1, 0, 1.0, -1.0, depth, height, -width),
+        (0, 2, 1, 1.0, 1.0, width, depth, height),
+        (0, 2, 1, 1.0, -1.0, width, depth, -height),
+        (0, 1, 2, 1.0, -1.0, width, height, depth),
+        (0, 1, 2, -1.0, -1.0, width, height, -depth),
     ];
-    let half = [x, y, z];
-    for (normal, u, v) in faces {
+    for (u, v, w, udir, vdir, pw, ph, pd) in sides {
         let base = mesh.positions.len() as u32;
-        for (su, sv, uv) in [
-            (-1.0, -1.0, [0.0, 1.0]),
-            (1.0, -1.0, [1.0, 1.0]),
-            (1.0, 1.0, [1.0, 0.0]),
-            (-1.0, 1.0, [0.0, 0.0]),
-        ] {
-            let p = [0, 1, 2].map(|i| (normal[i] + su * u[i] + sv * v[i]) * half[i]);
-            mesh.positions.push(p);
-            mesh.normals.push(normal);
-            mesh.uvs.push(uv);
-        }
-        mesh.indices
-            .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
-    }
-    Ok(mesh)
-}
-
-/// A surface of revolution around +Y from a profile of (radius, y) points, bottom to top, with smooth normals taken
-/// from the profile's slope and optional flat caps at either end.
-fn lathe(profile: &[(f32, f32)], count: usize, cap_bottom: bool, cap_top: bool) -> MeshData {
-    let count = segments(count);
-    let mut mesh = MeshData::default();
-    let rows = profile.len();
-    for (row, &(radius, y)) in profile.iter().enumerate() {
-        let prev = profile[row.saturating_sub(1)];
-        let next = profile[(row + 1).min(rows - 1)];
-        let (dr, dy) = (next.0 - prev.0, next.1 - prev.1);
-        let (nr, ny) = {
-            let len = (dr * dr + dy * dy).sqrt().max(f32::EPSILON);
-            (dy / len, -dr / len)
-        };
-        for s in 0..=count {
-            let angle = s as f32 / count as f32 * TAU;
-            let (sin, cos) = angle.sin_cos();
-            mesh.positions.push([radius * sin, y, radius * cos]);
-            mesh.normals.push([nr * sin, ny, nr * cos]);
-            mesh.uvs.push([
-                s as f32 / count as f32,
-                1.0 - row as f32 / (rows - 1) as f32,
-            ]);
-        }
-    }
-    let stride = count as u32 + 1;
-    for row in 0..rows as u32 - 1 {
-        for s in 0..count as u32 {
-            let a = row * stride + s;
-            let b = a + 1;
-            let c = a + stride;
-            let d = c + 1;
-            mesh.indices.extend([a, b, d, a, d, c]);
-        }
-    }
-    let mut cap = |radius: f32, y: f32, up: bool| {
-        if radius <= 0.0 {
-            return;
-        }
-        let normal = [0.0, if up { 1.0 } else { -1.0 }, 0.0];
-        let center = mesh.positions.len() as u32;
-        mesh.positions.push([0.0, y, 0.0]);
-        mesh.normals.push(normal);
-        mesh.uvs.push([0.5, 0.5]);
-        for s in 0..=count {
-            let angle = s as f32 / count as f32 * TAU;
-            let (sin, cos) = angle.sin_cos();
-            mesh.positions.push([radius * sin, y, radius * cos]);
-            mesh.normals.push(normal);
-            mesh.uvs.push([0.5 + 0.5 * sin, 0.5 - 0.5 * cos]);
-        }
-        for s in 0..count as u32 {
-            let (a, b) = (center + 1 + s, center + 2 + s);
-            if up {
-                mesh.indices.extend([center, a, b]);
-            } else {
-                mesh.indices.extend([center, b, a]);
+        for iy in 0..=1 {
+            let y = iy as f32 * ph - ph * 0.5;
+            for ix in 0..=1 {
+                let x = ix as f32 * pw - pw * 0.5;
+                let mut vertex = [0.0f32; 3];
+                vertex[u] = x * udir;
+                vertex[v] = y * vdir;
+                vertex[w] = pd * 0.5;
+                let mut normal = [0.0f32; 3];
+                normal[w] = if pd > 0.0 { 1.0 } else { -1.0 };
+                mesh.positions.push(vertex);
+                mesh.normals.push(normal);
+                mesh.uvs.push([ix as f32, 1.0 - iy as f32]);
             }
         }
-    };
-    if cap_bottom {
-        cap(profile[0].0, profile[0].1, false);
-    }
-    if cap_top {
-        cap(profile[rows - 1].0, profile[rows - 1].1, true);
-    }
-    mesh
-}
-
-pub fn sphere(radius: f32, count: usize) -> Result<MeshData, GeometryError> {
-    finite_positive(&[(radius, "radius")])?;
-    let rings = segments(count);
-    let profile: Vec<(f32, f32)> = (0..=rings)
-        .map(|r| {
-            let phi = -PI / 2.0 + r as f32 / rings as f32 * PI;
-            (radius * phi.cos(), radius * phi.sin())
-        })
-        .collect();
-    let mut mesh = lathe(&profile, count, false, false);
-    for (p, n) in mesh.positions.iter().zip(mesh.normals.iter_mut()) {
-        let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2])
-            .sqrt()
-            .max(f32::EPSILON);
-        *n = [p[0] / len, p[1] / len, p[2] / len];
+        let (a, b, c, d) = (base, base + 2, base + 3, base + 1);
+        mesh.indices.extend([a, b, d, b, c, d]);
     }
     Ok(mesh)
 }
 
-/// A capped cylinder or cone (a zero radius at one end) of total `height`, centered on the origin.
+/// three.js `SphereGeometry(radius, widthSegments, heightSegments)`.
+pub fn sphere(
+    radius: f32,
+    width_segments: usize,
+    height_segments: usize,
+) -> Result<MeshData, GeometryError> {
+    finite_positive(&[(radius, "radius")])?;
+    let (ws, hs) = (width_segments.max(3), height_segments.max(2));
+    let mut mesh = MeshData::default();
+    let mut grid = Vec::with_capacity(hs + 1);
+    for iy in 0..=hs {
+        let v = iy as f32 / hs as f32;
+        let u_offset = if iy == 0 {
+            0.5 / ws as f32
+        } else if iy == hs {
+            -0.5 / ws as f32
+        } else {
+            0.0
+        };
+        let mut row = Vec::with_capacity(ws + 1);
+        for ix in 0..=ws {
+            let u = ix as f32 / ws as f32;
+            let (phi, theta) = (u * TAU, v * PI);
+            let p = [
+                -radius * phi.cos() * theta.sin(),
+                radius * theta.cos(),
+                radius * phi.sin() * theta.sin(),
+            ];
+            let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+            row.push(mesh.positions.len() as u32);
+            mesh.positions.push(p);
+            mesh.normals.push(if len > 0.0 {
+                [p[0] / len, p[1] / len, p[2] / len]
+            } else {
+                [0.0, 0.0, 0.0]
+            });
+            mesh.uvs.push([u + u_offset, 1.0 - v]);
+        }
+        grid.push(row);
+    }
+    for iy in 0..hs {
+        for ix in 0..ws {
+            let (a, b, c, d) = (
+                grid[iy][ix + 1],
+                grid[iy][ix],
+                grid[iy + 1][ix],
+                grid[iy + 1][ix + 1],
+            );
+            if iy != 0 {
+                mesh.indices.extend([a, b, d]);
+            }
+            if iy != hs - 1 {
+                mesh.indices.extend([b, c, d]);
+            }
+        }
+    }
+    Ok(mesh)
+}
+
+/// three.js `CylinderGeometry(radiusTop, radiusBottom, height, radialSegments)` with one height segment and both caps
+/// (a cap of zero radius is skipped, so a zero top radius is three's `ConeGeometry`).
 pub fn cylinder(
     radius_top: f32,
     radius_bottom: f32,
     height: f32,
-    count: usize,
+    radial_segments: usize,
 ) -> Result<MeshData, GeometryError> {
     finite_positive(&[(height, "height")])?;
     for (value, name) in [(radius_top, "radiusTop"), (radius_bottom, "radiusBottom")] {
@@ -164,106 +136,245 @@ pub fn cylinder(
             "a cylinder needs a radius above zero at one end".into(),
         ));
     }
-    let h = height * 0.5;
-    Ok(lathe(
-        &[(radius_bottom, -h), (radius_top, h)],
-        count,
-        true,
-        true,
-    ))
+    let rs = radial_segments.max(3);
+    let half = height * 0.5;
+    let slope = (radius_bottom - radius_top) / height;
+    let mut mesh = MeshData::default();
+    let mut rows = Vec::new();
+    for y in 0..=1 {
+        let v = y as f32;
+        let radius = v * (radius_bottom - radius_top) + radius_top;
+        let mut row = Vec::new();
+        for x in 0..=rs {
+            let u = x as f32 / rs as f32;
+            let (sin, cos) = (u * TAU).sin_cos();
+            let n = [sin, slope, cos];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            row.push(mesh.positions.len() as u32);
+            mesh.positions
+                .push([radius * sin, -v * height + half, radius * cos]);
+            mesh.normals.push([n[0] / len, n[1] / len, n[2] / len]);
+            mesh.uvs.push([u, 1.0 - v]);
+        }
+        rows.push(row);
+    }
+    for x in 0..rs {
+        let (a, b, c, d) = (rows[0][x], rows[1][x], rows[1][x + 1], rows[0][x + 1]);
+        mesh.indices.extend([a, b, d, b, c, d]);
+    }
+    for top in [true, false] {
+        let radius = if top { radius_top } else { radius_bottom };
+        if radius <= 0.0 {
+            continue;
+        }
+        let sign = if top { 1.0 } else { -1.0 };
+        let center_start = mesh.positions.len() as u32;
+        for _ in 1..=rs {
+            mesh.positions.push([0.0, half * sign, 0.0]);
+            mesh.normals.push([0.0, sign, 0.0]);
+            mesh.uvs.push([0.5, 0.5]);
+        }
+        let center_end = mesh.positions.len() as u32;
+        for x in 0..=rs {
+            let (sin, cos) = (x as f32 / rs as f32 * TAU).sin_cos();
+            mesh.positions
+                .push([radius * sin, half * sign, radius * cos]);
+            mesh.normals.push([0.0, sign, 0.0]);
+            mesh.uvs.push([cos * 0.5 + 0.5, sin * 0.5 * sign + 0.5]);
+        }
+        for x in 0..rs as u32 {
+            let (c, i) = (center_start + x, center_end + x);
+            if top {
+                mesh.indices.extend([i, i + 1, c]);
+            } else {
+                mesh.indices.extend([i + 1, i, c]);
+            }
+        }
+    }
+    Ok(mesh)
 }
 
-/// A cylinder of `length` between two hemispheres of `radius`, centered on the origin.
-pub fn capsule(radius: f32, length: f32, count: usize) -> Result<MeshData, GeometryError> {
+/// three.js `LatheGeometry(points, segments)`: `points` are (x, y) in the XY plane, revolved around +Y.
+fn lathe(points: &[[f32; 2]], segments: usize) -> MeshData {
+    let mut normals0 = Vec::with_capacity(points.len());
+    let mut prev = [0.0f32; 2];
+    for j in 0..points.len() {
+        if j == points.len() - 1 {
+            normals0.push(prev);
+            continue;
+        }
+        let (dx, dy) = (
+            points[j + 1][0] - points[j][0],
+            points[j + 1][1] - points[j][1],
+        );
+        let current = [dy, -dx];
+        let mut n = current;
+        if j > 0 {
+            n = [n[0] + prev[0], n[1] + prev[1]];
+        }
+        let len = (n[0] * n[0] + n[1] * n[1]).sqrt();
+        normals0.push(if len > 0.0 {
+            [n[0] / len, n[1] / len]
+        } else {
+            n
+        });
+        prev = current;
+    }
+    let mut mesh = MeshData::default();
+    for i in 0..=segments {
+        let (sin, cos) = (i as f32 / segments as f32 * TAU).sin_cos();
+        for (j, p) in points.iter().enumerate() {
+            mesh.positions.push([p[0] * sin, p[1], p[0] * cos]);
+            mesh.uvs.push([
+                i as f32 / segments as f32,
+                j as f32 / (points.len() - 1) as f32,
+            ]);
+            let n = normals0[j];
+            mesh.normals.push([n[0] * sin, n[1], n[0] * cos]);
+        }
+    }
+    let count = points.len() as u32;
+    for i in 0..segments as u32 {
+        for j in 0..count - 1 {
+            let base = j + i * count;
+            let (a, b, c, d) = (base, base + count, base + count + 1, base + 1);
+            mesh.indices.extend([a, b, d, c, d, b]);
+        }
+    }
+    mesh
+}
+
+/// The points of a three.js `EllipseCurve` arc around `center` from `start` to `end` (counter-clockwise), `divisions`
+/// segments.
+fn arc_points(
+    center: [f32; 2],
+    radius: f32,
+    start: f32,
+    end: f32,
+    divisions: usize,
+) -> Vec<[f32; 2]> {
+    let mut delta = end - start;
+    while delta < 0.0 {
+        delta += TAU;
+    }
+    while delta > TAU {
+        delta -= TAU;
+    }
+    if delta < f32::EPSILON {
+        delta = TAU;
+    }
+    (0..=divisions)
+        .map(|d| {
+            let angle = start + d as f32 / divisions as f32 * delta;
+            [
+                center[0] + radius * angle.cos(),
+                center[1] + radius * angle.sin(),
+            ]
+        })
+        .collect()
+}
+
+/// three.js r160 `CapsuleGeometry(radius, length, capSegments, radialSegments)`: a lathe of two quarter arcs joined by
+/// a line, with consecutive equal points dropped as `Path.getPoints` does.
+pub fn capsule(
+    radius: f32,
+    length: f32,
+    cap_segments: usize,
+    radial_segments: usize,
+) -> Result<MeshData, GeometryError> {
     finite_positive(&[(radius, "radius")])?;
     if !length.is_finite() || length < 0.0 {
         return Err(GeometryError(format!(
             "length must be zero or more, got {length}"
         )));
     }
-    let cap_rows = (segments(count) / 2).max(2);
+    let divisions = cap_segments.max(1) * 2;
     let half = length * 0.5;
-    let mut profile = Vec::new();
-    for r in 0..=cap_rows {
-        let phi = -PI / 2.0 + r as f32 / cap_rows as f32 * (PI / 2.0);
-        profile.push((radius * phi.cos(), -half + radius * phi.sin()));
+    let mut points: Vec<[f32; 2]> = Vec::new();
+    let mut push = |p: [f32; 2]| {
+        if points.last() != Some(&p) {
+            points.push(p);
+        }
+    };
+    for p in arc_points([0.0, -half], radius, PI * 1.5, 0.0, divisions) {
+        push(p);
     }
-    for r in 0..=cap_rows {
-        let phi = r as f32 / cap_rows as f32 * (PI / 2.0);
-        profile.push((radius * phi.cos(), half + radius * phi.sin()));
+    push([radius, half]);
+    for p in arc_points([0.0, half], radius, 0.0, PI * 0.5, divisions) {
+        push(p);
     }
-    Ok(lathe(&profile, count, false, false))
+    Ok(lathe(&points, radial_segments.max(3)))
 }
 
-/// A torus around +Y: `radius` to the tube's center, `tube` the tube's radius.
-pub fn torus(radius: f32, tube: f32, count: usize) -> Result<MeshData, GeometryError> {
+/// three.js `TorusGeometry(radius, tube, radialSegments, tubularSegments)`, around +Z.
+pub fn torus(
+    radius: f32,
+    tube: f32,
+    radial_segments: usize,
+    tubular_segments: usize,
+) -> Result<MeshData, GeometryError> {
     finite_positive(&[(radius, "radius"), (tube, "tube")])?;
-    let radial = segments(count);
-    let tubular = segments(count * 2);
+    let (radial, tubular) = (radial_segments.max(3), tubular_segments.max(3));
     let mut mesh = MeshData::default();
     for j in 0..=radial {
-        let v = j as f32 / radial as f32 * TAU;
         for i in 0..=tubular {
             let u = i as f32 / tubular as f32 * TAU;
-            let center = [radius * u.cos(), 0.0, radius * u.sin()];
+            let v = j as f32 / radial as f32 * TAU;
             let p = [
                 (radius + tube * v.cos()) * u.cos(),
-                tube * v.sin(),
                 (radius + tube * v.cos()) * u.sin(),
+                tube * v.sin(),
             ];
-            let n = [
-                (p[0] - center[0]) / tube,
-                (p[1] - center[1]) / tube,
-                (p[2] - center[2]) / tube,
-            ];
+            let c = [radius * u.cos(), radius * u.sin(), 0.0];
+            let n = [p[0] - c[0], p[1] - c[1], p[2] - c[2]];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
             mesh.positions.push(p);
-            mesh.normals.push(n);
+            mesh.normals.push([n[0] / len, n[1] / len, n[2] / len]);
             mesh.uvs
                 .push([i as f32 / tubular as f32, j as f32 / radial as f32]);
         }
     }
-    let stride = tubular as u32 + 1;
-    for j in 0..radial as u32 {
-        for i in 0..tubular as u32 {
-            let a = j * stride + i;
-            let b = a + 1;
-            let c = a + stride;
-            let d = c + 1;
-            mesh.indices.extend([a, c, d, a, d, b]);
+    let row = tubular as u32 + 1;
+    for j in 1..=radial as u32 {
+        for i in 1..=tubular as u32 {
+            let a = row * j + i - 1;
+            let b = row * (j - 1) + i - 1;
+            let c = row * (j - 1) + i;
+            let d = row * j + i;
+            mesh.indices.extend([a, b, d, b, c, d]);
         }
     }
     Ok(mesh)
 }
 
-/// A plane in XZ facing +Y.
-pub fn plane(width: f32, depth: f32) -> Result<MeshData, GeometryError> {
-    finite_positive(&[(width, "width"), (depth, "depth")])?;
-    let (x, z) = (width * 0.5, depth * 0.5);
+/// three.js `PlaneGeometry(width, height)`: in XY, facing +Z.
+pub fn plane(width: f32, height: f32) -> Result<MeshData, GeometryError> {
+    finite_positive(&[(width, "width"), (height, "height")])?;
+    let (x, y) = (width * 0.5, height * 0.5);
     Ok(MeshData {
-        positions: vec![[-x, 0.0, z], [x, 0.0, z], [x, 0.0, -z], [-x, 0.0, -z]],
-        normals: vec![[0.0, 1.0, 0.0]; 4],
-        uvs: vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
-        indices: vec![0, 1, 2, 0, 2, 3],
+        positions: vec![[-x, y, 0.0], [x, y, 0.0], [-x, -y, 0.0], [x, -y, 0.0]],
+        normals: vec![[0.0, 0.0, 1.0]; 4],
+        uvs: vec![[0.0, 1.0], [1.0, 1.0], [0.0, 0.0], [1.0, 0.0]],
+        indices: vec![0, 2, 1, 2, 3, 1],
     })
 }
 
-/// A disc in XZ facing +Y.
-pub fn circle(radius: f32, count: usize) -> Result<MeshData, GeometryError> {
+/// three.js `CircleGeometry(radius, segments)`: in XY, facing +Z.
+pub fn circle(radius: f32, segments: usize) -> Result<MeshData, GeometryError> {
     finite_positive(&[(radius, "radius")])?;
-    let count = segments(count);
+    let count = segments.max(3);
     let mut mesh = MeshData::default();
     mesh.positions.push([0.0, 0.0, 0.0]);
-    mesh.normals.push([0.0, 1.0, 0.0]);
+    mesh.normals.push([0.0, 0.0, 1.0]);
     mesh.uvs.push([0.5, 0.5]);
     for s in 0..=count {
-        let angle = s as f32 / count as f32 * TAU;
-        let (sin, cos) = angle.sin_cos();
-        mesh.positions.push([radius * cos, 0.0, -radius * sin]);
-        mesh.normals.push([0.0, 1.0, 0.0]);
-        mesh.uvs.push([0.5 + 0.5 * cos, 0.5 + 0.5 * sin]);
+        let (sin, cos) = (s as f32 / count as f32 * TAU).sin_cos();
+        mesh.positions.push([radius * cos, radius * sin, 0.0]);
+        mesh.normals.push([0.0, 0.0, 1.0]);
+        mesh.uvs.push([(cos + 1.0) / 2.0, (sin + 1.0) / 2.0]);
     }
-    for s in 0..count as u32 {
-        mesh.indices.extend([0, s + 1, s + 2]);
+    for i in 1..=count as u32 {
+        mesh.indices.extend([i, i + 1, 0]);
     }
     Ok(mesh)
 }
@@ -337,6 +448,50 @@ pub fn polyhedron(
 mod tests {
     use super::*;
 
+    #[test]
+    fn counts_match_three() {
+        // three r160: BoxGeometry 24/36, SphereGeometry(1,16,16) 289 vertices and 16*16*6-2*16*3 indices,
+        // CylinderGeometry(.5,1,2,16) 34 + 2*(16+17) vertices, CapsuleGeometry(.5,1,8,16) 17*(2*16+1+... ) per lathe rule
+        assert_eq!(
+            (
+                cuboid(1.0, 1.0, 1.0).unwrap().positions.len(),
+                cuboid(1.0, 1.0, 1.0).unwrap().indices.len()
+            ),
+            (24, 36)
+        );
+        let s = sphere(1.0, 16, 16).unwrap();
+        assert_eq!(
+            (s.positions.len(), s.indices.len()),
+            (17 * 17, 16 * 16 * 6 - 2 * 16 * 3)
+        );
+        let c = cylinder(0.5, 1.0, 2.0, 16).unwrap();
+        assert_eq!(c.positions.len(), 2 * 17 + 2 * (16 + 17));
+        let cone = cylinder(0.0, 1.0, 2.0, 16).unwrap();
+        assert_eq!(cone.positions.len(), 2 * 17 + (16 + 17));
+        let cap = capsule(0.5, 1.0, 4, 8).unwrap();
+        // two arcs of 8 divisions (9 points each) and the joining line, with the shared ends dropped: 9 + 9 points
+        assert_eq!(cap.positions.len(), 9 * 18);
+        let t = torus(1.0, 0.25, 8, 16).unwrap();
+        assert_eq!((t.positions.len(), t.indices.len()), (9 * 17, 8 * 16 * 6));
+        assert_eq!(circle(1.0, 16).unwrap().positions.len(), 18);
+    }
+
+    #[test]
+    fn a_sphere_vertex_sits_where_three_puts_it() {
+        let s = sphere(2.0, 4, 2).unwrap();
+        // iy = 1 (equator), ix = 1: phi = pi/2 -> x = -2 cos(pi/2) = 0, z = 2 sin(pi/2) = 2
+        let p = s.positions[5 + 1];
+        assert!(
+            p[0].abs() < 1e-5 && p[1].abs() < 1e-5 && (p[2] - 2.0).abs() < 1e-5,
+            "{p:?}"
+        );
+        assert_eq!(
+            s.uvs[0],
+            [0.125, 1.0],
+            "the pole's u is offset by half a segment"
+        );
+    }
+
     fn outward(mesh: &MeshData) -> bool {
         mesh.indices.chunks(3).all(|t| {
             let [a, b, c] = [t[0], t[1], t[2]].map(|i| mesh.positions[i as usize]);
@@ -356,11 +511,11 @@ mod tests {
     fn every_primitive_winds_counter_clockwise_toward_its_normals() {
         for (name, mesh) in [
             ("box", cuboid(1.0, 2.0, 3.0).unwrap()),
-            ("sphere", sphere(1.0, 16).unwrap()),
+            ("sphere", sphere(1.0, 16, 16).unwrap()),
             ("cylinder", cylinder(0.5, 1.0, 2.0, 16).unwrap()),
             ("cone", cylinder(0.0, 1.0, 2.0, 16).unwrap()),
-            ("capsule", capsule(0.5, 1.0, 16).unwrap()),
-            ("torus", torus(1.0, 0.25, 16).unwrap()),
+            ("capsule", capsule(0.5, 1.0, 8, 16).unwrap()),
+            ("torus", torus(1.0, 0.25, 8, 16).unwrap()),
             ("plane", plane(2.0, 2.0).unwrap()),
             ("circle", circle(1.0, 16).unwrap()),
         ] {
@@ -379,7 +534,7 @@ mod tests {
     #[test]
     fn control_a_non_positive_size_is_refused() {
         assert!(cuboid(0.0, 1.0, 1.0).is_err());
-        assert!(sphere(-1.0, 8).is_err());
+        assert!(sphere(-1.0, 8, 8).is_err());
         assert!(cylinder(0.0, 0.0, 1.0, 8).is_err());
     }
 
