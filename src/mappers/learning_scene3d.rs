@@ -1527,7 +1527,13 @@ fn inert(v: &Value) -> bool {
     }
 }
 
+/// A list item (`bodies[0]`, `nodes[2]`, …) is a row of the program's data: the fields the pattern draws are read and
+/// a row's own other fields (`mass`, `period`, …) are left alone, as three's builders leave them; the pattern's own props
+/// are checked strictly.
 fn check_keys(f: &Fields, allowed: &[&str], path: &str) -> Result<(), CanvasSceneError> {
+    if path.ends_with(']') {
+        return Ok(());
+    }
     match f.keys().find(|key| !allowed.contains(&key.as_str())) {
         Some(key) => Err(bad(&join(path, key), "not a declared prop")),
         None => Ok(()),
@@ -1722,10 +1728,13 @@ mod tests {
             &json!({"type": "physics-canvas", "mode": "3d", "bogus": 1}),
         ));
         assert!(unknown.starts_with("physics-canvas.bogus:"), "{unknown}");
-        let item = err(learning_canvas_node_3d(&json!({
-            "type": "physics-canvas", "mode": "3d", "bodies": [{"x": 0, "y": 0, "spin": 1}],
-        })));
-        assert!(item.starts_with("physics-canvas.bodies[0].spin:"), "{item}");
+        assert!(
+            learning_canvas_node_3d(&json!({
+                "type": "physics-canvas", "mode": "3d", "bodies": [{"x": 0, "y": 0, "mass": 5}],
+            }))
+            .is_ok(),
+            "a body row's own fields (mass) are the row's, not props"
+        );
         let flat = err(learning_canvas_node_3d(&json!({
             "type": "physics-canvas", "mode": "3d", "sceneObjects": [{"kind": "ground"}],
         })));

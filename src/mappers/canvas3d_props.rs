@@ -583,7 +583,7 @@ fn css(v: &Value, field: &str) -> Result<[f32; 4], CanvasSceneError> {
     let s = v
         .as_str()
         .ok_or_else(|| bad(field, "must be a CSS color string"))?;
-    parse_css_color(s).ok_or_else(|| bad(field, format!("`{s}` is not #hex, rgb() or rgba()")))
+    parse_css_color(s).ok_or_else(|| bad(field, format!("`{s}` is not a CSS color")))
 }
 
 #[cfg(test)]

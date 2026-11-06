@@ -661,7 +661,8 @@ fn camera(fields: Option<&Fields>, b: &Bounds, cell: f64) -> Result<Camera, Canv
             }
             None => lifted,
         };
-        (center + turned / zoom.unwrap_or(1.0), center)
+        // three's follow and chase offsets are fixed; zoom frames the other modes (G-ORBITAL-GAME-RENDERER-011)
+        (center + turned, center)
     } else {
         let size = (span_x * cell).max(span_z * cell).max(4.0);
         let d = size / zoom.unwrap_or(1.0);
@@ -934,21 +935,6 @@ const SPRITE_KEYS: &[&str] = &[
     "rotation",
     "opacity",
     "shadow",
-];
-
-const ASSET_KEYS: &[&str] = &[
-    "url",
-    "role",
-    "category",
-    "animations",
-    "style",
-    "variant",
-    "dimension",
-    "aspect",
-    "atlas",
-    "sprite",
-    "name",
-    "thumbnailUrl",
 ];
 
 const SKINNED_MESH_KEYS: &[&str] = &[
@@ -1612,9 +1598,8 @@ impl Walk<'_> {
         check_keys(f, SPRITE_KEYS, path)?;
         let asset_path = join(path, "asset");
         let asset = opt_object(f, "asset", path)?;
-        if let Some(a) = asset {
-            check_keys(a, ASSET_KEYS, &asset_path)?;
-        }
+        // an asset is a record of the program's art data: its declared fields are read, a row's own extras are its own
+
         let url = match asset {
             Some(a) => opt_str(a, "url", &asset_path)?.filter(|u| !u.is_empty()),
             None => None,
@@ -2518,13 +2503,18 @@ impl Walk<'_> {
                         num("height")?.unwrap_or(1.0) * cell,
                     )
                 };
-                let body = geometry::plane(w as f32, h as f32)
-                    .map_err(|e| bad(path, format!("{shape}: {}", e.0)))?;
-                let edge = match (fill, stroke) {
-                    (Some(_), Some(_)) => Some(outline_of(rect_points(w, h))?),
-                    _ => None,
-                };
-                (Some(body), edge)
+                // a zero-wide rect is three's degenerate PlaneGeometry: nothing drawn, no error
+                if w == 0.0 || h == 0.0 {
+                    (None, None)
+                } else {
+                    let body = geometry::plane(w as f32, h as f32)
+                        .map_err(|e| bad(path, format!("{shape}: {}", e.0)))?;
+                    let edge = match (fill, stroke) {
+                        (Some(_), Some(_)) => Some(outline_of(rect_points(w, h))?),
+                        _ => None,
+                    };
+                    (Some(body), edge)
+                }
             }
             "ellipse" => {
                 let rx = num("radiusX")?.unwrap_or(0.4);
@@ -3366,7 +3356,9 @@ fn css(v: &Value, field: &str) -> Result<[f32; 4], CanvasSceneError> {
     parse_css_color(s).ok_or_else(|| {
         bad(
             field,
-            format!("`{s}` is not #hex, rgb() or rgba() (theme tones and var() resolve only in the web host)"),
+            format!(
+                "`{s}` is not a CSS color (theme tones and var() resolve only in the web host)"
+            ),
         )
     })
 }

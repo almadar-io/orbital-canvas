@@ -1487,7 +1487,12 @@ fn push_shape_stroke(points: &[Vec2], stroke: Option<Stroke>, out: &mut Vec<Draw
 
 /// Background image: atlas slices cover the viewport; whole images tile at
 /// native pixel size with the camera phase, as in the existing web painter.
-pub(crate) fn background_sprites(bg: &Value, width: f32, height: f32, cam: (f32, f32)) -> Vec<DrawCommand> {
+pub(crate) fn background_sprites(
+    bg: &Value,
+    width: f32,
+    height: f32,
+    cam: (f32, f32),
+) -> Vec<DrawCommand> {
     let url = match bg {
         Value::String(s) => s.as_str(),
         Value::Object(_) => match bg.get("url").and_then(Value::as_str) {
@@ -1616,19 +1621,22 @@ pub(crate) fn parse_css_color(s: &str) -> Option<[f32; 4]> {
             _ => None,
         };
     }
-    let inner = s
+    let rgb = s
         .strip_prefix("rgba(")
         .or_else(|| s.strip_prefix("rgb("))
-        .and_then(|r| r.strip_suffix(')'))?;
-    let parts: Vec<f32> = inner
-        .split(',')
-        .map(|p| p.trim().parse::<f32>())
-        .collect::<Result<_, _>>()
-        .ok()?;
-    match parts.as_slice() {
-        [r, g, b] => Some([r / 255.0, g / 255.0, b / 255.0, 1.0]),
-        [r, g, b, a] => Some([r / 255.0, g / 255.0, b / 255.0, *a]),
-        _ => None,
+        .and_then(|r| r.strip_suffix(')'))
+        .and_then(|inner| {
+            inner
+                .split(',')
+                .map(|p| p.trim().parse::<f32>())
+                .collect::<Result<Vec<f32>, _>>()
+                .ok()
+        });
+    match rgb.as_deref() {
+        Some([r, g, b]) => Some([r / 255.0, g / 255.0, b / 255.0, 1.0]),
+        Some([r, g, b, a]) => Some([r / 255.0, g / 255.0, b / 255.0, *a]),
+        // every other CSS color the browser paints: named colors, `transparent`, hsl(), hwb(), space-separated rgb()
+        _ => csscolorparser::parse(s).ok().map(|c| [c.r, c.g, c.b, c.a]),
     }
 }
 
@@ -1666,7 +1674,23 @@ mod tests {
             [1.0, 0.0, 0.0, 1.0]
         );
         assert_eq!(parse_css_color("#ff000080").unwrap()[3], 128.0 / 255.0);
-        assert!(parse_css_color("rebeccapurple").is_none());
+        let purple = parse_css_color("rebeccapurple").unwrap();
+        assert_eq!(
+            purple,
+            [
+                0x66 as f32 / 255.0,
+                0x33 as f32 / 255.0,
+                0x99 as f32 / 255.0,
+                1.0
+            ],
+            "named colors, as browsers paint them"
+        );
+        assert_eq!(parse_css_color("transparent").unwrap()[3], 0.0);
+        assert!(
+            parse_css_color("var(--tone)").is_none(),
+            "control: a theme variable is the web host's to resolve"
+        );
+        assert!(parse_css_color("not a color").is_none());
     }
 
     #[test]

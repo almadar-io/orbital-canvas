@@ -7,7 +7,11 @@ Every open gap this repo owns lives here. This file is the source of truth; the 
 - **Codes:** new gaps use this repo's prefix `G-ORBITAL-GAME-RENDERER-`. Take the "Next code" below, then bump it in the same edit. Codes are never reused or renamed.
 - **Close by deleting.** Remove the entry in the same commit as the fix.
 
-Next code: `G-ORBITAL-GAME-RENDERER-010`
+Next code: `G-ORBITAL-GAME-RENDERER-012`
+
+- **G-ORBITAL-GAME-RENDERER-011** [owner-decision] — `camera.zoom` on a `follow`/`chase` camera: three's GameCamera3D ignores it (fixed offsets [0,12,14] / [0,4,-7]), and the racing and toy-track boards set it, so giving it a meaning (dolly the offset) changed how those boards look (P-025 parity run, 2026-11-06). orbital-canvas keeps three's fixed offsets for now; decide whether zoom should dolly a following camera, then retune the boards' `scale`. Rung: (1) the pattern's declared meaning. Root cause: one-off.
+
+- **G-ORBITAL-GAME-RENDERER-010** [mechanical] — 3D text differs from drei's `<Text>` in its face and metrics: orbital-canvas rasterizes the bundled DejaVu face (2D text stack) where troika drew Roboto as signed-distance-field text, so glyph shapes differ and a label's vertical middle sits about 0.1 unit off (seen in the P-025 parity run, 2026-11-06: minigolf's `Ball` label ~20 px higher). Bundle Roboto for 3D labels and anchor the middle as troika does (its line box). Rung: (3) the paired capture. Root cause: one-off.
 
 - **G-ORBITAL-GAME-RENDERER-009** [mechanical] — The learning canvases' 3D modes refuse, by name, the 2D-only props three also skipped in 3D: physics `particles`, `sceneObjects`, `vectors`, `angles`, `field`; biology `compartments`, `bands`, `stages`, `helix`; chemistry `containers`; and `animate:true` (`mappers/learning_scene3d.rs` `*_2D` lists, 2026-11-06). Owner ruling 2026-11-06 says every declared prop gets a real meaning: draw each in 3D (or as part of the 2D overlay where it is a panel) instead of refusing. Rung: (3) H4 on the 3D learning atoms. Root cause: one-off.
 

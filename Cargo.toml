@@ -27,6 +27,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # physics-canvas `particles.data` arrives as base64 bytes.
 base64 = "0.22"
+# Every CSS color a browser paints (named, transparent, hsl, hwb), as the web hosts accept them.
+csscolorparser = { version = "0.7", default-features = false, features = ["named-colors"] }
 thiserror = "1.0"
 anyhow = "1.0"
 tracing = "0.1"
