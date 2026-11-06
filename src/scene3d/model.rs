@@ -17,6 +17,9 @@ pub struct Scene3D {
     pub grid: Option<Grid>,
     #[serde(default)]
     pub interaction: Interaction,
+    /// Whether any drawable declares a keyframe animation, so the host keeps redrawing on its canvas clock.
+    #[serde(default)]
+    pub animated: bool,
 }
 
 /// What a host needs to turn pointer input into the scene's own events: whether the user may orbit the camera,

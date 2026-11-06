@@ -35,6 +35,7 @@ fn scene(meshes: Vec<MeshInstance>, lights: Lights, shadows: bool) -> Scene3D {
         meshes,
         grid: None,
         interaction: Interaction::default(),
+        animated: false,
     }
 }
 

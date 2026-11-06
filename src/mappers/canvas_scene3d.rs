@@ -3,6 +3,7 @@
 //! is a typed error naming the field, never a silent drop.
 
 use super::game_canvas_2d::{parse_css_color, to_drawable_nodes, CanvasSceneError};
+use crate::scene3d::animation::{self, AnimatedState, Animation, AnimationError, MATERIAL_TRACKS};
 use crate::scene3d::geometry;
 use crate::scene3d::model::{
     srgb_to_linear, srgb_to_linear_rgb, AmbientLight, Camera, DirectionalLight, Grid,
@@ -69,11 +70,43 @@ pub fn scene_from_canvas_node(
     scene_from_canvas_node_themed(node, width, height, &SceneTheme::default())
 }
 
+/// The scene at rest: every declared `animation` is left unapplied, as the three host draws before its first frame
+/// and under reduced motion. [`Scene3D::animated`] still reports it, so a host that plays motion maps with
+/// [`scene_from_canvas_node_at`] instead.
 pub fn scene_from_canvas_node_themed(
     node: &Value,
     width: f32,
     height: f32,
     theme: &SceneTheme,
+) -> Result<Scene3D, CanvasSceneError> {
+    compose(node, width, height, theme, None)
+}
+
+/// The scene with every `animation` sampled at `elapsed_ms` on the canvas clock: the three host's
+/// `clock.elapsedTime`, one clock per canvas that starts at its first frame and is never reset when the drawables
+/// change, so every mesh and group shares the phase whenever it mounted.
+pub fn scene_from_canvas_node_at(
+    node: &Value,
+    width: f32,
+    height: f32,
+    theme: &SceneTheme,
+    elapsed_ms: f64,
+) -> Result<Scene3D, CanvasSceneError> {
+    if !(elapsed_ms.is_finite() && elapsed_ms >= 0.0) {
+        return Err(bad(
+            "elapsedMs",
+            format!("{elapsed_ms} is not a time on the canvas clock (finite, at least zero)"),
+        ));
+    }
+    compose(node, width, height, theme, Some(elapsed_ms))
+}
+
+fn compose(
+    node: &Value,
+    width: f32,
+    height: f32,
+    theme: &SceneTheme,
+    elapsed_ms: Option<f64>,
 ) -> Result<Scene3D, CanvasSceneError> {
     let object = node.as_object().ok_or(CanvasSceneError::NotAnObject)?;
     let fields = object
@@ -141,6 +174,8 @@ pub fn scene_from_canvas_node_themed(
         theme,
         meshes: Vec::new(),
         pick_id: None,
+        elapsed_ms,
+        animated: false,
     };
     let place = Placement {
         cell,
@@ -174,6 +209,7 @@ pub fn scene_from_canvas_node_themed(
         meshes: walk.meshes,
         grid,
         interaction: interaction(fields, &nodes, &bounds, cell)?,
+        animated: walk.animated,
     })
 }
 
@@ -635,6 +671,12 @@ impl Placement {
         )
     }
 
+    /// An animation offset in cells on scene axes, projected like a position: `x` to X, `y` to Z, `z` to Y, all
+    /// three scaled by the cell (unlike a position's `z`).
+    fn offset(self, [x, y, z]: [f64; 3]) -> DVec3 {
+        DVec3::new(x * self.cell, z * self.cell, y * self.cell)
+    }
+
     fn inner(self) -> Self {
         Self {
             cell: self.cell,
@@ -649,6 +691,9 @@ struct Walk<'a> {
     meshes: Vec<MeshInstance>,
     /// The innermost enclosing drawable id, as three's click walks up to it.
     pick_id: Option<String>,
+    /// The canvas clock; `None` leaves animations at rest.
+    elapsed_ms: Option<f64>,
+    animated: bool,
 }
 
 const MESH_KEYS: &[&str] = &[
@@ -709,6 +754,22 @@ const MATERIAL_KEYS: &[&str] = &[
 ];
 
 impl Walk<'_> {
+    /// The node's declared `animation`, and its state on the canvas clock when there is one.
+    fn animation(
+        &mut self,
+        f: &Fields,
+        path: &str,
+    ) -> Result<Option<(Animation, Option<AnimatedState>)>, CanvasSceneError> {
+        let Some(value) = present(f, "animation") else {
+            return Ok(None);
+        };
+        let declared =
+            Animation::parse(value, &join(path, "animation")).map_err(animation_error)?;
+        self.animated = true;
+        let state = self.elapsed_ms.map(|t| animation::sample(&declared, t));
+        Ok(Some((declared, state)))
+    }
+
     fn drawable(
         &mut self,
         node: &Value,
@@ -750,7 +811,7 @@ impl Walk<'_> {
         opacity: f64,
     ) -> Result<(), CanvasSceneError> {
         check_keys(f, GROUP_KEYS, path)?;
-        for key in ["bone", "animation", "clip"] {
+        for key in ["bone", "clip"] {
             if present(f, key).is_some() {
                 return Err(undrawn(&join(path, key), STEP_PARITY));
             }
@@ -771,9 +832,30 @@ impl Walk<'_> {
             ));
         }
         let rotation = rotation.unwrap_or([0.0, -rotate.unwrap_or(0.0), 0.0]);
+        let animated = self.animation(f, path)?;
+        if let Some((declared, _)) = &animated {
+            // `Group3D` animates the transform alone; a material or opacity track belongs on a leaf mesh.
+            for track in MATERIAL_TRACKS {
+                if let Some((i, _)) = declared.values(track).first() {
+                    return Err(bad(
+                        &format!("{path}.animation.keyframes[{i}].{track}"),
+                        "a group animates only its transform (the three host ignores it)",
+                    ));
+                }
+            }
+        }
+        let state = animated.and_then(|(_, state)| state);
+        let (offset, delta, scale) = match &state {
+            Some(s) => (place.offset(s.offset), s.rotate, scale * s.scale),
+            None => (DVec3::ZERO, [0.0; 3], scale),
+        };
         let matrix = parent
-            * DMat4::from_translation(world)
-            * euler_xyz(rotation)
+            * DMat4::from_translation(world + offset)
+            * euler_xyz([
+                rotation[0] + delta[0],
+                rotation[1] + delta[1],
+                rotation[2] + delta[2],
+            ])
             * DMat4::from_scale(DVec3::splat(scale));
         let opacity = opt_number(f, "opacity", path)?.unwrap_or(1.0) * opacity;
         let items = present(f, "items").ok_or_else(|| bad(&join(path, "items"), "is required"))?;
@@ -802,7 +884,7 @@ impl Walk<'_> {
         group_opacity: f64,
     ) -> Result<(), CanvasSceneError> {
         check_keys(f, MESH_KEYS, path)?;
-        for key in ["skin", "outline", "animation"] {
+        for key in ["skin", "outline"] {
             if present(f, key).is_some() {
                 return Err(undrawn(&join(path, key), STEP_PARITY));
             }
@@ -923,13 +1005,20 @@ impl Walk<'_> {
             .map(|v| triple(v, &join(path, "rotation")))
             .transpose()?
             .unwrap_or([0.0; 3]);
+        let animated = self.animation(f, path)?;
+        let state = animated.as_ref().and_then(|(_, state)| state.as_ref());
+        let [ax, ay, az] = state.map_or([0.0; 3], |s| s.rotate);
         // three's GROUND_ROTATION lays plane and circle flat; it adds to the authored Euler angles.
         let oriented = match shape {
-            "plane" | "circle" => euler_xyz([-FRAC_PI_2 + rx, ry, rz]),
-            _ => euler_xyz([rx, ry, rz]),
+            "plane" | "circle" => euler_xyz([-FRAC_PI_2 + rx + ax, ry + ay, rz + az]),
+            _ => euler_xyz([rx + ax, ry + ay, rz + az]),
         };
+        // `Mesh3D` moves and scales its outer group, so the scale also carries the pivot lift.
+        let (offset, scale) =
+            state.map_or((DVec3::ZERO, 1.0), |s| (place.offset(s.offset), s.scale));
         let transform = parent
-            * DMat4::from_translation(world)
+            * DMat4::from_translation(world + offset)
+            * DMat4::from_scale(DVec3::splat(scale))
             * DMat4::from_translation(DVec3::new(0.0, lift, 0.0))
             * oriented;
 
@@ -938,14 +1027,60 @@ impl Walk<'_> {
             Some(m) => opt_number(m, "opacity", &join(path, "material"))?.unwrap_or(1.0),
             None => 1.0,
         };
-        let opacity =
-            opt_number(f, "opacity", path)?.unwrap_or(1.0) * material_opacity * group_opacity;
-        let material = material(
+        let node_opacity = opt_number(f, "opacity", path)?;
+        let opacity = state
+            .and_then(|s| s.opacity)
+            .or(node_opacity)
+            .unwrap_or(1.0)
+            * material_opacity
+            * group_opacity;
+        let mut material = material(
             material_fields,
             &join(path, "material"),
             opacity,
             self.theme,
         )?;
+        if let Some((declared, _)) = &animated {
+            let anim_path = join(path, "animation");
+            animated_colors(declared, &anim_path)?;
+            let base_emissive = material_fields.is_some_and(|m| present(m, "emissive").is_some());
+            for track in ["emissive", "emissiveIntensity"] {
+                let Some((i, _)) = declared.values(track).first().copied() else {
+                    continue;
+                };
+                let field = format!("{anim_path}.keyframes[{i}].{track}");
+                if material.kind == MaterialKind::Basic {
+                    return Err(bad(
+                        &field,
+                        "material kind `basic` has no emissive (the three host ignores it)",
+                    ));
+                }
+                if track == "emissiveIntensity" && !base_emissive && !declared.declares("emissive")
+                {
+                    return Err(bad(
+                        &field,
+                        "has no effect without material.emissive or an emissive track (the three host ignores it)",
+                    ));
+                }
+            }
+        }
+        if let Some(s) = state {
+            if let Some(color) = &s.color {
+                material.color = rgb(
+                    &Value::String(color.clone()),
+                    &join(path, "animation.color"),
+                )?;
+            }
+            if let Some(emissive) = &s.emissive {
+                material.emissive = rgb(
+                    &Value::String(emissive.clone()),
+                    &join(path, "animation.emissive"),
+                )?;
+            }
+            if let Some(intensity) = s.emissive_intensity {
+                material.emissive_intensity = intensity as f32;
+            }
+        }
         self.meshes.push(MeshInstance {
             mesh,
             transform: transform.as_mat4().to_cols_array(),
@@ -1161,6 +1296,20 @@ fn material(
     })
 }
 
+/// Every keyframe colour parses as the static colours do, so a bad one is refused whatever the clock reads.
+fn animated_colors(declared: &Animation, path: &str) -> Result<(), CanvasSceneError> {
+    for track in ["color", "emissive"] {
+        for (i, value) in declared.values(track) {
+            rgb(value, &format!("{path}.keyframes[{i}].{track}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn animation_error(e: AnimationError) -> CanvasSceneError {
+    bad(&e.field, e.why)
+}
+
 fn kind_name(kind: MaterialKind) -> &'static str {
     match kind {
         MaterialKind::Basic => "basic",
@@ -1371,6 +1520,14 @@ mod tests {
             canvas[key] = value.clone();
         }
         scene_from_canvas_node(&canvas, 800.0, 600.0)
+    }
+
+    fn scene_at(props: Value, elapsed_ms: f64) -> Result<Scene3D, CanvasSceneError> {
+        let mut canvas = json!({"type": "canvas", "mode": "3d", "showGrid": false});
+        for (key, value) in props.as_object().unwrap() {
+            canvas[key] = value.clone();
+        }
+        scene_from_canvas_node_at(&canvas, 800.0, 600.0, &SceneTheme::default(), elapsed_ms)
     }
 
     fn message(result: Result<Scene3D, CanvasSceneError>) -> String {
@@ -1682,5 +1839,150 @@ mod tests {
             "{ignored}"
         );
         assert!(scene(json!({"keyMap": {"KeyW": "UP"}, "tileClickEvent": "TILE", "camera": {"controls": false}})).is_ok());
+    }
+
+    fn pulsing_box(animation: Value) -> Value {
+        json!({"drawables": [{
+            "type": "draw-mesh",
+            "position": {"x": 0, "y": 0},
+            "opacity": 0.9,
+            "material": {"color": "#ffffff", "emissive": "#000000"},
+            "animation": animation
+        }]})
+    }
+
+    fn pulse() -> Value {
+        json!({
+            "durationMs": 1000,
+            "keyframes": [
+                {"at": 0, "offsetX": 0, "offsetY": 0, "offsetZ": 0, "scale": 1, "opacity": 1,
+                 "emissive": "#ff0000", "emissiveIntensity": 0},
+                {"at": 1, "offsetX": 2, "offsetY": 4, "offsetZ": 1, "scale": 3, "opacity": 0.5,
+                 "emissive": "#00ff00", "emissiveIntensity": 2}
+            ]
+        })
+    }
+
+    #[test]
+    fn a_mesh_animation_moves_scales_fades_and_glows_at_the_canvas_clock() {
+        let s = scene_at(pulsing_box(pulse()), 500.0).unwrap();
+        assert!(s.animated);
+        let mesh = &s.meshes[0];
+        let t = mesh.transform;
+        // offset (1, 2, 0.5) cells → world (1, 0.5, 2); the ×2 scale also doubles the 0.5 pivot lift
+        close([t[12], t[13], t[14]], [1.0, 1.5, 2.0]);
+        close([t[0], t[5], t[10]], [2.0, 2.0, 2.0]);
+        assert!(
+            (mesh.material.opacity - 0.75).abs() < 1e-6,
+            "the track replaces node opacity"
+        );
+        assert!(mesh.material.is_transparent());
+        close(mesh.material.emissive, [1.0, 0.0, 0.0]);
+        assert!((mesh.material.emissive_intensity - 1.0).abs() < 1e-6);
+        close(mesh.material.color, [1.0, 1.0, 1.0]);
+
+        let looped = scene_at(pulsing_box(pulse()), 1500.0).unwrap();
+        assert_eq!(looped.meshes, s.meshes);
+    }
+
+    #[test]
+    fn a_mesh_rotation_track_adds_to_the_authored_and_ground_rotation() {
+        let spin = json!({"durationMs": 1000, "keyframes": [
+            {"at": 0, "rotateX": 0, "color": "#ff0000"},
+            {"at": 1, "rotateX": std::f64::consts::PI, "color": "#0000ff"}
+        ]});
+        let s = scene_at(json!({"drawables": [{
+            "type": "draw-mesh", "shape": "plane", "position": {"x": 0, "y": 0}, "animation": spin
+        }]}), 500.0)
+        .unwrap();
+        let t = s.meshes[0].transform;
+        // −π/2 ground rotation + π/2 from the track: the plane stands back up, facing +Z
+        close([t[8], t[9], t[10]], [0.0, 0.0, 1.0]);
+        close(s.meshes[0].material.color, [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_group_animation_carries_its_children() {
+        let s = scene_at(
+            json!({"drawables": [{
+                "type": "draw-group",
+                "position": {"x": 0, "y": 0},
+                "scale": 2,
+                "animation": {"durationMs": 1000, "keyframes": [
+                    {"at": 0, "rotateY": 0, "offsetZ": 0, "scale": 1},
+                    {"at": 1, "rotateY": std::f64::consts::PI, "offsetZ": 2, "scale": 2}
+                ]},
+                "items": [{"type": "draw-mesh", "position": {"x": 1, "y": 0}, "pivot": "center"}]
+            }]}),
+            500.0,
+        )
+        .unwrap();
+        assert!(s.animated);
+        let t = s.meshes[0].transform;
+        // yaw π/2 turns +X to −Z; scale 2 × 1.5; offsetZ 1 cell up
+        close([t[12], t[13], t[14]], [0.0, 1.0, -3.0]);
+        close([t[1], t[5], t[9]], [0.0, 3.0, 0.0]);
+    }
+
+    #[test]
+    fn control_no_animation_or_no_clock_is_the_unanimated_scene() {
+        let still = json!({"drawables": [{
+            "type": "draw-group", "position": {"x": 1, "y": 2}, "rotate": 0.3, "scale": 1.5, "opacity": 0.5,
+            "items": [{"type": "draw-mesh", "shape": "circle", "position": {"x": 1, "y": 0},
+                       "rotation": [0.1, 0.2, 0.3], "opacity": 0.8,
+                       "material": {"emissive": "#102030", "emissiveIntensity": 2}}]
+        }]});
+        let rest = scene(still.clone()).unwrap();
+        assert!(!rest.animated);
+        assert_eq!(scene_at(still, 1234.0).unwrap(), rest);
+
+        let at_rest = scene(pulsing_box(pulse())).unwrap();
+        assert!(at_rest.animated);
+        let mut plain = pulsing_box(Value::Null);
+        plain["drawables"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("animation");
+        let plain = scene(plain).unwrap();
+        assert_eq!(at_rest.meshes, plain.meshes);
+    }
+
+    #[test]
+    fn control_animation_tracks_three_ignores_error_by_name() {
+        let group_fade = message(scene_at(
+            json!({"drawables": [{
+                "type": "draw-group", "position": {"x": 0, "y": 0}, "items": [],
+                "animation": {"durationMs": 100, "keyframes": [{"at": 0, "scale": 1}, {"at": 1, "opacity": 0}]}
+            }]}),
+            0.0,
+        ));
+        assert_eq!(
+            group_fade,
+            "drawables[0].animation.keyframes[1].opacity: a group animates only its transform (the three host ignores it)"
+        );
+        let basic_glow = message(scene(json!({"drawables": [{
+            "type": "draw-mesh", "position": {"x": 0, "y": 0}, "material": {"kind": "basic"},
+            "animation": {"durationMs": 100, "keyframes": [{"at": 0, "emissive": "#ff0000"}]}
+        }]})));
+        assert!(
+            basic_glow.starts_with("drawables[0].animation.keyframes[0].emissive: "),
+            "{basic_glow}"
+        );
+        let dark_intensity = message(scene(json!({"drawables": [{
+            "type": "draw-mesh", "position": {"x": 0, "y": 0},
+            "animation": {"durationMs": 100, "keyframes": [{"at": 0, "emissiveIntensity": 2}]}
+        }]})));
+        assert!(
+            dark_intensity.starts_with("drawables[0].animation.keyframes[0].emissiveIntensity: "),
+            "{dark_intensity}"
+        );
+        let bad_color = message(scene(pulsing_box(json!({
+            "durationMs": 100, "keyframes": [{"at": 0, "color": "not-a-color"}]
+        }))));
+        assert!(
+            bad_color.starts_with("drawables[0].animation.keyframes[0].color: "),
+            "{bad_color}"
+        );
+        assert!(scene_at(pulsing_box(pulse()), -1.0).is_err());
     }
 }

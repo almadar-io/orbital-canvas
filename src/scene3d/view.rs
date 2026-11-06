@@ -441,6 +441,7 @@ mod tests {
                     id: "flag".into(),
                 }],
             },
+            animated: false,
         }
     }
 

@@ -30,8 +30,13 @@ fn wanted_features(adapter: &wgpu::Adapter) -> wgpu::Features {
 }
 
 fn new_instance() -> wgpu::Instance {
+    // the shared slot is WebGPU in a browser; a page without it gets a WebGL2 device per canvas instead (web3d)
+    #[cfg(target_arch = "wasm32")]
+    let backends = wgpu::Backends::BROWSER_WEBGPU;
+    #[cfg(not(target_arch = "wasm32"))]
+    let backends = wgpu::Backends::all();
     wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::all(),
+        backends,
         flags: wgpu::InstanceFlags::default(),
         memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
         backend_options: wgpu::BackendOptions::default(),

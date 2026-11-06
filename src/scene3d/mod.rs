@@ -1,6 +1,7 @@
 //! Real 3D: a retained scene ([`model`]), mesh builders ([`geometry`]) and a GPU renderer ([`render`]) whose transforms,
 //! lighting and shadows run in shaders.
 
+pub mod animation;
 pub mod geometry;
 pub mod model;
 pub mod render;
