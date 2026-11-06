@@ -609,7 +609,7 @@ impl GpuHost {
         .await?;
         let (tx, rx) = signal();
         ctx.queue.on_submitted_work_done(move || tx.send(()));
-        drive(&ctx.device)?;
+        drive(&ctx.device, &rx)?;
         rx.await
             .map_err(|_| io_error("the queue ended without finishing the work"))?;
         Ok(record([]))
@@ -673,7 +673,7 @@ impl GpuHost {
             (target, start)
         })
         .await?;
-        drive(&ctx.device)?;
+        drive(&ctx.device, &rx)?;
         rx.await
             .map_err(|_| io_error("the buffer map never answered"))?
             .map_err(|e| io_error(format!("buffer map failed: {e}")))?;

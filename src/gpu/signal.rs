@@ -40,6 +40,14 @@ impl<T> Drop for Sender<T> {
     }
 }
 
+impl<T> Receiver<T> {
+    /// A value was sent, or the sender went away: awaiting the receiver will not wait.
+    pub(super) fn settled(&self) -> bool {
+        let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        state.value.is_some() || state.closed
+    }
+}
+
 /// The sender went away without sending.
 pub(super) struct Dropped;
 
