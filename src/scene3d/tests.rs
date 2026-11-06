@@ -33,6 +33,7 @@ fn scene(meshes: Vec<MeshInstance>, lights: Lights, shadows: bool) -> Scene3D {
         shadows,
         tone_mapping: ToneMapping::None,
         meshes,
+        grid: None,
     }
 }
 
@@ -352,5 +353,93 @@ fn a_packet_draws_its_3d_scene_first_and_2d_commands_over_it() {
     assert!(
         scene[2] > 200 && scene[0] < 50,
         "the scene shows where nothing covers it: {scene:?}"
+    );
+}
+
+#[test]
+fn a_grid_draws_lines_on_the_ground_seen_from_above_and_control_not_from_below() {
+    let Some(mut r) = renderer() else { return };
+    let grid = Grid {
+        center: [0.0, 0.0, 0.0],
+        size: [20.0, 20.0],
+        cell_size: 1.0,
+        cell_thickness: 1.0,
+        cell_color: [1.0, 1.0, 1.0],
+        section_size: 5.0,
+        section_thickness: 1.5,
+        section_color: [1.0, 1.0, 1.0],
+        fade_distance: 50.0,
+        fade_strength: 1.0,
+        fade_from: 1.0,
+    };
+    let mut s = scene(Vec::new(), Lights::default(), false);
+    s.grid = Some(grid);
+    s.camera = camera([0.0, 6.0, 0.01], [0.0, 0.0, 0.0]);
+    let lit = |rgba: &[u8]| rgba.chunks(4).filter(|p| p[0] > 40).count();
+    let above = draw(&mut r, &s, 1);
+    assert!(lit(&above) > 50, "grid lines show from above");
+    s.camera = camera([0.0, -6.0, 0.01], [0.0, 0.0, 0.0]);
+    assert_eq!(
+        lit(&draw(&mut r, &s, 1)),
+        0,
+        "control: drei draws only the side facing up"
+    );
+}
+
+#[test]
+fn a_mapped_canvas_scene_renders_its_meshes_over_the_grid() {
+    let Some(mut r) = renderer() else { return };
+    let node = serde_json::json!({
+        "type": "canvas",
+        "mode": "3d",
+        "backgroundColor": "#1b1f2a",
+        "drawables": [
+            {"type": "draw-mesh", "shape": "box", "position": {"x": 0, "y": 0}, "material": {"color": "#e05a47"}},
+            {"type": "draw-mesh", "shape": "sphere", "radius": 0.6, "position": {"x": 3, "y": 1}, "material": {"color": "#4a90d9", "metalness": 0.3, "roughness": 0.4}},
+            {"type": "draw-mesh", "shape": "torus", "radius": 0.6, "tube": 0.2, "position": {"x": 1, "y": 3}, "material": {"color": "#f2c14e"}},
+            {"type": "draw-mesh", "shape": "cone", "radius": 0.5, "height": 1.4, "position": {"x": 4, "y": 4}, "material": {"color": "#5cb85c", "kind": "toon"}}
+        ]
+    });
+    let scene =
+        crate::mappers::canvas_scene3d::scene_from_canvas_node(&node, 512.0, 512.0).expect("maps");
+    let shared = crate::device::shared_device().expect("device");
+    let texture = shared.device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: 512,
+            height: 512,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let mut encoder = shared.device.create_command_encoder(&Default::default());
+    r.encode(&mut encoder, &scene, &texture, 4).expect("render");
+    let rgba = crate::renderer::copy_texture_to_rgba(
+        &shared.device,
+        &shared.queue,
+        encoder,
+        &texture,
+        512,
+        512,
+    )
+    .expect("readback");
+    if let Ok(dir) = std::env::var("SCENE3D_DUMP") {
+        image::RgbaImage::from_raw(512, 512, rgba.clone())
+            .expect("frame")
+            .save(format!("{dir}/mapped.png"))
+            .expect("png");
+    }
+    let colored = rgba
+        .chunks(4)
+        .filter(|p| p[0] as i32 - p[2] as i32 > 60)
+        .count();
+    assert!(
+        colored > 500,
+        "the red box and yellow torus show: {colored} warm pixels"
     );
 }

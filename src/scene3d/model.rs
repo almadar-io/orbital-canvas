@@ -13,6 +13,27 @@ pub struct Scene3D {
     pub shadows: bool,
     pub tone_mapping: ToneMapping,
     pub meshes: Vec<MeshInstance>,
+    /// A ground grid drawn as drei's `Grid` draws it.
+    pub grid: Option<Grid>,
+}
+
+/// drei's `Grid`: cell and section lines on the y = `center[1]` plane, faded with distance from the camera's
+/// projection onto that plane, visible from above only.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct Grid {
+    pub center: [f32; 3],
+    /// Extent along X and Z.
+    pub size: [f32; 2],
+    pub cell_size: f32,
+    pub cell_thickness: f32,
+    /// Linear RGB.
+    pub cell_color: [f32; 3],
+    pub section_size: f32,
+    pub section_thickness: f32,
+    pub section_color: [f32; 3],
+    pub fade_distance: f32,
+    pub fade_strength: f32,
+    pub fade_from: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

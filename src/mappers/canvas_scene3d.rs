@@ -5,9 +5,9 @@
 use super::game_canvas_2d::{parse_css_color, to_drawable_nodes, CanvasSceneError};
 use crate::scene3d::geometry;
 use crate::scene3d::model::{
-    srgb_to_linear, srgb_to_linear_rgb, AmbientLight, Camera, DirectionalLight, HemisphereLight,
-    Lights, Material, MaterialKind, MeshData, MeshInstance, PointLight, Projection, Scene3D,
-    ShadowSettings, Side, ToneMapping,
+    srgb_to_linear, srgb_to_linear_rgb, AmbientLight, Camera, DirectionalLight, Grid,
+    HemisphereLight, Lights, Material, MaterialKind, MeshData, MeshInstance, PointLight,
+    Projection, Scene3D, ShadowSettings, Side, ToneMapping,
 };
 use glam::{DMat4, DVec3};
 use serde_json::{Map, Value};
@@ -38,6 +38,9 @@ pub struct SceneTheme {
     pub flat: bool,
     /// `--material-outline`; above zero gives every mesh an outline.
     pub outline: f32,
+    /// The diagram tones (`grid`, `axis`, `ink`, `series-N`, …) as CSS colors; a tone the theme leaves out draws
+    /// white, which is what three keeps when the web host hands it `currentColor`.
+    pub tones: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for SceneTheme {
@@ -51,6 +54,7 @@ impl Default for SceneTheme {
             metalness: 0.0,
             flat: false,
             outline: 0.0,
+            tones: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -98,9 +102,7 @@ pub fn scene_from_canvas_node_themed(
         }
         None => 1.0,
     };
-    if opt_bool(fields, "showGrid", "canvas")?.unwrap_or(true) {
-        return Err(undrawn("canvas.showGrid", STEP_PARITY));
-    }
+    let show_grid = opt_bool(fields, "showGrid", "canvas")?.unwrap_or(true);
     if let Some(post) = opt_object(fields, "post", "canvas")? {
         check_keys(post, &["bloom", "vignette"], "canvas.post")?;
         for key in ["bloom", "vignette"] {
@@ -155,6 +157,11 @@ pub fn scene_from_canvas_node_themed(
             None => [0.0; 4],
         },
     };
+    let grid = if show_grid {
+        Some(grid(&bounds, cell, theme)?)
+    } else {
+        None
+    };
     Ok(Scene3D {
         camera,
         background,
@@ -162,6 +169,38 @@ pub fn scene_from_canvas_node_themed(
         shadows,
         tone_mapping,
         meshes: walk.meshes,
+        grid,
+    })
+}
+
+/// The host's drei `Grid`: sized to the scene bounds plus a cell on each side (at least 10), centered on them.
+fn grid(bounds: &Bounds, cell: f64, theme: &SceneTheme) -> Result<Grid, CanvasSceneError> {
+    let tone = |name: &str| -> Result<[f32; 3], CanvasSceneError> {
+        match theme.tones.get(name) {
+            Some(css) => rgb(&Value::String(css.clone()), &format!("theme tone {name}")),
+            None => Ok([1.0, 1.0, 1.0]),
+        }
+    };
+    let (span_x, span_z) = (bounds.max_x - bounds.min_x, bounds.max_z - bounds.min_z);
+    Ok(Grid {
+        center: [
+            (span_x / 2.0 * cell - cell / 2.0) as f32,
+            0.0,
+            (span_z / 2.0 * cell - cell / 2.0) as f32,
+        ],
+        size: [
+            ((span_x + 2.0) * cell).max(10.0) as f32,
+            ((span_z + 2.0) * cell).max(10.0) as f32,
+        ],
+        cell_size: 1.0,
+        cell_thickness: 1.0,
+        cell_color: tone("grid")?,
+        section_size: 5.0,
+        section_thickness: 1.5,
+        section_color: tone("axis")?,
+        fade_distance: 50.0,
+        fade_strength: 1.0,
+        fade_from: 1.0,
     })
 }
 
@@ -1562,14 +1601,14 @@ mod tests {
             outline,
             "drawables[0].outline: not yet drawn by orbital-canvas (P-025 step 4)"
         );
-        let grid = message(scene_from_canvas_node(
-            &json!({"type": "canvas", "mode": "3d"}),
-            800.0,
-            600.0,
-        ));
+        let grid = scene_from_canvas_node(&json!({"type": "canvas", "mode": "3d"}), 800.0, 600.0)
+            .unwrap()
+            .grid
+            .unwrap();
         assert_eq!(
-            grid,
-            "canvas.showGrid: not yet drawn by orbital-canvas (P-025 step 4)"
+            (grid.center, grid.size),
+            ([4.5, 0.0, 4.5], [12.0, 12.0]),
+            "the empty scene's 0..10 bounds"
         );
         let sprite = message(scene(
             json!({"drawables": [{"type": "draw-sprite", "position": {"x": 0, "y": 0}}]}),

@@ -40,6 +40,17 @@ struct ObjectUniform {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GridUniform {
+    center: [f32; 4],
+    size: [f32; 4],
+    lines: [f32; 4],
+    cell_color: [f32; 4],
+    section_color: [f32; 4],
+    camera_on_plane: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
     position: [f32; 3],
     normal: [f32; 3],
@@ -63,6 +74,12 @@ struct PipelineKey {
     samples: u32,
     side: Side,
     transparent: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct GridKey {
+    format: wgpu::TextureFormat,
+    samples: u32,
 }
 
 struct Targets {
@@ -91,6 +108,11 @@ pub struct Renderer3D {
     lit_layout: wgpu::PipelineLayout,
     shadow_pipeline: wgpu::RenderPipeline,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
+    grid_shader: wgpu::ShaderModule,
+    grid_layout: wgpu::BindGroupLayout,
+    grid_pipeline_layout: wgpu::PipelineLayout,
+    grid_pipelines: HashMap<GridKey, wgpu::RenderPipeline>,
+    grid_buffer: wgpu::Buffer,
     frame_buffer: wgpu::Buffer,
     object_buffer: wgpu::Buffer,
     object_capacity: u64,
@@ -177,7 +199,9 @@ impl Renderer3D {
     pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene3d shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("scene3d.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                concat!(include_str!("prelude.wgsl"), include_str!("lit.wgsl")).into(),
+            ),
         });
         let frame_size = std::mem::size_of::<FrameUniform>() as u64;
         let object_size = std::mem::size_of::<ObjectUniform>() as u64;
@@ -269,6 +293,28 @@ impl Renderer3D {
             multiview: None,
             cache: None,
         });
+        let grid_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("scene3d grid shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                concat!(include_str!("prelude.wgsl"), include_str!("grid.wgsl")).into(),
+            ),
+        });
+        let grid_size = std::mem::size_of::<GridUniform>() as u64;
+        let grid_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("scene3d grid"),
+            entries: &[uniform_entry(0, vertex_fragment, false, grid_size)],
+        });
+        let grid_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("scene3d grid"),
+            bind_group_layouts: &[&shadow_frame_layout, &grid_layout],
+            push_constant_ranges: &[],
+        });
+        let grid_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("scene3d grid"),
+            size: grid_size,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let frame_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scene3d frame"),
             size: frame_size,
@@ -311,6 +357,11 @@ impl Renderer3D {
             lit_layout,
             shadow_pipeline,
             pipelines: HashMap::new(),
+            grid_shader,
+            grid_layout,
+            grid_pipeline_layout,
+            grid_pipelines: HashMap::new(),
+            grid_buffer,
             frame_buffer,
             object_buffer,
             object_capacity,
@@ -365,7 +416,8 @@ impl Renderer3D {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: !key.transparent,
+                    // three keeps depthWrite on for transparent materials
+                    depth_write_enabled: true,
                     depth_compare: wgpu::CompareFunction::LessEqual,
                     stencil: Default::default(),
                     bias: Default::default(),
@@ -378,6 +430,52 @@ impl Renderer3D {
                 cache: None,
             })
         })
+    }
+
+    fn grid_pipeline(&mut self, key: GridKey) {
+        let (device, shader, layout) =
+            (&self.device, &self.grid_shader, &self.grid_pipeline_layout);
+        self.grid_pipelines.entry(key).or_insert_with(|| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("scene3d grid"),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_grid"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_grid"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: key.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                // drei draws the grid's back side, which faces up: visible from above only
+                primitive: wgpu::PrimitiveState {
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: key.samples,
+                    ..Default::default()
+                },
+                multiview: None,
+                cache: None,
+            })
+        });
     }
 
     fn mesh(&mut self, data: &MeshData) -> u64 {
@@ -779,6 +877,51 @@ impl Renderer3D {
                 transparent: draw.3,
             });
         }
+        let grid_draw = match &scene.grid {
+            Some(g) => {
+                let center = Vec3::from(g.center);
+                let eye = Vec3::from(scene.camera.eye);
+                let uniform = GridUniform {
+                    center: [center.x, center.y, center.z, 1.0],
+                    size: [g.size[0], g.size[1], g.cell_size, g.section_size],
+                    lines: [
+                        g.cell_thickness,
+                        g.section_thickness,
+                        g.fade_distance,
+                        g.fade_strength,
+                    ],
+                    cell_color: [g.cell_color[0], g.cell_color[1], g.cell_color[2], 1.0],
+                    section_color: [
+                        g.section_color[0],
+                        g.section_color[1],
+                        g.section_color[2],
+                        1.0,
+                    ],
+                    camera_on_plane: [eye.x, center.y, eye.z, g.fade_from],
+                };
+                self.queue
+                    .write_buffer(&self.grid_buffer, 0, bytemuck::bytes_of(&uniform));
+                self.grid_pipeline(GridKey { format, samples });
+                let frame_only = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("scene3d grid frame"),
+                    layout: &self.shadow_frame_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.frame_buffer.as_entire_binding(),
+                    }],
+                });
+                let params = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("scene3d grid"),
+                    layout: &self.grid_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.grid_buffer.as_entire_binding(),
+                    }],
+                });
+                Some((view_proj.project_point3(center).z, frame_only, params))
+            }
+            None => None,
+        };
         self.ensure_targets(width, height, format, samples);
         let targets = self.targets.as_ref().expect("just ensured");
         let target_view = target.create_view(&Default::default());
@@ -816,8 +959,21 @@ impl Renderer3D {
             occlusion_query_set: None,
         });
         pass.set_bind_group(0, &frame_group, &[]);
+        let mut grid_pending = grid_draw.as_ref();
         for index in order {
-            let (i, key, _, transparent, side, _, _) = &draws[index];
+            let (i, key, depth, transparent, side, _, _) = &draws[index];
+            // the grid is a transparent object: drawn among them, back to front
+            if *transparent {
+                if let Some((_, frame_only, params)) = grid_pending.filter(|(d, _, _)| *d >= *depth)
+                {
+                    pass.set_pipeline(&self.grid_pipelines[&GridKey { format, samples }]);
+                    pass.set_bind_group(0, frame_only, &[]);
+                    pass.set_bind_group(1, params, &[]);
+                    pass.draw(0..6, 0..1);
+                    pass.set_bind_group(0, &frame_group, &[]);
+                    grid_pending = None;
+                }
+            }
             let pipeline = &self.pipelines[&PipelineKey {
                 format,
                 samples,
@@ -835,6 +991,12 @@ impl Renderer3D {
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.count, 0, 0..1);
+        }
+        if let Some((_, frame_only, params)) = grid_pending {
+            pass.set_pipeline(&self.grid_pipelines[&GridKey { format, samples }]);
+            pass.set_bind_group(0, frame_only, &[]);
+            pass.set_bind_group(1, params, &[]);
+            pass.draw(0..6, 0..1);
         }
         drop(pass);
 
