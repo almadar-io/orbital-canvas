@@ -683,3 +683,27 @@ fn reads_reuse_one_staging_buffer_and_return_only_their_own_bytes() {
         "closing the device drops the kept buffer"
     );
 }
+
+#[test]
+fn a_live_buffer_resolves_for_drawing_and_control_released_or_on_another_device_it_does_not() {
+    let Some((host, device)) = open() else { return };
+    let made = buffer(&host, &device, 64, &["storage"]).expect("buffer");
+    let id = made.as_int().expect("buffer id") as u64;
+    let dev = device.as_int().expect("device id") as u64;
+    assert!(matches!(
+        super::drawable::resolve(id, dev),
+        Ok(super::drawable::DrawableGpu::Buffer { size: 64, .. })
+    ));
+    assert_eq!(
+        super::drawable::resolve(id, dev + 1_000_000).err(),
+        Some(super::drawable::DrawableGpuError::WrongDevice {
+            id,
+            device: dev + 1_000_000
+        })
+    );
+    call(&host, OsOp::GpuRelease, &[made.clone()]).expect("release");
+    assert_eq!(
+        super::drawable::resolve(id, dev).err(),
+        Some(super::drawable::DrawableGpuError::NotLive { id })
+    );
+}

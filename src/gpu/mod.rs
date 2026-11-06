@@ -10,6 +10,7 @@
 //! `width * texel bytes` that is a multiple of 256.
 
 mod create;
+pub mod drawable;
 mod io;
 mod names;
 mod signal;
@@ -22,7 +23,7 @@ use crate::device::{shared_device_async, SharedDevice};
 use orbital_core_base::gpu::GpuAnswerer;
 use orbital_core_base::os::{OsError, OsErrorKind, OsOp};
 use orbital_core_base::value::{Value, ValueMap};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
 
 pub(super) type Reply = Result<Value, OsError>;
@@ -143,8 +144,9 @@ pub(super) struct Entry {
 }
 
 struct Table {
-    next: u64,
     entries: HashMap<u64, Entry>,
+    /// Ids this host issued and has since released or closed: using one answers `closed`.
+    retired: HashSet<u64>,
 }
 
 /// One program instance's gpu objects over the process-wide device.
@@ -166,8 +168,8 @@ impl GpuHost {
     pub fn new() -> Self {
         Self {
             table: Mutex::new(Table {
-                next: 1,
                 entries: HashMap::new(),
+                retired: HashSet::new(),
             }),
             shared: Mutex::new(None),
             staging: Mutex::new(None),
@@ -205,17 +207,15 @@ impl GpuHost {
     }
 
     pub(super) fn insert(&self, device: u64, object: Object) -> u64 {
-        let mut table = self.table();
-        let id = table.next;
-        table.next += 1;
-        table.entries.insert(id, Entry { device, object });
+        let id = drawable::next_id();
+        drawable::register(id, device, &object);
+        self.table().entries.insert(id, Entry { device, object });
         id
     }
 
     pub(super) fn insert_device(&self) -> u64 {
         let mut table = self.table();
-        let id = table.next;
-        table.next += 1;
+        let id = drawable::next_id();
         table.entries.insert(
             id,
             Entry {
@@ -235,7 +235,7 @@ impl GpuHost {
     ) -> Result<(T, u64), OsError> {
         let table = self.table();
         match table.entries.get(&id) {
-            None if id < table.next => Err(closed(format!("handle {id} is closed"))),
+            None if table.retired.contains(&id) => Err(closed(format!("handle {id} is closed"))),
             None => Err(invalid(format!("no handle {id}"))),
             Some(entry) => pick(entry)
                 .map(|picked| (picked, entry.device))
@@ -291,9 +291,19 @@ impl GpuHost {
         self.fetch(device, "device", |e| {
             matches!(e.object, Object::Device).then_some(())
         })?;
-        self.table()
+        let mut table = self.table();
+        let gone: Vec<u64> = table
             .entries
-            .retain(|id, entry| *id != device && entry.device != device);
+            .iter()
+            .filter(|(id, entry)| **id == device || entry.device == device)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in gone {
+            table.entries.remove(&id);
+            table.retired.insert(id);
+            drawable::unregister(id);
+        }
+        drop(table);
         self.drop_staging();
         Ok(())
     }
@@ -301,13 +311,15 @@ impl GpuHost {
     pub(super) fn release(&self, id: u64) -> Result<(), OsError> {
         let mut table = self.table();
         match table.entries.get(&id) {
-            None if id < table.next && id > 0 => Err(closed(format!("handle {id} is closed"))),
+            None if table.retired.contains(&id) => Err(closed(format!("handle {id} is closed"))),
             None => Err(invalid(format!("no handle {id}"))),
             Some(Entry {
                 object: Object::Device,
                 ..
             }) => Err(invalid("a device is closed with gpu/device-close")),
             Some(_) => {
+                table.retired.insert(id);
+                drawable::unregister(id);
                 if let Some(Entry { object, .. }) = table.entries.remove(&id) {
                     match object {
                         Object::Buffer { buffer, .. } => buffer.destroy(),
@@ -333,7 +345,14 @@ impl GpuHost {
 
     /// Drop every object this host holds (host teardown).
     pub fn close_all(&self) {
-        self.table().entries.clear();
+        let mut table = self.table();
+        let ids: Vec<u64> = table.entries.keys().copied().collect();
+        for id in ids {
+            drawable::unregister(id);
+            table.retired.insert(id);
+        }
+        table.entries.clear();
+        drop(table);
         self.drop_staging();
     }
 
