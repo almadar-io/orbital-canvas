@@ -21,7 +21,8 @@ const STEP_PARITY: u8 = 4;
 
 /// The theme's scene axis as `canvasTheme.ts` resolves it from CSS variables. [`Default`] holds that resolver's
 /// fallbacks, which is what the three host draws under a theme that declares none of these variables.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct SceneTheme {
     /// `--surface-diagram`; `None` is transparent.
     pub ground: Option<String>,

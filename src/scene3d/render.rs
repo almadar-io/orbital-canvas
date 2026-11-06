@@ -925,11 +925,20 @@ impl Renderer3D {
         self.ensure_targets(width, height, format, samples);
         let targets = self.targets.as_ref().expect("just ensured");
         let target_view = target.create_view(&Default::default());
+        // the clear bypasses the shader, so it takes the same sRGB encode a non-sRGB target gets there, premultiplied
         let bg = scene.background;
+        let channel = |linear: f32| -> f64 {
+            let encoded = if format.is_srgb() {
+                linear
+            } else {
+                linear_to_srgb(linear)
+            };
+            (encoded * bg[3]) as f64
+        };
         let clear = wgpu::Color {
-            r: bg[0] as f64,
-            g: bg[1] as f64,
-            b: bg[2] as f64,
+            r: channel(bg[0]),
+            g: channel(bg[1]),
+            b: channel(bg[2]),
             a: bg[3] as f64,
         };
         let (view, resolve) = match &targets.color {
@@ -1005,6 +1014,15 @@ impl Renderer3D {
             .retain(|_, mesh| clock - mesh.last_used <= KEEP_FRAMES);
         self.maps.retain(|_, entry| clock - entry.1 <= KEEP_FRAMES);
         Ok(())
+    }
+}
+
+fn linear_to_srgb(c: f32) -> f32 {
+    let c = c.clamp(0.0, 1.0);
+    if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
     }
 }
 

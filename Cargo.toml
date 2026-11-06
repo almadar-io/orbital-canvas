@@ -48,7 +48,7 @@ ureq = { version = "2.9", default-features = false, features = ["json"], optiona
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Window", "Response", "Headers"] }
+web-sys = { version = "0.3", features = ["Window", "Response", "Headers", "HtmlCanvasElement"] }
 
 
 [dev-dependencies]

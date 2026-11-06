@@ -445,3 +445,53 @@ fn a_mapped_canvas_scene_renders_its_meshes_over_the_grid() {
         "the red box and yellow torus show: {colored} warm pixels"
     );
 }
+
+#[test]
+fn a_non_srgb_target_clears_to_the_authored_background_and_control_an_srgb_one_too() {
+    let Some(mut r) = renderer() else { return };
+    let mut s = scene(Vec::new(), Lights::default(), false);
+    s.background = [
+        srgb_to_linear(0x1b as f32 / 255.0),
+        srgb_to_linear(0x1f as f32 / 255.0),
+        srgb_to_linear(0x2a as f32 / 255.0),
+        1.0,
+    ];
+    let shared = crate::device::shared_device().expect("device");
+    for format in [
+        wgpu::TextureFormat::Rgba8Unorm,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+    ] {
+        let texture = shared.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let mut encoder = shared.device.create_command_encoder(&Default::default());
+        r.encode(&mut encoder, &s, &texture, 4).expect("render");
+        let rgba = crate::renderer::copy_texture_to_rgba(
+            &shared.device,
+            &shared.queue,
+            encoder,
+            &texture,
+            SIZE,
+            SIZE,
+        )
+        .expect("readback");
+        let p = pixel(&rgba, 1, 1);
+        assert!(
+            (p[0] as i32 - 0x1b).abs() <= 1
+                && (p[1] as i32 - 0x1f).abs() <= 1
+                && (p[2] as i32 - 0x2a).abs() <= 1,
+            "{format:?}: {p:?}"
+        );
+    }
+}
