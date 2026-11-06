@@ -4,9 +4,11 @@
 pub mod geometry;
 pub mod model;
 pub mod render;
+pub mod view;
 
 pub use model::*;
 pub use render::{view_projection, Render3DError, Renderer3D};
+pub use view::{Button, Pick, Scene3DView};
 
 #[cfg(test)]
 mod tests;

@@ -34,6 +34,7 @@ fn scene(meshes: Vec<MeshInstance>, lights: Lights, shadows: bool) -> Scene3D {
         tone_mapping: ToneMapping::None,
         meshes,
         grid: None,
+        interaction: Interaction::default(),
     }
 }
 
@@ -44,6 +45,7 @@ fn instance(mesh: MeshData, transform: Mat4, material: Material) -> MeshInstance
         material,
         cast_shadow: true,
         receive_shadow: true,
+        id: None,
     }
 }
 

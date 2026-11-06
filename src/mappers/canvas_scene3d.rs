@@ -9,6 +9,7 @@ use crate::scene3d::model::{
     HemisphereLight, Lights, Material, MaterialKind, MeshData, MeshInstance, PointLight,
     Projection, Scene3D, ShadowSettings, Side, ToneMapping,
 };
+use crate::scene3d::model::{CellId, Interaction};
 use glam::{DMat4, DVec3};
 use serde_json::{Map, Value};
 use std::f64::consts::FRAC_PI_2;
@@ -138,6 +139,7 @@ pub fn scene_from_canvas_node_themed(
     let mut walk = Walk {
         theme,
         meshes: Vec::new(),
+        pick_id: None,
     };
     let place = Placement {
         cell,
@@ -170,6 +172,51 @@ pub fn scene_from_canvas_node_themed(
         tone_mapping,
         meshes: walk.meshes,
         grid,
+        interaction: interaction(fields, &nodes, &bounds, cell)?,
+    })
+}
+
+/// OrbitControls are on unless `camera.controls` is false or the camera follows; the cell index is the host's
+/// `buildHitIndex`, whose keys only an integral position can match.
+fn interaction(
+    fields: &Fields,
+    nodes: &[(String, Value)],
+    bounds: &Bounds,
+    cell: f64,
+) -> Result<Interaction, CanvasSceneError> {
+    let camera = opt_object(fields, "camera", "canvas")?;
+    let controls = match camera {
+        Some(c) => opt_bool(c, "controls", "canvas.camera")?.unwrap_or(true),
+        None => true,
+    };
+    let follows = camera
+        .and_then(|c| c.get("mode"))
+        .and_then(Value::as_str)
+        .is_some_and(|m| m == "follow" || m == "chase");
+    let mut cells = Vec::new();
+    for (path, node) in nodes {
+        let Some(f) = node.as_object() else { continue };
+        let (Some(id), Some("draw-mesh" | "draw-group")) = (
+            f.get("id").and_then(Value::as_str),
+            f.get("type").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let pos = required_pos(f, path)?;
+        if pos[0].fract() == 0.0 && pos[1].fract() == 0.0 {
+            cells.push(CellId {
+                x: pos[0] as i64,
+                y: pos[1] as i64,
+                id: id.to_string(),
+            });
+        }
+    }
+    Ok(Interaction {
+        orbit: controls && !follows,
+        cell: cell as f32,
+        min_x: bounds.min_x as f32,
+        min_z: bounds.min_z as f32,
+        cells,
     })
 }
 
@@ -599,6 +646,8 @@ impl Placement {
 struct Walk<'a> {
     theme: &'a SceneTheme,
     meshes: Vec<MeshInstance>,
+    /// The innermost enclosing drawable id, as three's click walks up to it.
+    pick_id: Option<String>,
 }
 
 const MESH_KEYS: &[&str] = &[
@@ -671,7 +720,11 @@ impl Walk<'_> {
             .as_object()
             .ok_or_else(|| bad(path, "not a drawable node"))?;
         let ty = fields.get("type").and_then(Value::as_str).unwrap_or("");
-        match ty {
+        let outer = self.pick_id.clone();
+        if let Some(id) = fields.get("id").and_then(Value::as_str) {
+            self.pick_id = Some(id.to_string());
+        }
+        let drawn = match ty {
             "draw-mesh" => self.mesh(fields, path, parent, place, opacity),
             "draw-group" => self.group(fields, path, parent, place, opacity),
             "draw-sprite" | "draw-shape" | "draw-text" | "draw-sprite-layer"
@@ -682,7 +735,9 @@ impl Walk<'_> {
                 &join(path, "type"),
                 format!("`{other}` is not a drawable"),
             )),
-        }
+        };
+        self.pick_id = outer;
+        drawn
     }
 
     fn group(
@@ -896,6 +951,7 @@ impl Walk<'_> {
             material,
             cast_shadow: opt_bool(f, "castShadow", path)?.unwrap_or(true),
             receive_shadow: opt_bool(f, "receiveShadow", path)?.unwrap_or(true),
+            id: self.pick_id.clone(),
         });
         Ok(())
     }

@@ -15,6 +15,27 @@ pub struct Scene3D {
     pub meshes: Vec<MeshInstance>,
     /// A ground grid drawn as drei's `Grid` draws it.
     pub grid: Option<Grid>,
+    #[serde(default)]
+    pub interaction: Interaction,
+}
+
+/// What a host needs to turn pointer input into the scene's own events: whether the user may orbit the camera,
+/// and how world points map back to scene cells (`scene = world / cell + min`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Interaction {
+    pub orbit: bool,
+    pub cell: f32,
+    pub min_x: f32,
+    pub min_z: f32,
+    /// The scene cell of each top-level drawable that carries an id.
+    pub cells: Vec<CellId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CellId {
+    pub x: i64,
+    pub y: i64,
+    pub id: String,
 }
 
 /// drei's `Grid`: cell and section lines on the y = `center[1]` plane, faded with distance from the camera's
@@ -125,6 +146,9 @@ pub struct MeshInstance {
     pub material: Material,
     pub cast_shadow: bool,
     pub receive_shadow: bool,
+    /// The id of the innermost drawable this mesh belongs to, for picking.
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 /// Indexed triangles in the mesh's local space, counter-clockwise front faces.
