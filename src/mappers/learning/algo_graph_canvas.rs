@@ -495,12 +495,6 @@ pub fn derive_shapes(props: &Value, width: f32, height: f32) -> Vec<Shape> {
 }
 
 pub fn map(props: &Value, viewport: Option<(f32, f32)>) -> Result<MappedScene, CanvasSceneError> {
-    if get_string(props, "title").is_some_and(|t| !t.is_empty()) {
-        gap_once(
-            "algo-graph-title",
-            "the title is a Typography above the canvas, outside the drawn scene",
-        );
-    }
     let mut spec = CanvasSpec::from_props("algo-graph-canvas", props, 600.0, 400.0, Vec::new());
     spec.shapes = derive_shapes(props, spec.width, spec.height);
     let on_node_click = get_string(props, "onNodeClick");

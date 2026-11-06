@@ -630,12 +630,6 @@ pub fn map(props: &Value, viewport: Option<(f32, f32)>) -> Result<MappedScene, C
     if get_string(props, "mode").as_deref() == Some("3d") {
         return Err(CanvasSceneError::UnsupportedMode("3d".into()));
     }
-    if get_string(props, "title").is_some_and(|t| !t.is_empty()) {
-        gap_once(
-            "physics-title",
-            "physics-canvas title (Typography h4 above the canvas) is not drawn natively",
-        );
-    }
     let width = get_f32(props, "width", 600.0).max(1.0);
     let height = get_f32(props, "height", 400.0).max(1.0);
     let shapes = derive_shapes(props, width, height);

@@ -406,16 +406,6 @@ pub fn map(props: &Value, viewport: Option<(f32, f32)>) -> Result<MappedScene, C
     }
     let width = get_f32(props, "width", 600.0).max(1.0);
     let height = get_f32(props, "height", 400.0).max(1.0);
-    if props
-        .get("title")
-        .and_then(Value::as_str)
-        .is_some_and(|t| !t.is_empty())
-    {
-        gap_once(
-            "biology-title",
-            "the canvas card title (Typography h4) is not painted natively",
-        );
-    }
     let shapes = derive_shapes(props, width, height);
     let spec = CanvasSpec::from_props("biology-canvas", props, 600.0, 400.0, shapes);
     Ok(canvas::render(&spec, &canvas::theme_for(props), viewport))

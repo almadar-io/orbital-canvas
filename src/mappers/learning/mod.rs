@@ -72,6 +72,17 @@ pub(crate) const PATTERNS: &[&str] = &[
     "physics-canvas",
 ];
 
+/// The molecules the web wraps in a card (title above the canvas): the learning atom and the
+/// graph canvas draw without one.
+pub const CARD_PATTERNS: &[&str] = &[
+    "algo-graph-canvas",
+    "algorithm-canvas",
+    "biology-canvas",
+    "chemistry-canvas",
+    "math-canvas",
+    "physics-canvas",
+];
+
 pub fn handles(pattern: &str) -> bool {
     PATTERNS.contains(&pattern)
 }
