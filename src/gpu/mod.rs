@@ -353,9 +353,7 @@ impl GpuHost {
             OsOp::GpuShaderCreate => self.shader_create(args).await,
             OsOp::GpuPipelineCreate => self.pipeline_create(args).await,
             OsOp::GpuBindGroupCreate => self.bind_group_create(args).await,
-            OsOp::GpuWrite => self.write(args).await,
             OsOp::GpuSubmit => self.submit(args).await,
-            OsOp::GpuRead => self.read(args).await,
             OsOp::GpuRelease => {
                 let handle = as_id(arg(args, 0, "handle")?, "handle")?;
                 self.release(handle)?;

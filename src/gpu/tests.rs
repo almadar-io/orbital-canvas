@@ -84,8 +84,73 @@ fn fs() -> @location(0) vec4<f32> {
 }
 ";
 
-fn kind_of(result: Result<Value, OsError>) -> OsErrorKind {
+fn kind_of<T: std::fmt::Debug>(result: Result<T, OsError>) -> OsErrorKind {
     result.expect_err("expected an error").kind
+}
+
+fn write_cmd(buffer: &Value, offset: i64, data: Value) -> Value {
+    record([(
+        "write",
+        record([
+            ("buffer", buffer.clone()),
+            ("offset", Value::Int(offset)),
+            ("data", data),
+        ]),
+    )])
+}
+
+fn read_cmd(buffer: &Value, offset: i64, length: i64) -> Value {
+    record([(
+        "read",
+        record([
+            ("buffer", buffer.clone()),
+            ("offset", Value::Int(offset)),
+            ("length", Value::Int(length)),
+        ]),
+    )])
+}
+
+/// Submit `commands` as one job; the bytes of each read, in list order.
+fn job(host: &GpuHost, device: &Value, commands: Vec<Value>) -> Result<Vec<Vec<u8>>, OsError> {
+    let reply = call(
+        host,
+        OsOp::GpuSubmit,
+        &[device.clone(), Value::array(commands)],
+    )?;
+    Ok(reply
+        .get("reads")
+        .and_then(|r| r.as_array())
+        .expect("reads")
+        .iter()
+        .map(|r| r.as_bytes().expect("bytes").to_vec())
+        .collect())
+}
+
+fn write(
+    host: &GpuHost,
+    device: &Value,
+    buffer: &Value,
+    offset: i64,
+    data: Value,
+) -> Result<(), OsError> {
+    job(host, device, vec![write_cmd(buffer, offset, data)]).map(|_| ())
+}
+
+fn read(
+    host: &GpuHost,
+    device: &Value,
+    buffer: &Value,
+    offset: i64,
+    length: i64,
+) -> Result<Vec<u8>, OsError> {
+    job(host, device, vec![read_cmd(buffer, offset, length)]).map(|mut reads| reads.remove(0))
+}
+
+fn u32s(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 #[test]
@@ -95,26 +160,6 @@ fn vector_add_runs_on_the_gpu_and_reads_back() {
     let a = buffer(&host, &device, 32, &usage).unwrap();
     let b = buffer(&host, &device, 32, &usage).unwrap();
     let out = buffer(&host, &device, 32, &usage).unwrap();
-    call(
-        &host,
-        OsOp::GpuWrite,
-        &[
-            a.clone(),
-            Value::Int(0),
-            u32_bytes(&[1, 2, 3, 4, 5, 6, 7, 8]),
-        ],
-    )
-    .unwrap();
-    call(
-        &host,
-        OsOp::GpuWrite,
-        &[
-            b.clone(),
-            Value::Int(0),
-            u32_bytes(&[10, 20, 30, 40, 50, 60, 70, 80]),
-        ],
-    )
-    .unwrap();
     let shader = handle(
         &call(&host, OsOp::GpuShaderCreate, &[device.clone(), text(ADD)]).unwrap(),
         "shader",
@@ -163,28 +208,231 @@ fn vector_add_runs_on_the_gpu_and_reads_back() {
             ("dispatch", ints(&[2, 1, 1])),
         ]),
     )]);
-    call(
+    let reads = job(
         &host,
-        OsOp::GpuSubmit,
-        &[device.clone(), Value::array(vec![command])],
+        &device,
+        vec![
+            write_cmd(&a, 0, u32_bytes(&[1, 2, 3, 4, 5, 6, 7, 8])),
+            write_cmd(&b, 0, u32_bytes(&[10, 20, 30, 40, 50, 60, 70, 80])),
+            read_cmd(&out, 0, 32),
+            command,
+            read_cmd(&out, 0, 32),
+            read_cmd(&a, 0, 4),
+        ],
     )
     .unwrap();
-    let read = call(&host, OsOp::GpuRead, &[out, Value::Int(0), Value::Int(32)]).unwrap();
-    let bytes = read
-        .get("data")
-        .and_then(|d| d.as_bytes())
-        .expect("bytes")
-        .to_vec();
-    let sums: Vec<u32> = bytes
-        .chunks(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    assert_eq!(sums, vec![11, 22, 33, 44, 55, 66, 77, 88]);
-    // Control: the inputs were not touched.
-    let first = call(&host, OsOp::GpuRead, &[a, Value::Int(0), Value::Int(4)]).unwrap();
+    assert_eq!(reads.len(), 3, "one bytes per read");
     assert_eq!(
-        first.get("data").and_then(|d| d.as_bytes()),
-        Some(&1u32.to_le_bytes()[..])
+        u32s(&reads[0]),
+        vec![0; 8],
+        "a read before the dispatch sees the buffer before it ran"
+    );
+    assert_eq!(u32s(&reads[1]), vec![11, 22, 33, 44, 55, 66, 77, 88]);
+    assert_eq!(
+        u32s(&reads[2]),
+        vec![1],
+        "control: the inputs were not touched"
+    );
+}
+
+#[test]
+fn a_texture_write_repacks_its_rows_and_lands_in_order() {
+    let Some((host, device)) = open() else { return };
+    let texture = handle(
+        &call(
+            &host,
+            OsOp::GpuTextureCreate,
+            &[
+                device.clone(),
+                record([
+                    ("width", Value::Int(3)),
+                    ("height", Value::Int(2)),
+                    ("format", text("r32float")),
+                    ("usage", names(&["texture-binding", "copy-dst"])),
+                ]),
+            ],
+        )
+        .unwrap(),
+        "texture",
+    );
+    let out = buffer(&host, &device, 24, &["storage", "copy-src"]).unwrap();
+    let wgsl = "
+@group(0) @binding(0) var t: texture_2d<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    out[id.x + id.y * 3u] = textureLoad(t, vec2<i32>(i32(id.x), i32(id.y)), 0).r;
+}
+";
+    let shader = handle(
+        &call(&host, OsOp::GpuShaderCreate, &[device.clone(), text(wgsl)]).unwrap(),
+        "shader",
+    );
+    let pipeline = handle(
+        &call(
+            &host,
+            OsOp::GpuPipelineCreate,
+            &[
+                device.clone(),
+                record([
+                    ("kind", text("compute")),
+                    ("shader", shader),
+                    ("entry", text("main")),
+                ]),
+            ],
+        )
+        .unwrap(),
+        "pipeline",
+    );
+    let entries = Value::array(vec![
+        record([("binding", Value::Int(0)), ("texture", texture.clone())]),
+        record([("binding", Value::Int(1)), ("buffer", out.clone())]),
+    ]);
+    let group = handle(
+        &call(
+            &host,
+            OsOp::GpuBindGroupCreate,
+            &[pipeline.clone(), Value::Int(0), entries],
+        )
+        .unwrap(),
+        "bindGroup",
+    );
+    let texels: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    let compute = record([(
+        "compute",
+        record([
+            ("pipeline", pipeline),
+            ("bindGroups", Value::array(vec![group])),
+            ("dispatch", ints(&[3, 2, 1])),
+        ]),
+    )]);
+    let write = record([(
+        "write",
+        record([("texture", texture.clone()), ("data", Value::bytes(texels))]),
+    )]);
+    let reads = job(&host, &device, vec![write, compute, read_cmd(&out, 0, 24)]).unwrap();
+    let got: Vec<f32> = reads[0]
+        .chunks(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(
+        got,
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        "a 12-byte row padded to 256 in the upload lands row by row"
+    );
+    let short = record([(
+        "write",
+        record([("texture", texture), ("data", Value::bytes(vec![0; 20]))]),
+    )]);
+    assert_eq!(
+        kind_of(job(&host, &device, vec![short])),
+        OsErrorKind::Invalid,
+        "a texture write carries the whole texture"
+    );
+}
+
+#[test]
+fn a_map_read_buffer_reads_after_the_list_and_no_later_command_may_write_it() {
+    let Some((host, device)) = open() else { return };
+    let src = buffer(&host, &device, 16, &["copy-src", "copy-dst"]).unwrap();
+    let mapped = buffer(&host, &device, 16, &["map-read", "copy-dst"]).unwrap();
+    let copy = record([(
+        "copy",
+        record([("from", src.clone()), ("to", mapped.clone())]),
+    )]);
+    let reads = job(
+        &host,
+        &device,
+        vec![
+            write_cmd(&src, 0, u32_bytes(&[7, 8, 9, 10])),
+            copy.clone(),
+            read_cmd(&mapped, 0, 16),
+            read_cmd(&mapped, 8, 8),
+        ],
+    )
+    .unwrap();
+    assert_eq!(u32s(&reads[0]), vec![7, 8, 9, 10]);
+    assert_eq!(
+        u32s(&reads[1]),
+        vec![9, 10],
+        "two reads of one map-read buffer map it once"
+    );
+    assert_eq!(
+        kind_of(job(&host, &device, vec![read_cmd(&mapped, 0, 16), copy])),
+        OsErrorKind::Invalid,
+        "a later copy into it would make the read lie about its place in the list"
+    );
+    assert_eq!(
+        kind_of(read(&host, &device, &mapped, 4, 8)),
+        OsErrorKind::Invalid,
+        "a map-read read starts at a multiple of 8"
+    );
+}
+
+#[test]
+fn a_write_or_read_off_a_multiple_of_four_or_past_the_buffer_is_invalid() {
+    let Some((host, device)) = open() else { return };
+    let buf = buffer(&host, &device, 16, &["copy-src", "copy-dst"]).unwrap();
+    assert_eq!(
+        kind_of(write(&host, &device, &buf, 0, Value::bytes(vec![1, 2, 3]))),
+        OsErrorKind::Invalid
+    );
+    assert_eq!(
+        kind_of(write(
+            &host,
+            &device,
+            &buf,
+            2,
+            Value::bytes(vec![1, 2, 3, 4])
+        )),
+        OsErrorKind::Invalid
+    );
+    assert_eq!(
+        kind_of(write(
+            &host,
+            &device,
+            &buf,
+            16,
+            Value::bytes(vec![1, 2, 3, 4])
+        )),
+        OsErrorKind::Invalid
+    );
+    assert_eq!(
+        kind_of(read(&host, &device, &buf, 0, 6)),
+        OsErrorKind::Invalid
+    );
+    assert_eq!(
+        kind_of(read(&host, &device, &buf, 12, 8)),
+        OsErrorKind::Invalid
+    );
+    let storage_only = buffer(&host, &device, 16, &["storage"]).unwrap();
+    assert_eq!(
+        kind_of(read(&host, &device, &storage_only, 0, 16)),
+        OsErrorKind::Invalid,
+        "a read needs copy-src or map-read"
+    );
+    write(&host, &device, &buf, 4, u32_bytes(&[5])).unwrap();
+    assert_eq!(
+        u32s(&read(&host, &device, &buf, 0, 8).unwrap()),
+        vec![0, 5],
+        "control"
+    );
+    let empty = call(
+        &host,
+        OsOp::GpuSubmit,
+        &[
+            device.clone(),
+            Value::array(vec![write_cmd(&buf, 0, u32_bytes(&[1]))]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        empty.get("reads").and_then(|r| r.as_array()).map(Vec::len),
+        Some(0),
+        "a job without a read answers an empty reads list"
     );
 }
 
@@ -260,18 +508,10 @@ fn render_to_pixels(draw_vertices: i64) -> Option<Vec<u8>> {
     call(
         &host,
         OsOp::GpuSubmit,
-        &[device, Value::array(vec![render, copy])],
+        &[device.clone(), Value::array(vec![render, copy])],
     )
     .unwrap();
-    let read = call(
-        &host,
-        OsOp::GpuRead,
-        &[readback, Value::Int(0), Value::Int(512)],
-    )
-    .unwrap();
-    read.get("data")
-        .and_then(|d| d.as_bytes())
-        .map(<[u8]>::to_vec)
+    read(&host, &device, &readback, 0, 512).ok()
 }
 
 #[test]
@@ -326,16 +566,15 @@ fn a_released_buffer_answers_closed() {
     let kept = buffer(&host, &device, 16, &["copy-src", "copy-dst"]).unwrap();
     let dropped = buffer(&host, &device, 16, &["copy-src", "copy-dst"]).unwrap();
     call(&host, OsOp::GpuRelease, &[dropped.clone()]).unwrap();
-    let read = [dropped.clone(), Value::Int(0), Value::Int(16)];
     assert_eq!(
-        kind_of(call(&host, OsOp::GpuRead, &read)),
+        kind_of(read(&host, &device, &dropped, 0, 16)),
         OsErrorKind::Closed
     );
     assert_eq!(
         kind_of(call(&host, OsOp::GpuRelease, &[dropped])),
         OsErrorKind::Closed
     );
-    assert!(call(&host, OsOp::GpuRead, &[kept, Value::Int(0), Value::Int(16)]).is_ok());
+    assert!(read(&host, &device, &kept, 0, 16).is_ok());
 }
 
 #[test]
@@ -348,9 +587,8 @@ fn a_closed_device_answers_closed_for_itself_and_its_objects() {
         kind_of(buffer(&host, &device, 16, &["storage"])),
         OsErrorKind::Closed
     );
-    let read = [owned, Value::Int(0), Value::Int(16)];
     assert_eq!(
-        kind_of(call(&host, OsOp::GpuRead, &read)),
+        kind_of(read(&host, &device, &owned, 0, 16)),
         OsErrorKind::Closed
     );
     // Control: another host's device is unaffected.
@@ -399,28 +637,15 @@ fn device_open_reports_compute_limits() {
 fn reads_reuse_one_staging_buffer_and_return_only_their_own_bytes() {
     let Some((host, device)) = open() else { return };
     let buf = buffer(&host, &device, 32, &["copy-dst", "copy-src"]).unwrap();
-    call(
+    write(
         &host,
-        OsOp::GpuWrite,
-        &[
-            buf.clone(),
-            Value::Int(0),
-            u32_bytes(&[1, 2, 3, 4, 5, 6, 7, 8]),
-        ],
+        &device,
+        &buf,
+        0,
+        u32_bytes(&[1, 2, 3, 4, 5, 6, 7, 8]),
     )
     .unwrap();
-    let read = |offset: i64, length: i64| {
-        call(
-            &host,
-            OsOp::GpuRead,
-            &[buf.clone(), Value::Int(offset), Value::Int(length)],
-        )
-        .unwrap()
-        .get("data")
-        .and_then(|d| d.as_bytes())
-        .expect("bytes")
-        .to_vec()
-    };
+    let read = |offset: i64, length: i64| read(&host, &device, &buf, offset, length).unwrap();
     let kept = |host: &GpuHost| host.staging.lock().unwrap().as_ref().map(|b| b.size());
     assert_eq!(kept(&host), None, "control: no read yet, nothing kept");
     assert_eq!(
@@ -438,14 +663,12 @@ fn reads_reuse_one_staging_buffer_and_return_only_their_own_bytes() {
         host.staging.lock().unwrap().as_ref() == Some(&first),
         "the kept buffer was reused"
     );
-    call(
+    write(
         &host,
-        OsOp::GpuWrite,
-        &[
-            buf.clone(),
-            Value::Int(0),
-            u32_bytes(&[9, 9, 9, 9, 9, 9, 9, 9]),
-        ],
+        &device,
+        &buf,
+        0,
+        u32_bytes(&[9, 9, 9, 9, 9, 9, 9, 9]),
     )
     .unwrap();
     assert_eq!(

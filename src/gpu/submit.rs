@@ -74,6 +74,45 @@ enum Cmd {
         set: wgpu::QuerySet,
         index: u32,
     },
+    WriteBuffer {
+        buffer: wgpu::Buffer,
+        offset: u64,
+        data: Value,
+    },
+    WriteTexture {
+        texture: wgpu::Texture,
+        extent: wgpu::Extent3d,
+        row: u32,
+        data: Value,
+    },
+    /// `direct` for a map-read buffer: mapped after the whole list instead of copied out at its place in it.
+    Read {
+        buffer: wgpu::Buffer,
+        offset: u64,
+        length: u64,
+        direct: bool,
+    },
+}
+
+impl Cmd {
+    /// Whether this command can change `buffer`'s contents.
+    fn writes(&self, buffer: &wgpu::Buffer) -> bool {
+        match self {
+            Cmd::WriteBuffer { buffer: to, .. }
+            | Cmd::BufferToBuffer { to, .. }
+            | Cmd::TextureToBuffer { buffer: to, .. }
+            | Cmd::Clear { buffer: to, .. } => to == buffer,
+            _ => false,
+        }
+    }
+}
+
+fn bytes_of(data: &Value) -> &[u8] {
+    data.as_bytes().unwrap_or_default()
+}
+
+fn align(at: u64, to: u64) -> u64 {
+    at.div_ceil(to) * to
 }
 
 fn extent(width: u32, height: u32, depth: u32) -> wgpu::Extent3d {
@@ -169,7 +208,7 @@ impl GpuHost {
         let record = object(value, "command")?;
         if record.len() != 1 {
             return Err(invalid(
-                "a command holds exactly one of compute, render, copy, clear, timestamp",
+                "a command holds exactly one of write, compute, render, copy, clear, timestamp, read",
             ));
         }
         let (kind, body) = record
@@ -243,6 +282,47 @@ impl GpuHost {
                 })
             }
             "copy" => self.parse_copy(body, device),
+            "write" => self.parse_write(body, device),
+            "read" => {
+                let id = as_id(required(body, "buffer")?, "buffer")?;
+                let (buffer, size, usage) =
+                    self.owned(id, device, "buffer", |e| match &e.object {
+                        Object::Buffer {
+                            buffer,
+                            size,
+                            usage,
+                        } => Some((buffer.clone(), *size, *usage)),
+                        _ => None,
+                    })?;
+                let offset = as_u64(required(body, "offset")?, "offset")?;
+                let length = as_u64(required(body, "length")?, "length")?;
+                if length == 0 {
+                    return Err(invalid("nothing to read"));
+                }
+                if offset.checked_add(length).is_none_or(|end| end > size) {
+                    return Err(invalid("the read runs past the end of the buffer"));
+                }
+                let direct = usage.contains(wgpu::BufferUsages::MAP_READ);
+                if direct {
+                    if offset % wgpu::MAP_ALIGNMENT != 0
+                        || length % wgpu::COPY_BUFFER_ALIGNMENT != 0
+                    {
+                        return Err(invalid("a read of a map-read buffer starts at a multiple of 8 and is a multiple of 4 long"));
+                    }
+                } else if !usage.contains(wgpu::BufferUsages::COPY_SRC) {
+                    return Err(invalid("a buffer is read through copy-src or map-read"));
+                } else if offset % wgpu::COPY_BUFFER_ALIGNMENT != 0
+                    || length % wgpu::COPY_BUFFER_ALIGNMENT != 0
+                {
+                    return Err(invalid("a read starts and ends at a multiple of 4"));
+                }
+                Ok(Cmd::Read {
+                    buffer,
+                    offset,
+                    length,
+                    direct,
+                })
+            }
             "clear" => {
                 let id = as_id(required(body, "buffer")?, "buffer")?;
                 let buffer = self.owned(id, device, "buffer", |e| match &e.object {
@@ -386,85 +466,74 @@ impl GpuHost {
         }
     }
 
-    pub(super) async fn write(&self, args: &[Value]) -> Reply {
-        let target = as_id(arg(args, 0, "target")?, "target")?;
-        let offset = as_u64(arg(args, 1, "offset")?, "offset")?;
-        let data = arg(args, 2, "data")?
+    fn parse_write(&self, body: &ValueMap, device: u64) -> Result<Cmd, OsError> {
+        let data = required(body, "data")?;
+        let bytes = data
             .bytes_view()
             .map_err(|e| invalid(format!("data: {e}")))?;
-        if data.is_empty() {
+        if bytes.is_empty() {
             return Err(invalid("nothing to write"));
         }
-        let (endpoint, device) = self.fetch(target, "buffer or texture", |e| match &e.object {
-            Object::Buffer { buffer, size, .. } => Some(Endpoint::Buffer {
-                buffer: buffer.clone(),
-                size: *size,
-            }),
-            Object::Texture {
-                texture,
-                width,
-                height,
-                depth,
-                format,
-            } => Some(Endpoint::Texture {
-                texture: texture.clone(),
-                width: *width,
-                height: *height,
-                depth: *depth,
-                format: *format,
-            }),
-            _ => None,
-        })?;
-        let ctx = self.context(device)?;
-        match endpoint {
-            Endpoint::Buffer { buffer, size } => {
-                let end = offset.checked_add(data.len() as u64);
-                if end.is_none_or(|end| end > size) {
+        let length = bytes.len() as u64;
+        let data = match data {
+            Value::Bytes(_) => data.clone(),
+            _ => Value::bytes(bytes.into_owned()),
+        };
+        match (field(body, "buffer"), field(body, "texture")) {
+            (Some(id), None) => {
+                let id = as_id(id, "buffer")?;
+                let (buffer, size) = self.owned(id, device, "buffer", |e| match &e.object {
+                    Object::Buffer { buffer, size, .. } => Some((buffer.clone(), *size)),
+                    _ => None,
+                })?;
+                let offset = as_u64(required(body, "offset")?, "offset")?;
+                if offset.checked_add(length).is_none_or(|end| end > size) {
                     return Err(invalid("the write runs past the end of the buffer"));
                 }
-                scoped(&ctx.device, || {
-                    ctx.queue.write_buffer(&buffer, offset, &data)
-                })
-                .await?;
-            }
-            Endpoint::Texture {
-                texture,
-                width,
-                height,
-                depth,
-                format,
-            } => {
-                if offset != 0 {
-                    return Err(invalid("a texture write starts at offset 0"));
+                if offset % wgpu::COPY_BUFFER_ALIGNMENT != 0
+                    || length % wgpu::COPY_BUFFER_ALIGNMENT != 0
+                {
+                    return Err(invalid(
+                        "a buffer write starts at a multiple of 4 and is a multiple of 4 long",
+                    ));
                 }
+                Ok(Cmd::WriteBuffer {
+                    buffer,
+                    offset,
+                    data,
+                })
+            }
+            (None, Some(id)) => {
+                let id = as_id(id, "texture")?;
+                let (texture, width, height, depth, format) =
+                    self.owned(id, device, "texture", |e| match &e.object {
+                        Object::Texture {
+                            texture,
+                            width,
+                            height,
+                            depth,
+                            format,
+                        } => Some((texture.clone(), *width, *height, *depth, *format)),
+                        _ => None,
+                    })?;
                 let row = row_bytes(width, format)?;
                 let whole = u64::from(row) * u64::from(height) * u64::from(depth);
-                if data.len() as u64 != whole {
+                if length != whole {
                     return Err(invalid(format!(
                         "a texture write carries the whole texture: {whole} bytes"
                     )));
                 }
-                scoped(&ctx.device, || {
-                    ctx.queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        &data,
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(row),
-                            rows_per_image: Some(height),
-                        },
-                        extent(width, height, depth),
-                    )
+                Ok(Cmd::WriteTexture {
+                    texture,
+                    extent: extent(width, height, depth),
+                    row,
+                    data,
                 })
-                .await?;
             }
+            _ => Err(invalid(
+                "a write names exactly one of `buffer` or `texture`",
+            )),
         }
-        Ok(record([]))
     }
 
     pub(super) async fn submit(&self, args: &[Value]) -> Reply {
@@ -480,12 +549,147 @@ impl GpuHost {
         if commands.is_empty() {
             return Err(invalid("no commands to submit"));
         }
+        for (at, command) in commands.iter().enumerate() {
+            if let Cmd::Read {
+                buffer,
+                direct: true,
+                ..
+            } = command
+            {
+                if commands[at + 1..].iter().any(|later| later.writes(buffer)) {
+                    return Err(invalid(
+                        "a map-read buffer is read as it stands after the list, so no later command may write it",
+                    ));
+                }
+            }
+        }
+        // Where each write's bytes sit in the one upload buffer, and each copied read in the one readback buffer.
+        let (mut uploads, mut reads) = (0u64, 0u64);
+        let slots: Vec<u64> = commands
+            .iter()
+            .map(|command| match command {
+                Cmd::WriteBuffer { data, .. } => {
+                    let at = align(uploads, wgpu::COPY_BUFFER_ALIGNMENT);
+                    uploads = at + bytes_of(data).len() as u64;
+                    at
+                }
+                Cmd::WriteTexture { extent, row, .. } => {
+                    let at = align(uploads, u64::from(ROW_ALIGN));
+                    let padded = u64::from(row.div_ceil(ROW_ALIGN) * ROW_ALIGN);
+                    uploads = at
+                        + padded
+                            * u64::from(extent.height)
+                            * u64::from(extent.depth_or_array_layers);
+                    at
+                }
+                Cmd::Read {
+                    length,
+                    direct: false,
+                    ..
+                } => {
+                    let at = align(reads, wgpu::MAP_ALIGNMENT);
+                    reads = at + length;
+                    at
+                }
+                _ => 0,
+            })
+            .collect();
+        let readback = (reads > 0).then(|| self.take_staging(&ctx.device, reads));
         scoped(&ctx.device, || {
+            let upload = (uploads > 0).then(|| {
+                let upload = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: align(uploads, wgpu::COPY_BUFFER_ALIGNMENT),
+                    usage: wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: true,
+                });
+                {
+                    let mut view = upload.slice(..).get_mapped_range_mut();
+                    for (command, at) in commands.iter().zip(&slots) {
+                        let at = *at as usize;
+                        match command {
+                            Cmd::WriteBuffer { data, .. } => {
+                                let bytes = bytes_of(data);
+                                view[at..at + bytes.len()].copy_from_slice(bytes);
+                            }
+                            Cmd::WriteTexture {
+                                extent, row, data, ..
+                            } => {
+                                let (row, padded) = (
+                                    *row as usize,
+                                    (row.div_ceil(ROW_ALIGN) * ROW_ALIGN) as usize,
+                                );
+                                let rows = (extent.height * extent.depth_or_array_layers) as usize;
+                                for (index, line) in
+                                    bytes_of(data).chunks(row).take(rows).enumerate()
+                                {
+                                    let start = at + index * padded;
+                                    view[start..start + row].copy_from_slice(line);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                upload.unmap();
+                upload
+            });
             let mut encoder = ctx
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-            for command in &commands {
+            for (command, at) in commands.iter().zip(&slots) {
                 match command {
+                    Cmd::WriteBuffer {
+                        buffer,
+                        offset,
+                        data,
+                    } => {
+                        if let Some(upload) = &upload {
+                            encoder.copy_buffer_to_buffer(
+                                upload,
+                                *at,
+                                buffer,
+                                *offset,
+                                bytes_of(data).len() as u64,
+                            );
+                        }
+                    }
+                    Cmd::WriteTexture {
+                        texture,
+                        extent,
+                        row,
+                        ..
+                    } => {
+                        if let Some(upload) = &upload {
+                            encoder.copy_buffer_to_texture(
+                                wgpu::TexelCopyBufferInfo {
+                                    buffer: upload,
+                                    layout: wgpu::TexelCopyBufferLayout {
+                                        offset: *at,
+                                        bytes_per_row: Some(row.div_ceil(ROW_ALIGN) * ROW_ALIGN),
+                                        rows_per_image: Some(extent.height),
+                                    },
+                                },
+                                wgpu::TexelCopyTextureInfo {
+                                    texture,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d::ZERO,
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                *extent,
+                            );
+                        }
+                    }
+                    Cmd::Read {
+                        buffer,
+                        offset,
+                        length,
+                        direct,
+                    } => {
+                        if let (false, Some(staging)) = (direct, &readback) {
+                            encoder.copy_buffer_to_buffer(buffer, *offset, staging, *at, *length);
+                        }
+                    }
                     Cmd::Compute {
                         pipeline,
                         groups,
@@ -607,80 +811,87 @@ impl GpuHost {
             ctx.queue.submit(std::iter::once(encoder.finish()));
         })
         .await?;
-        let (tx, rx) = signal();
-        ctx.queue.on_submitted_work_done(move || tx.send(()));
-        drive(&ctx.device, &rx)?;
-        rx.await
-            .map_err(|_| io_error("the queue ended without finishing the work"))?;
-        Ok(record([]))
-    }
-
-    pub(super) async fn read(&self, args: &[Value]) -> Reply {
-        let id = as_id(arg(args, 0, "buffer")?, "buffer")?;
-        let offset = as_u64(arg(args, 1, "offset")?, "offset")?;
-        let length = as_u64(arg(args, 2, "length")?, "length")?;
-        let ((buffer, size, usage), device) = self.fetch(id, "buffer", |e| match &e.object {
-            Object::Buffer {
+        // Each map-read buffer is mapped once over every range the list reads from it.
+        let mut direct: Vec<(wgpu::Buffer, u64, u64)> = Vec::new();
+        for command in &commands {
+            if let Cmd::Read {
                 buffer,
-                size,
-                usage,
-            } => Some((buffer.clone(), *size, *usage)),
-            _ => None,
-        })?;
-        if length == 0 {
-            return Err(invalid("nothing to read"));
-        }
-        if offset.checked_add(length).is_none_or(|end| end > size) {
-            return Err(invalid("the read runs past the end of the buffer"));
-        }
-        let direct = usage.contains(wgpu::BufferUsages::MAP_READ);
-        if direct {
-            if offset % wgpu::MAP_ALIGNMENT != 0 || length % wgpu::COPY_BUFFER_ALIGNMENT != 0 {
-                return Err(invalid("a read of a map-read buffer starts at a multiple of 8 and is a multiple of 4 long"));
-            }
-        } else {
-            if !usage.contains(wgpu::BufferUsages::COPY_SRC) {
-                return Err(invalid("a buffer is read through copy-src or map-read"));
-            }
-            if offset % wgpu::COPY_BUFFER_ALIGNMENT != 0
-                || length % wgpu::COPY_BUFFER_ALIGNMENT != 0
+                offset,
+                length,
+                direct: true,
+            } = command
             {
-                return Err(invalid("a read starts and ends at a multiple of 4"));
+                match direct.iter_mut().find(|(b, ..)| b == buffer) {
+                    Some((_, start, end)) => {
+                        *start = (*start).min(*offset);
+                        *end = (*end).max(offset + length);
+                    }
+                    None => direct.push((buffer.clone(), *offset, offset + length)),
+                }
             }
         }
-        let ctx = self.context(device)?;
-        let (tx, rx) = signal();
-        let (mapped, start) = scoped(&ctx.device, || {
-            let (target, start) = if direct {
-                (buffer.clone(), offset)
-            } else {
-                let staging = self.take_staging(&ctx.device, length);
-                let mut encoder = ctx
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-                encoder.copy_buffer_to_buffer(&buffer, offset, &staging, 0, length);
-                ctx.queue.submit(std::iter::once(encoder.finish()));
-                (staging, 0)
-            };
-            target
-                .slice(start..start + length)
-                .map_async(wgpu::MapMode::Read, move |result| tx.send(result));
-            (target, start)
-        })
-        .await?;
-        drive(&ctx.device, &rx)?;
-        rx.await
-            .map_err(|_| io_error("the buffer map never answered"))?
-            .map_err(|e| io_error(format!("buffer map failed: {e}")))?;
-        let slice = mapped.slice(start..start + length);
-        let data = {
-            let view = slice.get_mapped_range();
-            view.to_vec()
-        };
-        mapped.unmap();
-        if !direct {
-            self.keep_staging(mapped);
+        let mut maps: Vec<(wgpu::Buffer, u64, u64)> = direct.clone();
+        if let Some(staging) = &readback {
+            maps.push((staging.clone(), 0, reads));
         }
-        Ok(record([("data", Value::bytes(data))]))
+        if maps.is_empty() {
+            let (tx, rx) = signal();
+            ctx.queue.on_submitted_work_done(move || tx.send(()));
+            drive(&ctx.device, &rx)?;
+            rx.await
+                .map_err(|_| io_error("the queue ended without finishing the work"))?;
+            return Ok(record([("reads", Value::array(Vec::new()))]));
+        }
+        let mut waits = Vec::with_capacity(maps.len());
+        for (buffer, start, end) in &maps {
+            let (tx, rx) = signal();
+            buffer
+                .slice(*start..*end)
+                .map_async(wgpu::MapMode::Read, move |result| tx.send(result));
+            waits.push(rx);
+        }
+        let mut mapped = Ok(());
+        let mut held = Vec::with_capacity(maps.len());
+        for (rx, (buffer, ..)) in waits.into_iter().zip(&maps) {
+            drive(&ctx.device, &rx)?;
+            let outcome = rx
+                .await
+                .map_err(|_| io_error("the buffer map never answered"))
+                .and_then(|r| r.map_err(|e| io_error(format!("buffer map failed: {e}"))));
+            if outcome.is_ok() {
+                held.push(buffer.clone());
+            }
+            mapped = mapped.and(outcome);
+        }
+        let out = mapped.map(|()| {
+            commands
+                .iter()
+                .zip(&slots)
+                .filter_map(|(command, at)| match command {
+                    Cmd::Read {
+                        buffer,
+                        offset,
+                        length,
+                        direct: true,
+                    } => Some(Value::bytes(
+                        buffer
+                            .slice(*offset..offset + length)
+                            .get_mapped_range()
+                            .to_vec(),
+                    )),
+                    Cmd::Read { length, .. } => readback.as_ref().map(|staging| {
+                        Value::bytes(staging.slice(*at..at + length).get_mapped_range().to_vec())
+                    }),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
+        for buffer in held {
+            buffer.unmap();
+        }
+        if let Some(staging) = readback {
+            self.keep_staging(staging);
+        }
+        Ok(record([("reads", Value::array(out?))]))
     }
 }
