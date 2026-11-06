@@ -394,3 +394,69 @@ fn device_open_reports_compute_limits() {
     );
     assert_eq!(kind_of(bad), OsErrorKind::Invalid);
 }
+
+#[test]
+fn reads_reuse_one_staging_buffer_and_return_only_their_own_bytes() {
+    let Some((host, device)) = open() else { return };
+    let buf = buffer(&host, &device, 32, &["copy-dst", "copy-src"]).unwrap();
+    call(
+        &host,
+        OsOp::GpuWrite,
+        &[
+            buf.clone(),
+            Value::Int(0),
+            u32_bytes(&[1, 2, 3, 4, 5, 6, 7, 8]),
+        ],
+    )
+    .unwrap();
+    let read = |offset: i64, length: i64| {
+        call(
+            &host,
+            OsOp::GpuRead,
+            &[buf.clone(), Value::Int(offset), Value::Int(length)],
+        )
+        .unwrap()
+        .get("data")
+        .and_then(|d| d.as_bytes())
+        .expect("bytes")
+        .to_vec()
+    };
+    let kept = |host: &GpuHost| host.staging.lock().unwrap().as_ref().map(|b| b.size());
+    assert_eq!(kept(&host), None, "control: no read yet, nothing kept");
+    assert_eq!(
+        read(0, 32),
+        u32_bytes(&[1, 2, 3, 4, 5, 6, 7, 8]).as_bytes().unwrap()
+    );
+    assert_eq!(kept(&host), Some(32));
+    let first = host.staging.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        read(8, 8),
+        u32_bytes(&[3, 4]).as_bytes().unwrap(),
+        "a shorter read through the kept buffer returns only its bytes"
+    );
+    assert!(
+        host.staging.lock().unwrap().as_ref() == Some(&first),
+        "the kept buffer was reused"
+    );
+    call(
+        &host,
+        OsOp::GpuWrite,
+        &[
+            buf.clone(),
+            Value::Int(0),
+            u32_bytes(&[9, 9, 9, 9, 9, 9, 9, 9]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        read(0, 32),
+        u32_bytes(&[9; 8]).as_bytes().unwrap(),
+        "reuse never returns stale bytes"
+    );
+    call(&host, OsOp::GpuDeviceClose, &[device]).unwrap();
+    assert_eq!(
+        kept(&host),
+        None,
+        "closing the device drops the kept buffer"
+    );
+}

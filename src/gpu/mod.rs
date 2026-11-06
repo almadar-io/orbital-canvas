@@ -151,6 +151,9 @@ struct Table {
 pub struct GpuHost {
     table: Mutex<Table>,
     shared: Mutex<Option<SharedDevice>>,
+    /// The map-read buffer a read of a copy-src buffer copies through, kept between reads. A read takes it out of the
+    /// slot, so concurrent reads never share one; it never outgrows the largest read, which fits in a program buffer.
+    staging: Mutex<Option<wgpu::Buffer>>,
 }
 
 impl Default for GpuHost {
@@ -167,6 +170,33 @@ impl GpuHost {
                 entries: HashMap::new(),
             }),
             shared: Mutex::new(None),
+            staging: Mutex::new(None),
+        }
+    }
+
+    /// A map-read staging buffer of at least `length` bytes: the kept one when it is large enough, else a new one.
+    pub(super) fn take_staging(&self, device: &wgpu::Device, length: u64) -> wgpu::Buffer {
+        let kept = self
+            .staging
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        match kept {
+            Some(buffer) if buffer.size() >= length => buffer,
+            _ => device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: length,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }),
+        }
+    }
+
+    /// Keep an unmapped staging buffer for the next read; of two, the larger stays.
+    pub(super) fn keep_staging(&self, buffer: wgpu::Buffer) {
+        let mut slot = self.staging.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.as_ref().is_none_or(|kept| kept.size() < buffer.size()) {
+            *slot = Some(buffer);
         }
     }
 
@@ -264,6 +294,7 @@ impl GpuHost {
         self.table()
             .entries
             .retain(|id, entry| *id != device && entry.device != device);
+        self.drop_staging();
         Ok(())
     }
 
@@ -289,9 +320,21 @@ impl GpuHost {
         }
     }
 
+    fn drop_staging(&self) {
+        if let Some(buffer) = self
+            .staging
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            buffer.destroy();
+        }
+    }
+
     /// Drop every object this host holds (host teardown).
     pub fn close_all(&self) {
         self.table().entries.clear();
+        self.drop_staging();
     }
 
     /// Answer one `gpu/*` ask. The browser host awaits this; the native [`GpuAnswerer`] blocks on it.

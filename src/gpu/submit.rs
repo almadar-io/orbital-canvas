@@ -654,12 +654,7 @@ impl GpuHost {
             let (target, start) = if direct {
                 (buffer.clone(), offset)
             } else {
-                let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: None,
-                    size: length,
-                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                    mapped_at_creation: false,
-                });
+                let staging = self.take_staging(&ctx.device, length);
                 let mut encoder = ctx
                     .device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -683,6 +678,9 @@ impl GpuHost {
             view.to_vec()
         };
         mapped.unmap();
+        if !direct {
+            self.keep_staging(mapped);
+        }
         Ok(record([("data", Value::bytes(data))]))
     }
 }
