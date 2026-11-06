@@ -1,7 +1,11 @@
 //! Draws a [`Scene3D`] on the GPU: vertex transforms, lighting and shadows run in shaders, meshes upload once and are
 //! cached by content, and the frame renders multisampled into any target texture of the renderer's device.
 
-use super::model::{Flat, MaterialKind, MeshData, Projection, Scene3D, Side};
+use super::environment::{self, Environment};
+use super::mipmap::{mip_level_count, MipmapError, MipmapGenerator};
+use super::model::{EnvironmentKind, Flat, MaterialKind, MeshData, Projection, Scene3D, Side};
+use super::post::{self, PostStack};
+use super::transmission::{self, Transmission};
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -38,6 +42,7 @@ struct ObjectUniform {
     color: [f32; 4],
     emissive: [f32; 4],
     params: [f32; 4],
+    physical: [f32; 4],
 }
 
 #[repr(C)]
@@ -81,11 +86,20 @@ struct PipelineKey {
     additive: bool,
 }
 
+/// three's `WebGLRenderList` lists, in drawing order.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum List {
+    Opaque,
+    Transmissive,
+    Transparent,
+}
+
 /// One mesh's draw: its object slot, cached mesh, view depth and the state its pipeline and map are chosen by.
 struct Draw {
     slot: usize,
     mesh: u64,
     depth: f32,
+    list: List,
     transparent: bool,
     additive: bool,
     side: Side,
@@ -112,6 +126,8 @@ struct Targets {
 pub enum Render3DError {
     #[error("the scene is invalid: {0}")]
     Invalid(String),
+    #[error(transparent)]
+    Mipmap(#[from] MipmapError),
 }
 
 pub struct Renderer3D {
@@ -133,14 +149,21 @@ pub struct Renderer3D {
     frame_buffer: wgpu::Buffer,
     object_buffer: wgpu::Buffer,
     object_capacity: u64,
+    /// The frame uniform of the passes that draw into the transmission target (no tone mapping, no encode).
+    linear_frame_buffer: wgpu::Buffer,
     color_sampler: wgpu::Sampler,
     nearest_sampler: wgpu::Sampler,
     shadow_sampler: wgpu::Sampler,
     shadow_map: Option<(u32, wgpu::TextureView)>,
     placeholder_shadow: wgpu::TextureView,
     white_map: wgpu::BindGroup,
+    mips: MipmapGenerator,
     /// Keyed by the image and whether it samples nearest.
-    maps: HashMap<(String, bool), (wgpu::BindGroup, u64)>,
+    maps: HashMap<(String, bool), (wgpu::BindGroup, wgpu::Texture, u64)>,
+    room: Option<Environment>,
+    no_environment: Environment,
+    transmission: Transmission,
+    post: Option<PostStack>,
     meshes: HashMap<u64, GpuMesh>,
     targets: Option<Targets>,
     clock: u64,
@@ -187,6 +210,17 @@ fn color3(rgb: [f32; 3], scale: f32, w: f32) -> [f32; 4] {
     [rgb[0] * scale, rgb[1] * scale, rgb[2] * scale, w]
 }
 
+/// The lit shader's source: the shared prelude, the lit pass, three's IBL and its transmission.
+pub(super) fn lit_source() -> String {
+    [
+        include_str!("prelude.wgsl"),
+        include_str!("lit.wgsl"),
+        environment::IBL_WGSL,
+        transmission::WGSL,
+    ]
+    .concat()
+}
+
 /// The camera's view-projection for an `aspect` (width over height).
 pub fn view_projection(scene: &Scene3D, aspect: f32) -> Mat4 {
     let c = &scene.camera;
@@ -218,13 +252,13 @@ impl Renderer3D {
     pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene3d shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                concat!(include_str!("prelude.wgsl"), include_str!("lit.wgsl")).into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(lit_source().into()),
         });
         let frame_size = std::mem::size_of::<FrameUniform>() as u64;
         let object_size = std::mem::size_of::<ObjectUniform>() as u64;
         let vertex_fragment = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
+        let [environment_texture, environment_sampler] = Environment::layout_entries(3);
+        let [transmission_texture, transmission_sampler] = Transmission::layout_entries(5);
         let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene3d frame"),
             entries: &[
@@ -245,6 +279,10 @@ impl Renderer3D {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
+                environment_texture,
+                environment_sampler,
+                transmission_texture,
+                transmission_sampler,
             ],
         });
         let shadow_frame_layout =
@@ -340,6 +378,12 @@ impl Renderer3D {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let linear_frame_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("scene3d linear frame"),
+            size: frame_size,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let object_capacity = 64;
         let object_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scene3d objects"),
@@ -353,6 +397,7 @@ impl Renderer3D {
             address_mode_v: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -371,8 +416,11 @@ impl Renderer3D {
             ..Default::default()
         });
         let placeholder_shadow = depth_texture(&device, 1, 1, 1, "scene3d no shadow");
-        let white = upload_rgba(&device, &queue, 1, 1, &[255, 255, 255, 255]);
+        let white = upload_rgba(&device, &queue, 1, 1, 1, &[255, 255, 255, 255]);
         let white_map = map_bind_group(&device, &map_layout, &white, &color_sampler);
+        let mips = MipmapGenerator::new(device.clone());
+        let no_environment = Environment::placeholder(&device);
+        let transmission = Transmission::new(device.clone());
         Self {
             device,
             queue,
@@ -390,6 +438,7 @@ impl Renderer3D {
             grid_pipelines: HashMap::new(),
             grid_buffer,
             frame_buffer,
+            linear_frame_buffer,
             object_buffer,
             object_capacity,
             color_sampler,
@@ -398,7 +447,12 @@ impl Renderer3D {
             shadow_map: None,
             placeholder_shadow,
             white_map,
+            mips,
             maps: HashMap::new(),
+            room: None,
+            no_environment,
+            transmission,
+            post: None,
             meshes: HashMap::new(),
             targets: None,
             clock: 0,
@@ -555,15 +609,40 @@ impl Renderer3D {
     }
 
     /// The bind group of the image at `url`, uploaded as sRGB and sampled nearest or linear; `None` until the asset
-    /// has loaded or when it fails.
-    fn map(&mut self, url: &str, nearest: bool) -> Option<&wgpu::BindGroup> {
+    /// has loaded or when it fails. A linear map gets its full mip chain, generated on `encoder` (three's
+    /// `generateMipmaps` with `LinearMipmapLinearFilter`); a nearest one keeps its single level, as three's
+    /// `NearestFilter` does.
+    fn map(
+        &mut self,
+        url: &str,
+        nearest: bool,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<Option<&wgpu::BindGroup>, Render3DError> {
         let clock = self.clock;
         let key = (url.to_string(), nearest);
         if self.maps.contains_key(&key) {
-            let entry = self.maps.get_mut(&key)?;
-            entry.1 = clock;
-            return Some(&entry.0);
+            let entry = self.maps.get_mut(&key).expect("just checked");
+            entry.2 = clock;
+            return Ok(Some(&entry.0));
         }
+        let Some(rgba) = self.decode_map(url) else {
+            return Ok(None);
+        };
+        let (w, h) = rgba.dimensions();
+        let levels = if nearest { 1 } else { mip_level_count(w, h) };
+        let texture = upload_rgba(&self.device, &self.queue, w, h, levels, rgba.as_raw());
+        self.mips.generate(encoder, &texture)?;
+        let sampler = if nearest {
+            &self.nearest_sampler
+        } else {
+            &self.color_sampler
+        };
+        let group = map_bind_group(&self.device, &self.map_layout, &texture, sampler);
+        self.maps.insert(key.clone(), (group, texture, clock));
+        Ok(self.maps.get(&key).map(|entry| &entry.0))
+    }
+
+    fn decode_map(&self, url: &str) -> Option<image::RgbaImage> {
         crate::asset::ensure_asset(url);
         let bytes = crate::asset::asset_bytes(url)?;
         let rgba = match crate::asset::asset_kind(url)? {
@@ -581,16 +660,7 @@ impl Renderer3D {
                 image::RgbaImage::from_raw(raster.0, raster.1, r.rgba)?
             }
         };
-        let (w, h) = rgba.dimensions();
-        let texture = upload_rgba(&self.device, &self.queue, w, h, rgba.as_raw());
-        let sampler = if nearest {
-            &self.nearest_sampler
-        } else {
-            &self.color_sampler
-        };
-        let group = map_bind_group(&self.device, &self.map_layout, &texture, sampler);
-        self.maps.insert(key.clone(), (group, clock));
-        self.maps.get(&key).map(|entry| &entry.0)
+        Some(rgba)
     }
 
     fn ensure_targets(
@@ -666,6 +736,79 @@ impl Renderer3D {
         Ok(())
     }
 
+    fn post_stack(&mut self, format: wgpu::TextureFormat) -> &mut PostStack {
+        if self.post.as_ref().map(|p| p.format()) != Some(format) {
+            self.post = Some(PostStack::new(
+                self.device.clone(),
+                self.queue.clone(),
+                format,
+            ));
+        }
+        self.post.as_mut().expect("just set")
+    }
+
+    fn frame_group(
+        &self,
+        uniform: &wgpu::Buffer,
+        shadow: &wgpu::TextureView,
+        with_environment: bool,
+        transmission: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        let environment = if with_environment {
+            self.room
+                .as_ref()
+                .expect("the environment is built before the frame")
+        } else {
+            &self.no_environment
+        };
+        let [environment_texture, environment_sampler] = environment.bind_entries(3);
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene3d frame"),
+            layout: &self.frame_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(shadow),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.shadow_sampler),
+                },
+                environment_texture,
+                environment_sampler,
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(transmission),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(self.transmission.sampler()),
+                },
+            ],
+        })
+    }
+
+    fn draw_mesh(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        draw: &Draw,
+        objects: &wgpu::BindGroup,
+        map: Option<&wgpu::BindGroup>,
+        key: PipelineKey,
+    ) {
+        let mesh = &self.meshes[&draw.mesh];
+        pass.set_pipeline(&self.pipelines[&key]);
+        pass.set_bind_group(1, objects, &[(draw.slot as u64 * OBJECT_STRIDE) as u32]);
+        pass.set_bind_group(2, map.unwrap_or(&self.white_map), &[]);
+        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+        pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..mesh.count, 0, 0..1);
+    }
+
     pub fn encode(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -682,6 +825,16 @@ impl Renderer3D {
                 scene.lights.points.len()
             )));
         }
+        // @react-three/postprocessing mounts its composer only around an effect
+        let effects = scene
+            .post
+            .filter(|p| p.bloom.is_some() || p.vignette.is_some());
+        let lit_format = if effects.is_some() {
+            post::HDR_FORMAT
+        } else {
+            format
+        };
+        let with_environment = scene.environment == Some(EnvironmentKind::Room);
         let aspect = width as f32 / height.max(1) as f32;
         let view_proj = view_projection(scene, aspect);
         let view = Mat4::look_at_rh(
@@ -735,9 +888,10 @@ impl Renderer3D {
             point_color: [[0.0; 4]; MAX_POINTS],
             options: [
                 scene.lights.points.len() as f32,
-                (scene.tone_mapping == super::model::ToneMapping::Aces) as u32 as f32,
-                (!format.is_srgb()) as u32 as f32,
-                0.0,
+                (effects.is_none() && scene.tone_mapping == super::model::ToneMapping::Aces) as u32
+                    as f32,
+                (effects.is_none() && !format.is_srgb()) as u32 as f32,
+                with_environment as u32 as f32,
             ],
             camera_right: [right.x, right.y, right.z, 0.0],
             camera_up: [up.x, up.y, up.z, 0.0],
@@ -757,6 +911,16 @@ impl Renderer3D {
         }
         self.queue
             .write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
+        // three renders the transmission target with NoToneMapping into a linear half-float buffer
+        let linear_frame = FrameUniform {
+            options: [frame.options[0], 0.0, 0.0, frame.options[3]],
+            ..frame
+        };
+        self.queue.write_buffer(
+            &self.linear_frame_buffer,
+            0,
+            bytemuck::bytes_of(&linear_frame),
+        );
 
         // Objects: one uniform slot each, and the meshes uploaded (or found in the cache).
         let needed = scene.meshes.len().max(1) as u64;
@@ -812,6 +976,8 @@ impl Renderer3D {
                 color: [m.color[0], m.color[1], m.color[2], m.opacity],
                 emissive: color3(m.emissive, m.emissive_intensity, 0.0),
                 params: [m.metalness, m.roughness, kind, flags as f32],
+                // three's default thickness, 0
+                physical: [m.transmission, m.ior, 0.0, 0.0],
             };
             let offset = i * OBJECT_STRIDE as usize;
             objects[offset..offset + std::mem::size_of::<ObjectUniform>()]
@@ -822,10 +988,18 @@ impl Renderer3D {
             } else {
                 model.transform_point3(centroid(&instance.mesh))
             };
+            let list = if matches!(m.kind, MaterialKind::Physical) && m.transmission > 0.0 {
+                List::Transmissive
+            } else if m.is_transparent() {
+                List::Transparent
+            } else {
+                List::Opaque
+            };
             draws.push(Draw {
                 slot: i,
                 mesh,
                 depth: view_proj.project_point3(center).z,
+                list,
                 transparent: m.is_transparent(),
                 additive: flat.additive,
                 side: m.side,
@@ -895,31 +1069,16 @@ impl Renderer3D {
             None => self.placeholder_shadow.clone(),
         };
 
-        let frame_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("scene3d frame"),
-            layout: &self.frame_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.frame_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&shadow_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.shadow_sampler),
-                },
-            ],
-        });
+        if with_environment && self.room.is_none() {
+            self.room = Some(Environment::room(&self.device, &self.queue));
+        }
 
-        // Opaque front to back, then transparent back to front.
+        // Opaque front to back, transmissive front to back, then transparent back to front.
         let mut order: Vec<usize> = (0..draws.len()).collect();
         order.sort_by(|&a, &b| {
             let (da, db) = (&draws[a], &draws[b]);
-            da.transparent.cmp(&db.transparent).then_with(|| {
-                if da.transparent {
+            da.list.cmp(&db.list).then_with(|| {
+                if da.list == List::Transparent {
                     db.depth.total_cmp(&da.depth)
                 } else {
                     da.depth.total_cmp(&db.depth)
@@ -928,21 +1087,41 @@ impl Renderer3D {
         });
         let mut map_groups: Vec<Option<wgpu::BindGroup>> = Vec::with_capacity(draws.len());
         for draw in &draws {
-            map_groups.push(
-                draw.map
-                    .as_ref()
-                    .and_then(|(url, nearest)| self.map(url, *nearest).cloned()),
-            );
+            let group = match &draw.map {
+                Some((url, nearest)) => self.map(url, *nearest, encoder)?.cloned(),
+                None => None,
+            };
+            map_groups.push(group);
         }
+        let transmissive = draws.iter().any(|d| d.list == List::Transmissive);
         for draw in &draws {
-            self.pipeline(PipelineKey {
-                format,
-                samples,
-                side: draw.side,
-                transparent: draw.transparent,
-                additive: draw.additive,
-            });
+            self.pipeline(pipeline_key(draw, lit_format, samples, draw.side));
+            if transmissive {
+                match draw.list {
+                    List::Opaque => {
+                        self.pipeline(pipeline_key(
+                            draw,
+                            transmission::FORMAT,
+                            transmission::SAMPLES,
+                            draw.side,
+                        ));
+                    }
+                    List::Transmissive if draw.side == Side::Double => {
+                        self.pipeline(pipeline_key(
+                            draw,
+                            transmission::FORMAT,
+                            transmission::SAMPLES,
+                            Side::Back,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
         }
+        let grid_key = GridKey {
+            format: lit_format,
+            samples,
+        };
         let grid_draw = match &scene.grid {
             Some(g) => {
                 let center = Vec3::from(g.center);
@@ -967,7 +1146,7 @@ impl Renderer3D {
                 };
                 self.queue
                     .write_buffer(&self.grid_buffer, 0, bytemuck::bytes_of(&uniform));
-                self.grid_pipeline(GridKey { format, samples });
+                self.grid_pipeline(grid_key);
                 let frame_only = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("scene3d grid frame"),
                     layout: &self.shadow_frame_layout,
@@ -988,13 +1167,91 @@ impl Renderer3D {
             }
             None => None,
         };
-        self.ensure_targets(width, height, format, samples);
+
+        // three's renderTransmissionPass: the opaque list, then double-sided transmissive back faces.
+        let transmission_view = if transmissive {
+            let opaque_group = self.frame_group(
+                &self.linear_frame_buffer,
+                &shadow_view,
+                with_environment,
+                self.transmission.placeholder_view(),
+            );
+            let mut pass = self
+                .transmission
+                .begin_opaque(encoder, width, height, scene.background);
+            pass.set_bind_group(0, &opaque_group, &[]);
+            for &index in &order {
+                let draw = &draws[index];
+                if draw.list != List::Opaque {
+                    continue;
+                }
+                self.draw_mesh(
+                    &mut pass,
+                    draw,
+                    &object_group,
+                    map_groups[index].as_ref(),
+                    pipeline_key(draw, transmission::FORMAT, transmission::SAMPLES, draw.side),
+                );
+            }
+            drop(pass);
+            self.transmission.end_opaque(encoder)?;
+            let back_faces: Vec<usize> = order
+                .iter()
+                .copied()
+                .filter(|&i| draws[i].list == List::Transmissive && draws[i].side == Side::Double)
+                .collect();
+            if !back_faces.is_empty() {
+                let back_group = self.frame_group(
+                    &self.linear_frame_buffer,
+                    &shadow_view,
+                    with_environment,
+                    &self.transmission.opaque_view(),
+                );
+                let mut pass = self.transmission.begin_back_faces(encoder);
+                pass.set_bind_group(0, &back_group, &[]);
+                for &index in &back_faces {
+                    let draw = &draws[index];
+                    self.draw_mesh(
+                        &mut pass,
+                        draw,
+                        &object_group,
+                        map_groups[index].as_ref(),
+                        pipeline_key(
+                            draw,
+                            transmission::FORMAT,
+                            transmission::SAMPLES,
+                            Side::Back,
+                        ),
+                    );
+                }
+                drop(pass);
+                self.transmission.end_back_faces(encoder)?;
+            }
+            Some(self.transmission.view())
+        } else {
+            None
+        };
+        let frame_group = self.frame_group(
+            &self.frame_buffer,
+            &shadow_view,
+            with_environment,
+            transmission_view
+                .as_ref()
+                .unwrap_or(self.transmission.placeholder_view()),
+        );
+
+        let scene_view = match effects {
+            Some(_) => Some(self.post_stack(format).scene_target(width, height)),
+            None => None,
+        };
+        self.ensure_targets(width, height, lit_format, samples);
         let targets = self.targets.as_ref().expect("just ensured");
         let target_view = target.create_view(&Default::default());
-        // the clear bypasses the shader, so it takes the same sRGB encode a non-sRGB target gets there, premultiplied
+        // the clear bypasses the shader, so it takes the same sRGB encode a non-sRGB target gets there, premultiplied;
+        // under post it stays linear, as three's setClearColor into the composer's buffer
         let bg = scene.background;
         let channel = |linear: f32| -> f64 {
-            let encoded = if format.is_srgb() {
+            let encoded = if effects.is_some() || format.is_srgb() {
                 linear
             } else {
                 linear_to_srgb(linear)
@@ -1007,9 +1264,10 @@ impl Renderer3D {
             b: channel(bg[2]),
             a: bg[3] as f64,
         };
+        let output = scene_view.as_ref().unwrap_or(&target_view);
         let (view, resolve) = match &targets.color {
-            Some(msaa) => (msaa, Some(&target_view)),
-            None => (&target_view, None),
+            Some(msaa) => (msaa, Some(output)),
+            None => (output, None),
         };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("scene3d lit"),
@@ -1035,14 +1293,14 @@ impl Renderer3D {
         });
         pass.set_bind_group(0, &frame_group, &[]);
         let mut grid_pending = grid_draw.as_ref();
-        for index in order {
+        for &index in &order {
             let draw = &draws[index];
             // the grid is a transparent object: drawn among them, back to front
-            if draw.transparent {
+            if draw.list == List::Transparent {
                 if let Some((_, frame_only, params)) =
                     grid_pending.filter(|(d, _, _)| *d >= draw.depth)
                 {
-                    pass.set_pipeline(&self.grid_pipelines[&GridKey { format, samples }]);
+                    pass.set_pipeline(&self.grid_pipelines[&grid_key]);
                     pass.set_bind_group(0, frame_only, &[]);
                     pass.set_bind_group(1, params, &[]);
                     pass.draw(0..6, 0..1);
@@ -1050,42 +1308,64 @@ impl Renderer3D {
                     grid_pending = None;
                 }
             }
-            let pipeline = &self.pipelines[&PipelineKey {
-                format,
-                samples,
-                side: draw.side,
-                transparent: draw.transparent,
-                additive: draw.additive,
-            }];
-            let mesh = &self.meshes[&draw.mesh];
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(
-                1,
+            self.draw_mesh(
+                &mut pass,
+                draw,
                 &object_group,
-                &[(draw.slot as u64 * OBJECT_STRIDE) as u32],
+                map_groups[index].as_ref(),
+                pipeline_key(draw, lit_format, samples, draw.side),
             );
-            pass.set_bind_group(
-                2,
-                map_groups[index].as_ref().unwrap_or(&self.white_map),
-                &[],
-            );
-            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.count, 0, 0..1);
         }
         if let Some((_, frame_only, params)) = grid_pending {
-            pass.set_pipeline(&self.grid_pipelines[&GridKey { format, samples }]);
+            pass.set_pipeline(&self.grid_pipelines[&grid_key]);
             pass.set_bind_group(0, frame_only, &[]);
             pass.set_bind_group(1, params, &[]);
             pass.draw(0..6, 0..1);
         }
         drop(pass);
 
+        if let (Some(settings), Some(scene_view)) = (effects, &scene_view) {
+            let bloom = settings.bloom.map(|b| post::Bloom {
+                intensity: b.intensity,
+                threshold: b.threshold,
+                smoothing: b.smoothing,
+            });
+            let vignette = settings.vignette.map(|v| post::Vignette {
+                offset: v.offset,
+                darkness: v.darkness,
+            });
+            self.post_stack(format).apply(
+                encoder,
+                scene_view,
+                (width, height),
+                &target_view,
+                bloom,
+                vignette,
+            );
+        }
+
         let clock = self.clock;
         self.meshes
             .retain(|_, mesh| clock - mesh.last_used <= KEEP_FRAMES);
-        self.maps.retain(|_, entry| clock - entry.1 <= KEEP_FRAMES);
+        self.maps.retain(|_, entry| clock - entry.2 <= KEEP_FRAMES);
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn map_levels(&self, url: &str, nearest: bool) -> Option<u32> {
+        self.maps
+            .get(&(url.to_string(), nearest))
+            .map(|entry| entry.1.mip_level_count())
+    }
+}
+
+fn pipeline_key(draw: &Draw, format: wgpu::TextureFormat, samples: u32, side: Side) -> PipelineKey {
+    PipelineKey {
+        format,
+        samples,
+        side,
+        transparent: draw.transparent,
+        additive: draw.additive,
     }
 }
 
@@ -1153,6 +1433,7 @@ fn upload_rgba(
     queue: &wgpu::Queue,
     width: u32,
     height: u32,
+    levels: u32,
     rgba: &[u8],
 ) -> wgpu::Texture {
     let size = wgpu::Extent3d {
@@ -1163,11 +1444,13 @@ fn upload_rgba(
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("scene3d map"),
         size,
-        mip_level_count: 1,
+        mip_level_count: levels,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
     queue.write_texture(
@@ -1209,4 +1492,401 @@ fn map_bind_group(
             },
         ],
     })
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::super::geometry;
+    use super::super::model::*;
+    use super::Renderer3D;
+    use glam::Mat4;
+
+    const SIZE: u32 = 64;
+
+    fn renderer() -> Option<Renderer3D> {
+        let shared = crate::device::shared_device().ok()?;
+        Some(Renderer3D::new(shared.device.clone(), shared.queue.clone()))
+    }
+
+    fn scene(meshes: Vec<MeshInstance>) -> Scene3D {
+        Scene3D {
+            camera: Camera {
+                eye: [0.0, 0.0, 8.0],
+                target: [0.0, 0.0, 0.0],
+                up: [0.0, 1.0, 0.0],
+                projection: Projection::Perspective {
+                    fov_y_degrees: 45.0,
+                },
+                near: 0.1,
+                far: 100.0,
+            },
+            background: [0.0, 0.0, 0.0, 1.0],
+            lights: Lights::default(),
+            shadows: false,
+            tone_mapping: ToneMapping::None,
+            meshes,
+            grid: None,
+            interaction: Interaction::default(),
+            animated: false,
+            environment: None,
+            post: None,
+        }
+    }
+
+    fn instance(mesh: MeshData, transform: Mat4, material: Material) -> MeshInstance {
+        MeshInstance {
+            mesh,
+            transform: transform.to_cols_array(),
+            material,
+            cast_shadow: false,
+            receive_shadow: false,
+            id: None,
+        }
+    }
+
+    fn draw(renderer: &mut Renderer3D, scene: &Scene3D) -> Vec<u8> {
+        let shared = crate::device::shared_device().expect("device");
+        let texture = shared.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene3d integration target"),
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        shared
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = shared.device.create_command_encoder(&Default::default());
+        renderer
+            .encode(&mut encoder, scene, &texture, 4)
+            .expect("render");
+        let rgba = crate::renderer::copy_texture_to_rgba(
+            &shared.device,
+            &shared.queue,
+            encoder,
+            &texture,
+            SIZE,
+            SIZE,
+        )
+        .expect("readback");
+        let errors = pollster::block_on(shared.device.pop_error_scope());
+        assert!(errors.is_none(), "{errors:?}");
+        rgba
+    }
+
+    fn pixel(rgba: &[u8], x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * SIZE + x) * 4) as usize;
+        [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+    }
+
+    fn luma(p: [u8; 4]) -> u32 {
+        p[0] as u32 + p[1] as u32 + p[2] as u32
+    }
+
+    #[test]
+    fn the_room_environment_lights_a_metal_sphere_that_no_light_reaches() {
+        let Some(mut r) = renderer() else { return };
+        let sphere = instance(
+            geometry::sphere(2.0, 32, 16).unwrap(),
+            Mat4::IDENTITY,
+            Material {
+                kind: MaterialKind::Standard,
+                metalness: 1.0,
+                roughness: 0.2,
+                ..Material::default()
+            },
+        );
+        let dark = scene(vec![sphere]);
+        let lit = Scene3D {
+            environment: Some(EnvironmentKind::Room),
+            ..dark.clone()
+        };
+        let (with, without) = (draw(&mut r, &lit), draw(&mut r, &dark));
+        let center = (SIZE / 2, SIZE / 2);
+        assert!(
+            luma(pixel(&with, center.0, center.1)) > 60,
+            "the room reflects off the metal: {:?}",
+            pixel(&with, center.0, center.1)
+        );
+        assert!(
+            luma(pixel(&without, center.0, center.1)) < 6,
+            "control: without the environment no light reaches it: {:?}",
+            pixel(&without, center.0, center.1)
+        );
+        assert_eq!(
+            pixel(&with, 1, 1),
+            [0, 0, 0, 255],
+            "the environment lights materials, not the background"
+        );
+    }
+
+    #[test]
+    fn a_basic_material_ignores_the_environment() {
+        let Some(mut r) = renderer() else { return };
+        let gray = Material {
+            kind: MaterialKind::Basic,
+            color: [0.2, 0.2, 0.2],
+            ..Material::default()
+        };
+        let plain = scene(vec![instance(
+            geometry::plane(4.0, 4.0).unwrap(),
+            Mat4::IDENTITY,
+            gray,
+        )]);
+        let lit = Scene3D {
+            environment: Some(EnvironmentKind::Room),
+            ..plain.clone()
+        };
+        assert_eq!(
+            pixel(&draw(&mut r, &lit), SIZE / 2, SIZE / 2),
+            pixel(&draw(&mut r, &plain), SIZE / 2, SIZE / 2)
+        );
+    }
+
+    fn glowing_square() -> Scene3D {
+        scene(vec![instance(
+            geometry::plane(2.0, 2.0).unwrap(),
+            Mat4::IDENTITY,
+            Material {
+                kind: MaterialKind::Standard,
+                color: [0.0, 0.0, 0.0],
+                emissive: [1.0, 1.0, 1.0],
+                emissive_intensity: 4.0,
+                ..Material::default()
+            },
+        )])
+    }
+
+    #[test]
+    fn bloom_spreads_a_bright_emissive_past_its_edge() {
+        let Some(mut r) = renderer() else { return };
+        let plain = glowing_square();
+        let bloomed = Scene3D {
+            post: Some(PostSettings {
+                bloom: Some(BloomSettings {
+                    intensity: 1.0,
+                    threshold: 0.9,
+                    smoothing: 0.3,
+                }),
+                vignette: None,
+            }),
+            ..plain.clone()
+        };
+        let (with, without) = (draw(&mut r, &bloomed), draw(&mut r, &plain));
+        // the square spans about 19 pixels around the center; this one is a few pixels outside it
+        let outside = (SIZE / 2 + 14, SIZE / 2);
+        assert!(
+            luma(pixel(&with, outside.0, outside.1)) > 30,
+            "bloom glows past the edge: {:?}",
+            pixel(&with, outside.0, outside.1)
+        );
+        assert_eq!(
+            pixel(&without, outside.0, outside.1),
+            [0, 0, 0, 255],
+            "control: without post the background stays black"
+        );
+        assert!(
+            pixel(&with, SIZE / 2, SIZE / 2)[0] == 255,
+            "the square itself stays saturated"
+        );
+    }
+
+    #[test]
+    fn a_vignette_alone_darkens_the_corners_and_skips_tone_mapping() {
+        let Some(mut r) = renderer() else { return };
+        let gray = Material {
+            kind: MaterialKind::Basic,
+            color: [0.5, 0.5, 0.5],
+            ..Material::default()
+        };
+        let plain = Scene3D {
+            tone_mapping: ToneMapping::Aces,
+            ..scene(vec![instance(
+                geometry::plane(20.0, 20.0).unwrap(),
+                Mat4::IDENTITY,
+                gray,
+            )])
+        };
+        let vignetted = Scene3D {
+            post: Some(PostSettings {
+                bloom: None,
+                vignette: Some(VignetteSettings {
+                    offset: 0.3,
+                    darkness: 0.6,
+                }),
+            }),
+            ..plain.clone()
+        };
+        let (with, without) = (draw(&mut r, &vignetted), draw(&mut r, &plain));
+        let corner = luma(pixel(&with, 1, 1));
+        let center = luma(pixel(&with, SIZE / 2, SIZE / 2));
+        assert!(corner + 30 < center, "corner {corner} center {center}");
+        // linear 0.5 encodes to 188 untoned; three's ACES fit lifts it to about 197
+        let untoned = pixel(&with, SIZE / 2, SIZE / 2)[0];
+        assert!((185..=191).contains(&untoned), "{untoned}");
+        let toned = pixel(&without, SIZE / 2, SIZE / 2)[0];
+        assert!(
+            toned >= 193,
+            "control: without a composer ACES applies: {toned}"
+        );
+        let empty = Scene3D {
+            post: Some(PostSettings::default()),
+            ..plain.clone()
+        };
+        assert_eq!(
+            draw(&mut r, &empty),
+            without,
+            "control: post with no effect mounts no composer"
+        );
+    }
+
+    fn pane(transmission: f32, side: Side) -> Scene3D {
+        let behind = instance(
+            geometry::plane(20.0, 20.0).unwrap(),
+            Mat4::from_translation(glam::Vec3::new(0.0, 0.0, -2.0)),
+            Material {
+                kind: MaterialKind::Basic,
+                ..Material::default()
+            },
+        );
+        let glass = instance(
+            geometry::plane(3.0, 3.0).unwrap(),
+            Mat4::IDENTITY,
+            Material {
+                kind: MaterialKind::Physical,
+                color: [0.1, 1.0, 0.1],
+                roughness: 0.0,
+                transmission,
+                side,
+                ..Material::default()
+            },
+        );
+        scene(vec![glass, behind])
+    }
+
+    #[test]
+    fn a_transmissive_pane_shows_what_is_behind_it_tinted() {
+        let Some(mut r) = renderer() else { return };
+        let (glass, opaque) = (
+            draw(&mut r, &pane(1.0, Side::Front)),
+            draw(&mut r, &pane(0.0, Side::Front)),
+        );
+        let [red, green, _, _] = pixel(&glass, SIZE / 2, SIZE / 2);
+        assert!(
+            green > 200 && red + 80 < green,
+            "the white wall shows through, tinted green: {:?}",
+            pixel(&glass, SIZE / 2, SIZE / 2)
+        );
+        assert!(
+            luma(pixel(&opaque, SIZE / 2, SIZE / 2)) < 10,
+            "control: an opaque unlit pane hides the wall: {:?}",
+            pixel(&opaque, SIZE / 2, SIZE / 2)
+        );
+        assert_eq!(
+            pixel(&glass, 2, 2),
+            [255, 255, 255, 255],
+            "the wall around the pane is untouched"
+        );
+        let double = draw(&mut r, &pane(1.0, Side::Double));
+        let [_, green, _, _] = pixel(&double, SIZE / 2, SIZE / 2);
+        assert!(
+            green > 100,
+            "a double-sided pane still transmits: {:?}",
+            pixel(&double, SIZE / 2, SIZE / 2)
+        );
+    }
+
+    fn register_png(url: &str, width: u32, height: u32) {
+        let image = image::RgbaImage::from_fn(width, height, |x, y| {
+            if (x + y) % 2 == 0 {
+                image::Rgba([255, 255, 255, 255])
+            } else {
+                image::Rgba([0, 0, 0, 255])
+            }
+        });
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("png");
+        crate::asset::register_asset(url, bytes.into(), Some("image/png"));
+    }
+
+    #[test]
+    fn linear_maps_get_a_full_mip_chain_and_nearest_ones_keep_one_level() {
+        let Some(mut r) = renderer() else { return };
+        let shared = crate::device::shared_device().expect("device");
+        let (checker, dot) = (
+            "test://scene3d/mips-checker.png",
+            "test://scene3d/mips-dot.png",
+        );
+        register_png(checker, 8, 4);
+        register_png(dot, 1, 1);
+        shared
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut encoder = shared.device.create_command_encoder(&Default::default());
+        for (url, nearest) in [(checker, false), (checker, true), (dot, false)] {
+            assert!(r.map(url, nearest, &mut encoder).expect("map").is_some());
+        }
+        shared.queue.submit([encoder.finish()]);
+        let errors = pollster::block_on(shared.device.pop_error_scope());
+        assert!(errors.is_none(), "{errors:?}");
+        assert_eq!(r.map_levels(checker, false), Some(4), "8x4 down to 1x1");
+        assert_eq!(
+            r.map_levels(checker, true),
+            Some(1),
+            "three's NearestFilter generates no mips"
+        );
+        assert_eq!(
+            r.map_levels(dot, false),
+            Some(1),
+            "control: a 1x1 texture has one level"
+        );
+    }
+
+    #[test]
+    fn a_mapped_plane_draws_through_its_mips() {
+        let Some(mut r) = renderer() else { return };
+        let url = "test://scene3d/mips-far-checker.png";
+        register_png(url, 256, 256);
+        let far = |nearest: bool| {
+            let kind = if nearest {
+                MaterialKind::Flat(Flat {
+                    nearest: true,
+                    ..Flat::default()
+                })
+            } else {
+                MaterialKind::Basic
+            };
+            scene(vec![instance(
+                geometry::plane(2.0, 2.0).unwrap(),
+                Mat4::IDENTITY,
+                Material {
+                    kind,
+                    map: Some(url.into()),
+                    ..Material::default()
+                },
+            )])
+        };
+        let filtered = draw(&mut r, &far(false));
+        let [v, _, _, _] = pixel(&filtered, SIZE / 2, SIZE / 2);
+        // a 256-texel checker over ~19 pixels averages to linear 0.5, which encodes to 188
+        assert!((175..=200).contains(&v), "mipmapped average: {v}");
+        let aliased = draw(&mut r, &far(true));
+        let [n, _, _, _] = pixel(&aliased, SIZE / 2, SIZE / 2);
+        assert!(
+            n < 10 || n > 245,
+            "control: nearest sampling picks one texel: {n}"
+        );
+    }
 }

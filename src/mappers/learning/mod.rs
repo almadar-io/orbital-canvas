@@ -98,7 +98,7 @@ pub fn map(
         "biology-canvas" => biology_canvas::map(props, viewport),
         "chemistry-canvas" => chemistry_canvas::map(props, viewport),
         "graph-canvas" => graph_canvas::map(props, viewport),
-        "learning-canvas" => Ok(learning_canvas::map(props, viewport)),
+        "learning-canvas" => learning_canvas::map(props, viewport),
         "math-canvas" => math_canvas::map(props, viewport),
         "physics-canvas" => physics_canvas::map(props, viewport),
         other => unreachable!("learning::handles admitted `{other}` with no mapper"),

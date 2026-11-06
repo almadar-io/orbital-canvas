@@ -3,18 +3,20 @@
 
 use super::canvas::{self, CanvasSpec};
 use super::shape::parse_shapes;
+use crate::mappers::game_canvas_2d::CanvasSceneError;
 use crate::mappers::scene::MappedScene;
 use serde_json::Value;
 
-pub fn map(props: &Value, viewport: Option<(f32, f32)>) -> MappedScene {
-    let spec = CanvasSpec::from_props(
+pub fn map(props: &Value, viewport: Option<(f32, f32)>) -> Result<MappedScene, CanvasSceneError> {
+    let mut spec = CanvasSpec::from_props(
         "learning-canvas",
         props,
         600.0,
         400.0,
         parse_shapes(props.get("shapes")),
     );
-    canvas::render(&spec, &canvas::theme_for(props), viewport)
+    spec.particles = canvas::parse_particles(props.get("particles"))?;
+    Ok(canvas::render(&spec, &canvas::theme_for(props), viewport))
 }
 
 #[cfg(test)]
@@ -51,7 +53,7 @@ mod tests {
 
     #[test]
     fn hotspot_scene_draws_five_solid_series_circles_and_five_centered_labels() {
-        let scene = map(&hotspot_scene(), None);
+        let scene = map(&hotspot_scene(), None).unwrap();
         let cmds = &scene.packet.draw_commands;
         let circles: Vec<_> = cmds
             .iter()
@@ -88,7 +90,7 @@ mod tests {
     fn a_fillstyle_other_than_solid_changes_the_circle_alpha() {
         let mut props = hotspot_scene();
         props["shapes"][0]["fillStyle"] = json!("tint");
-        let scene = map(&props, None);
+        let scene = map(&props, None).unwrap();
         let alphas: Vec<f32> = scene
             .packet
             .draw_commands
@@ -103,7 +105,7 @@ mod tests {
 
     #[test]
     fn tapping_a_part_emits_tap_shape_with_its_id_and_a_miss_emits_nothing() {
-        let scene = map(&hotspot_scene(), None);
+        let scene = map(&hotspot_scene(), None).unwrap();
         let hit = scene.emits_at(300.0, 170.0);
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].event, "TAP_SHAPE");
@@ -118,7 +120,7 @@ mod tests {
 
     #[test]
     fn the_viewport_fit_keeps_taps_on_their_shape() {
-        let scene = map(&hotspot_scene(), Some((300.0, 190.0)));
+        let scene = map(&hotspot_scene(), Some((300.0, 190.0))).unwrap();
         let hit = scene.emits_at(150.0, 85.0);
         assert_eq!(
             hit[0].payload["id"], "nucleus",
@@ -133,9 +135,9 @@ mod tests {
     #[test]
     fn readouts_and_traces_ride_on_the_authored_shapes() {
         let mut props = hotspot_scene();
-        let base = map(&props, None).packet.draw_commands.len();
+        let base = map(&props, None).unwrap().packet.draw_commands.len();
         props["readouts"] = json!([{"label": "score", "value": 3}]);
         props["traces"] = json!([{"series": [{"samples": [{"x": 0, "y": 0}, {"x": 1, "y": 1}]}]}]);
-        assert!(map(&props, None).packet.draw_commands.len() > base + 4);
+        assert!(map(&props, None).unwrap().packet.draw_commands.len() > base + 4);
     }
 }

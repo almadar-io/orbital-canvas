@@ -32,7 +32,6 @@ use std::f64::consts::FRAC_PI_2;
 
 type Fields = Map<String, Value>;
 
-const STEP_HOST: u8 = 2;
 const STEP_PARITY: u8 = 4;
 
 /// The theme's scene axis as `canvasTheme.ts` resolves it from CSS variables. [`Default`] holds that resolver's
@@ -149,13 +148,7 @@ fn compose(
     compose_with(node, width, height, theme, elapsed_ms, epoch_ms, None)
 }
 
-/// An edit-mode drag in flight: the dragged drawable drawn at its preview cell (`withPreviewPosition`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct DragPreview {
-    pub id: String,
-    pub x: i64,
-    pub y: i64,
-}
+pub use crate::scene3d::view::DragPreview;
 
 /// [`scene_from_canvas_node_at_epoch`] with an edit-mode drag preview.
 pub fn scene_from_canvas_node_with_preview(

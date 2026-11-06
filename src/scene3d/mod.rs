@@ -2,13 +2,17 @@
 //! lighting and shadows run in shaders.
 
 pub mod animation;
+pub mod environment;
 pub mod geometry;
 pub mod gltf;
 pub mod label;
+pub mod mipmap;
 pub mod model;
+pub mod post;
 pub mod render;
 pub mod skin;
 pub mod tessellate;
+pub mod transmission;
 pub mod view;
 
 pub use model::*;

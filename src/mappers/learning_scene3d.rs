@@ -112,7 +112,6 @@ const PHYSICS_KEYS: &[&str] = &[
     "vectorScale",
     "angles",
     "field",
-    "meters",
 ];
 
 const BIOLOGY_KEYS: &[&str] = &[
@@ -147,8 +146,9 @@ const PHYSICS_2D: &[&str] = &[
     "meters",
 ];
 const BIOLOGY_2D: &[&str] = &["compartments", "bands", "stages", "helix"];
-const CHEMISTRY_2D: &[&str] = &["containers", "equation"];
-const COMMON_2D: &[&str] = &["shapes", "readouts", "traces", "animate"];
+const CHEMISTRY_2D: &[&str] = &["containers"];
+// shapes, readouts, traces, meters and the equation draw as the 2D overlay over the scene (learning_overlay3d)
+const COMMON_2D: &[&str] = &["animate"];
 
 /// The `canvas` mode:"3d" node `LearningScene3D` hands `Canvas3DHost` for a physics, biology or chemistry node:
 /// drawables in scene cells with colors as authored (tone names resolve in the host stage), camera, lighting, post,
@@ -2082,9 +2082,15 @@ mod tests {
         );
 
         let labelled = json!({"type": "physics-canvas", "mode": "3d", "bodies": [{"x": 0, "y": 0, "label": "m"}]});
-        let unlabelled = json!({"type": "physics-canvas", "mode": "3d", "bodies": [{"x": 0, "y": 0}]});
-        let with = learning_scene3d(&labelled, 600.0, 400.0, &theme).expect("a label draws as 3D text");
+        let unlabelled =
+            json!({"type": "physics-canvas", "mode": "3d", "bodies": [{"x": 0, "y": 0}]});
+        let with =
+            learning_scene3d(&labelled, 600.0, 400.0, &theme).expect("a label draws as 3D text");
         let without = learning_scene3d(&unlabelled, 600.0, 400.0, &theme).expect("control");
-        assert_eq!(with.meshes.len(), without.meshes.len() + 1, "the label is one billboard more");
+        assert_eq!(
+            with.meshes.len(),
+            without.meshes.len() + 1,
+            "the label is one billboard more"
+        );
     }
 }

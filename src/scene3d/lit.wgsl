@@ -7,6 +7,8 @@ struct Object {
   emissive: vec4<f32>,
   // x: metalness, y: roughness, z: kind (0 basic, 1 standard, 2 physical, 3 toon, 4 flat), w: flags
   params: vec4<f32>,
+  // x: transmission, y: ior, z: thickness
+  physical: vec4<f32>,
 };
 
 const FLAG_FLAT: u32 = 1u;
@@ -117,12 +119,20 @@ struct Surface {
   toon: bool,
 };
 
-fn direct(s: Surface, n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, radiance: vec3<f32>) -> vec3<f32> {
+struct Reflected {
+  diffuse: vec3<f32>,
+  specular: vec3<f32>,
+};
+
+fn direct(s: Surface, n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, radiance: vec3<f32>) -> Reflected {
+  var out: Reflected;
   let dot_nl = clamp(dot(n, l), 0.0, 1.0);
   if (s.toon) {
     let coord = dot(n, l) * 0.5 + 0.5;
     let ramp = select(1.0, 0.7, coord < 0.7);
-    return radiance * ramp * s.diffuse / PI;
+    out.diffuse = radiance * ramp * s.diffuse / PI;
+    out.specular = vec3<f32>(0.0);
+    return out;
   }
   let irradiance = radiance * dot_nl;
   let h = normalize(l + v);
@@ -130,16 +140,19 @@ fn direct(s: Surface, n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, radiance: vec3<f
   let dot_nh = clamp(dot(n, h), 0.0, 1.0);
   let dot_vh = clamp(dot(v, h), 0.0, 1.0);
   let alpha = s.roughness * s.roughness;
-  let spec = f_schlick(s.specular, dot_vh) * v_ggx_smith_correlated(alpha, dot_nl, dot_nv) * d_ggx(alpha, dot_nh);
-  return irradiance * (s.diffuse / PI + spec);
+  out.diffuse = irradiance * s.diffuse / PI;
+  out.specular = irradiance * f_schlick(s.specular, dot_vh) * v_ggx_smith_correlated(alpha, dot_nl, dot_nv) * d_ggx(alpha, dot_nh);
+  return out;
 }
 
 @fragment
 fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
   let flags = u32(object.params.w);
+  let flat_shaded = (flags & FLAG_FLAT) != 0u;
   let texel = textureSample(color_map, color_sampler, in.uv);
   // derivatives before the cutout's discard, which leaves the rest of the shader in non-uniform control flow
   let face = cross(dpdx(in.world), dpdy(in.world));
+  let roughness = ibl_material_roughness(object.params.y, select(normalize(in.normal), normalize(face), flat_shaded));
   let base = object.color * select(vec4<f32>(1.0), texel, (flags & FLAG_MAP) != 0u);
   let kind = u32(object.params.z);
   if (kind == 0u || kind == 4u) {
@@ -149,40 +162,51 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> @location(0) ve
     return finish(base.rgb, base.a);
   }
   var n = normalize(in.normal);
-  if ((flags & FLAG_FLAT) != 0u) {
+  if (flat_shaded) {
     n = normalize(face);
   }
   let v = normalize(frame.camera_pos.xyz - in.world);
-  if ((flags & FLAG_FLAT) != 0u) {
+  if (flat_shaded) {
     if (dot(n, v) < 0.0) { n = -n; }
   } else if (!front) {
     n = -n;
   }
   let metalness = clamp(object.params.x, 0.0, 1.0);
+  let physical = kind == 2u;
+  let specular = ibl_specular(base.rgb, metalness, object.physical.y, physical);
   var s: Surface;
   s.diffuse = base.rgb * (1.0 - metalness);
-  s.specular = mix(vec3<f32>(0.04), base.rgb, metalness);
-  s.roughness = clamp(object.params.y, 0.0525, 1.0);
+  s.specular = specular.rgb;
+  s.roughness = roughness;
   s.toon = kind == 3u;
   if (s.toon) {
     s.diffuse = base.rgb;
   }
 
-  var light = vec3<f32>(0.0);
+  var diffuse = vec3<f32>(0.0);
+  var spec = vec3<f32>(0.0);
   // indirect: ambient and hemisphere irradiance over a Lambert surface
   var indirect = frame.ambient.rgb;
   if (frame.hemi_sky.w > 0.5) {
     let weight = 0.5 * n.y + 0.5;
     indirect = indirect + mix(frame.hemi_ground.rgb, frame.hemi_sky.rgb, weight);
   }
-  light = light + indirect * s.diffuse / PI;
+  diffuse = diffuse + indirect * s.diffuse / PI;
+  // three gives scene.environment to MeshStandardMaterial and its subclass alone
+  if ((kind == 1u || physical) && frame.options.w > 0.5) {
+    let ibl = ibl_indirect(n, v, s.diffuse, specular.rgb, specular.w, s.roughness);
+    diffuse = diffuse + ibl.diffuse;
+    spec = spec + ibl.specular;
+  }
 
   if (frame.dir_to_light.w > 0.5) {
     var visible = 1.0;
     if ((flags & FLAG_RECEIVE_SHADOW) != 0u) {
       visible = shadow_factor(in.shadow_coord);
     }
-    light = light + visible * direct(s, n, v, normalize(frame.dir_to_light.xyz), frame.dir_color.rgb);
+    let r = direct(s, n, v, normalize(frame.dir_to_light.xyz), frame.dir_color.rgb);
+    diffuse = diffuse + visible * r.diffuse;
+    spec = spec + visible * r.specular;
   }
   let count = u32(frame.options.x);
   for (var i = 0u; i < MAX_POINTS; i = i + 1u) {
@@ -193,13 +217,21 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front: bool) -> @location(0) ve
     let decay = frame.point_color[i].w;
     var falloff = 1.0 / max(pow(distance, decay), 0.01);
     if (cutoff > 0.0) {
-      let r = distance / cutoff;
-      let t = clamp(1.0 - r * r * r * r, 0.0, 1.0);
+      let q = distance / cutoff;
+      let t = clamp(1.0 - q * q * q * q, 0.0, 1.0);
       falloff = falloff * t * t;
     }
-    light = light + direct(s, n, v, to_light / max(distance, 1e-6), frame.point_color[i].rgb * falloff);
+    let r = direct(s, n, v, to_light / max(distance, 1e-6), frame.point_color[i].rgb * falloff);
+    diffuse = diffuse + r.diffuse;
+    spec = spec + r.specular;
   }
-  light = light + object.emissive.rgb;
-  return finish(light, base.a);
+  var alpha = base.a;
+  let transmission = object.physical.x;
+  if (physical && transmission > 0.0) {
+    let t = transmission_volume_refraction(n, v, s.roughness, s.diffuse, specular.rgb, specular.w, in.world,
+      object.model, frame.view_proj, object.physical.y, object.physical.z, vec3<f32>(1.0), 0.0, false);
+    diffuse = mix(diffuse, t.rgb, transmission);
+    alpha = base.a * mix(1.0, t.a, transmission);
+  }
+  return finish(diffuse + spec + object.emissive.rgb, alpha);
 }
-

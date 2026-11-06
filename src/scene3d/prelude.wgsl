@@ -17,7 +17,7 @@ struct Frame {
   shadow: vec4<f32>,
   point_pos: array<vec4<f32>, 8>,
   point_color: array<vec4<f32>, 8>,
-  // x: point count, y: 1 for ACES tone mapping, z: 1 to encode sRGB in the shader, w: unused
+  // x: point count, y: 1 for ACES tone mapping, z: 1 to encode sRGB in the shader, w: 1 when an environment is bound
   options: vec4<f32>,
   // the camera's world-space right and up axes, for billboards
   camera_right: vec4<f32>,
