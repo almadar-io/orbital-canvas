@@ -146,6 +146,40 @@ fn compose(
     elapsed_ms: Option<f64>,
     epoch_ms: Option<f64>,
 ) -> Result<Scene3D, CanvasSceneError> {
+    compose_with(node, width, height, theme, elapsed_ms, epoch_ms, None)
+}
+
+/// An edit-mode drag in flight: the dragged drawable drawn at its preview cell (`withPreviewPosition`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DragPreview {
+    pub id: String,
+    pub x: i64,
+    pub y: i64,
+}
+
+/// [`scene_from_canvas_node_at_epoch`] with an edit-mode drag preview.
+pub fn scene_from_canvas_node_with_preview(
+    node: &Value,
+    width: f32,
+    height: f32,
+    theme: &SceneTheme,
+    elapsed_ms: Option<f64>,
+    epoch_ms: Option<f64>,
+    preview: Option<&DragPreview>,
+) -> Result<Scene3D, CanvasSceneError> {
+    compose_with(node, width, height, theme, elapsed_ms, epoch_ms, preview)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compose_with(
+    node: &Value,
+    width: f32,
+    height: f32,
+    theme: &SceneTheme,
+    elapsed_ms: Option<f64>,
+    epoch_ms: Option<f64>,
+    preview: Option<&DragPreview>,
+) -> Result<Scene3D, CanvasSceneError> {
     let object = node.as_object().ok_or(CanvasSceneError::NotAnObject)?;
     let fields = object
         .get("props")
@@ -164,6 +198,7 @@ fn compose(
         ));
     }
     check_canvas_keys(fields)?;
+    let props = super::canvas3d_props::canvas_props_3d(node)?;
 
     let cell = match opt_number(fields, "pixelsPerUnit", "canvas")? {
         Some(ppu) if ppu > 0.0 => 1.0 / ppu,
@@ -176,14 +211,14 @@ fn compose(
         None => 1.0,
     };
     let show_grid = opt_bool(fields, "showGrid", "canvas")?.unwrap_or(true);
-    if let Some(post) = opt_object(fields, "post", "canvas")? {
-        check_keys(post, &["bloom", "vignette"], "canvas.post")?;
-        for key in ["bloom", "vignette"] {
-            if present(post, key).is_some() {
-                return Err(undrawn(&format!("canvas.post.{key}"), STEP_PARITY));
-            }
-        }
-    }
+    let post = post_settings(opt_object(fields, "post", "canvas")?)?;
+    let environment = match opt_object(fields, "lighting", "canvas")? {
+        Some(l) => match opt_str(l, "environment", "canvas.lighting")? {
+            Some("room") => Some(crate::scene3d::model::EnvironmentKind::Room),
+            _ => None,
+        },
+        None => None,
+    };
 
     let mut nodes = Vec::new();
     if let Some(drawables) = present(fields, "drawables") {
@@ -206,7 +241,35 @@ fn compose(
         }
     }
 
-    let bounds = scene_bounds(&nodes)?;
+    let drawn_bounds = scene_bounds(&nodes)?;
+    let [min_x, max_x, min_z, max_z] = props.world_bounds([
+        drawn_bounds.min_x,
+        drawn_bounds.max_x,
+        drawn_bounds.min_z,
+        drawn_bounds.max_z,
+    ]);
+    let bounds = Bounds {
+        min_x,
+        max_x,
+        min_z,
+        max_z,
+    };
+    let drawn: Vec<[f64; 2]> = drawn_items(&nodes)?
+        .into_iter()
+        .map(|(pos, _)| [pos[0], pos[1]])
+        .collect();
+    let paint_nodes: Vec<(String, Value)> = match preview {
+        Some(p) => {
+            let values: Vec<Value> = nodes.iter().map(|(_, n)| n.clone()).collect();
+            let moved = super::canvas3d_props::with_preview_position(&values, &p.id, p.x, p.y);
+            nodes
+                .iter()
+                .map(|(path, _)| path.clone())
+                .zip(moved)
+                .collect()
+        }
+        None => nodes.clone(),
+    };
     let shadows = opt_bool(fields, "shadows", "canvas")?.unwrap_or(true);
     let mut walk = Walk {
         theme,
@@ -224,16 +287,37 @@ fn compose(
         off_x: -bounds.min_x * cell,
         off_z: -bounds.min_z * cell,
     };
-    for (path, node) in &nodes {
-        walk.drawable(node, path, DMat4::IDENTITY, place, 1.0)?;
+    for (path, node) in &paint_nodes {
+        let fields_of = node.as_object();
+        let has_id = fields_of
+            .and_then(|f| f.get("id"))
+            .and_then(Value::as_str)
+            .is_some();
+        let pos = fields_of
+            .and_then(|f| present(f, "position"))
+            .map(|p| scene_pos(p, path))
+            .transpose()?;
+        let parent = match pos {
+            Some(pos) => props.unit_transform(has_id, place.world(pos)),
+            None => DMat4::IDENTITY,
+        };
+        let first = walk.meshes.len();
+        walk.drawable(node, path, parent, place, 1.0)?;
+        if let (Some(fog), Some(pos)) = (&props.fog_of_war, pos) {
+            if fog.fogged(pos[0], pos[1]) {
+                super::canvas3d_props::shade_fogged(&mut walk.meshes[first..]);
+            }
+        }
     }
     walk.bind_skins()?;
 
     let camera = camera(opt_object(fields, "camera", "canvas")?, &bounds, cell)?;
     let (lights, tone_mapping) = lights(opt_object(fields, "lighting", "canvas")?, shadows, theme)?;
-    let background = match present(fields, "backgroundColor") {
-        Some(value) => rgba(value, "canvas.backgroundColor")?,
-        None => match &theme.ground {
+    // a backdrop image paints behind the scene in the 2D layer, so the scene itself clears to transparent
+    let background = match (&props.background_image, present(fields, "backgroundColor")) {
+        (Some(_), _) => [0.0; 4],
+        (None, Some(value)) => rgba(value, "canvas.backgroundColor")?,
+        (None, None) => match &theme.ground {
             Some(ground) => rgba(&Value::String(ground.clone()), "theme --surface-diagram")?,
             None => [0.0; 4],
         },
@@ -243,17 +327,122 @@ fn compose(
     } else {
         None
     };
+    let mut interaction = interaction(fields, &nodes, &bounds, cell)?;
+    interaction.max_x = bounds.max_x as f32;
+    interaction.max_z = bounds.max_z as f32;
+    interaction.drawn = drawn;
+    interaction.editable = props.edit.is_some();
+    interaction.follow_from = follow_start(opt_object(fields, "camera", "canvas")?, &bounds, cell)?;
+    let mut meshes = walk.meshes;
+    if let Some(selected) = props.edit.as_ref().and_then(|e| e.selected.as_deref()) {
+        let at = match preview.filter(|p| p.id == selected) {
+            Some(p) => Some([p.x as f64, p.y as f64, 0.0]),
+            None => drawn_position_of(&nodes, selected)?,
+        };
+        if let Some(at) = at {
+            let color = match theme.tones.get("highlight") {
+                Some(css) => rgb(&Value::String(css.clone()), "theme tone highlight")?,
+                None => [1.0, 1.0, 1.0],
+            };
+            meshes.push(super::canvas3d_props::selection_ring(
+                &interaction,
+                at,
+                color,
+            ));
+        }
+    }
     Ok(Scene3D {
         camera,
         background,
         lights,
         shadows,
         tone_mapping,
-        meshes: walk.meshes,
+        meshes,
         grid,
-        interaction: interaction(fields, &nodes, &bounds, cell)?,
+        interaction,
         animated: walk.animated,
+        environment,
+        post,
     })
+}
+
+/// A following camera's first-frame pose (the host's CameraPose `follow`/`chase` framing, `[cx, d*0.5, cz+d]` turned by
+/// `azimuth`), which GameCamera3D then eases toward the follow pose; `None` for a camera that does not follow.
+fn follow_start(
+    c: Option<&Fields>,
+    b: &Bounds,
+    cell: f64,
+) -> Result<Option<[f32; 3]>, CanvasSceneError> {
+    let Some(c) = c else { return Ok(None) };
+    if !matches!(
+        present(c, "mode").and_then(Value::as_str),
+        Some("follow" | "chase")
+    ) {
+        return Ok(None);
+    }
+    let (span_x, span_z) = (b.max_x - b.min_x, b.max_z - b.min_z);
+    let (cx, cz) = (span_x / 2.0 * cell, span_z / 2.0 * cell);
+    let size = (span_x * cell).max(span_z * cell).max(4.0);
+    let d = size
+        / opt_number(c, "zoom", "canvas.camera")?
+            .filter(|z| *z > 0.0)
+            .unwrap_or(1.0);
+    let (x, y, z) = (cx, d * 0.5, cz + d);
+    let (x, z) = match opt_number(c, "azimuth", "canvas.camera")?.filter(|a| *a != 0.0) {
+        Some(a) => {
+            let (ox, oz) = (x - cx, z - cz);
+            let (s, co) = a.sin_cos();
+            (cx + ox * co - oz * s, cz + ox * s + oz * co)
+        }
+        None => (x, z),
+    };
+    Ok(Some([x as f32, y as f32, z as f32]))
+}
+
+/// Where the first drawable carrying `id` is drawn (scene units).
+fn drawn_position_of(
+    nodes: &[(String, Value)],
+    id: &str,
+) -> Result<Option<[f64; 3]>, CanvasSceneError> {
+    Ok(drawn_items(nodes)?
+        .into_iter()
+        .find(|(_, item)| item.as_deref() == Some(id))
+        .map(|(pos, _)| pos))
+}
+
+/// `post`: Effects3D mounts bloom and vignette with these defaults when the key is present.
+fn post_settings(
+    post: Option<&Fields>,
+) -> Result<Option<crate::scene3d::model::PostSettings>, CanvasSceneError> {
+    use crate::scene3d::model::{BloomSettings, PostSettings, VignetteSettings};
+    let Some(post) = post else { return Ok(None) };
+    check_keys(post, &["bloom", "vignette"], "canvas.post")?;
+    let bloom = match opt_object(post, "bloom", "canvas.post")? {
+        Some(b) => {
+            check_keys(
+                b,
+                &["intensity", "threshold", "smoothing"],
+                "canvas.post.bloom",
+            )?;
+            Some(BloomSettings {
+                intensity: opt_number(b, "intensity", "canvas.post.bloom")?.unwrap_or(1.0) as f32,
+                threshold: opt_number(b, "threshold", "canvas.post.bloom")?.unwrap_or(0.9) as f32,
+                smoothing: opt_number(b, "smoothing", "canvas.post.bloom")?.unwrap_or(0.3) as f32,
+            })
+        }
+        None => None,
+    };
+    let vignette = match opt_object(post, "vignette", "canvas.post")? {
+        Some(v) => {
+            check_keys(v, &["offset", "darkness"], "canvas.post.vignette")?;
+            Some(VignetteSettings {
+                offset: opt_number(v, "offset", "canvas.post.vignette")?.unwrap_or(0.3) as f32,
+                darkness: opt_number(v, "darkness", "canvas.post.vignette")?.unwrap_or(0.6) as f32,
+            })
+        }
+        None => None,
+    };
+    Ok((bloom.is_some() || vignette.is_some()).then_some(PostSettings { bloom, vignette }))
 }
 
 /// OrbitControls are on unless `camera.controls` is false or the camera follows; the cell index is the host's
@@ -290,6 +479,7 @@ fn interaction(
         min_x: bounds.min_x as f32,
         min_z: bounds.min_z as f32,
         cells,
+        ..Default::default()
     })
 }
 
@@ -337,25 +527,20 @@ fn check_canvas_keys(fields: &Fields) -> Result<(), CanvasSceneError> {
             | "skeleton" | "aria-label" | "aria-labelledby" | "aria-describedby" | "aria-live"
             | "aria-current" | "aria-pressed" | "aria-expanded" | "aria-selected"
             | "aria-hidden" | "aria-busy" | "role" | "lang" | "dir" | "tabIndex" => {}
-            "isLoading" | "editable" => {
+            // given their 3D meaning by canvas3d_props (owner ruling 2026-11-06), which validates them
+            "isLoading" | "editable" | "showMinimap" | "showCoordinates" | "showTileInfo"
+            | "fogOfWar" | "backgroundImage" | "worldWidth" | "worldHeight" | "unitScale" => {}
+            "fit" => {
                 if opt_bool(fields, key, "canvas")? == Some(true) {
-                    return Err(undrawn(&field, STEP_HOST));
+                    return Err(bad(
+                        &field,
+                        "fits a 2D grid to the viewport; a 3D canvas frames with its camera",
+                    ));
                 }
             }
-            "showMinimap" | "fit" | "showCoordinates" | "showTileInfo" => {
-                if opt_bool(fields, key, "canvas")? == Some(true) {
-                    return Err(undrawn(&field, STEP_PARITY));
-                }
-            }
-            "fogOfWar" => {
-                if !value.is_null() && !value.as_array().is_some_and(Vec::is_empty) {
-                    return Err(undrawn(&field, STEP_PARITY));
-                }
-            }
-            "projection" | "tileWidth" | "backgroundImage" | "worldWidth" | "worldHeight"
-            | "unitScale" => {
+            "projection" | "tileWidth" => {
                 if !value.is_null() {
-                    return Err(undrawn(&field, STEP_PARITY));
+                    return Err(bad(&field, "a 2D grid projection; a 3D canvas has none"));
                 }
             }
             _ => return Err(bad(&field, "not a declared canvas prop")),
@@ -570,7 +755,7 @@ fn lights(
     )?;
     match opt_str(l, "environment", path)? {
         None | Some("none") => {}
-        Some("room") => return Err(undrawn("canvas.lighting.environment", STEP_PARITY)),
+        Some("room") => {}
         Some(_) => return Err(bad("canvas.lighting.environment", "must be room or none")),
     }
     let tone_mapping = match opt_str(l, "toneMapping", path)? {

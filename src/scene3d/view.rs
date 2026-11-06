@@ -723,8 +723,11 @@ mod tests {
                     y: 0,
                     id: "flag".into(),
                 }],
+                ..Default::default()
             },
             animated: false,
+            environment: None,
+            post: None,
         }
     }
 

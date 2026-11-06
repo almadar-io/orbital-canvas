@@ -811,8 +811,11 @@ mod tests {
                         id: "knight".into(),
                     },
                 ],
+                ..Default::default()
             },
             animated: false,
+            environment: None,
+            post: None,
         }
     }
 

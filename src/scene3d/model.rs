@@ -20,6 +20,38 @@ pub struct Scene3D {
     /// Whether any drawable declares a keyframe animation, so the host keeps redrawing on its canvas clock.
     #[serde(default)]
     pub animated: bool,
+    /// Image-based lighting for standard and physical materials (`lighting.environment`).
+    #[serde(default)]
+    pub environment: Option<EnvironmentKind>,
+    /// The post-processing stack (`post`): bloom and vignette as @react-three/postprocessing draws them.
+    #[serde(default)]
+    pub post: Option<PostSettings>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum EnvironmentKind {
+    /// three's `RoomEnvironment` through `PMREMGenerator`.
+    Room,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct PostSettings {
+    pub bloom: Option<BloomSettings>,
+    pub vignette: Option<VignetteSettings>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct BloomSettings {
+    pub intensity: f32,
+    pub threshold: f32,
+    pub smoothing: f32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct VignetteSettings {
+    pub offset: f32,
+    pub darkness: f32,
 }
 
 /// What a host needs to turn pointer input into the scene's own events: whether the user may orbit the camera,
@@ -32,6 +64,20 @@ pub struct Interaction {
     pub min_z: f32,
     /// The scene cell of each top-level drawable that carries an id.
     pub cells: Vec<CellId>,
+    /// The far edge of the drawn bounds, in scene units (with `min_x`/`min_z`, the board the ground spans).
+    #[serde(default)]
+    pub max_x: f32,
+    #[serde(default)]
+    pub max_z: f32,
+    /// A following camera's starting pose, which it eases from toward its mapped pose (three's first frame).
+    #[serde(default)]
+    pub follow_from: Option<[f32; 3]>,
+    /// Every top-level drawn position, in scene units (overlays: coordinates, minimap).
+    #[serde(default)]
+    pub drawn: Vec<[f64; 2]>,
+    /// Edit mode: drawables are selected and dragged instead of the camera orbiting.
+    #[serde(default)]
+    pub editable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
