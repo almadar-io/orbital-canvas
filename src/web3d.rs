@@ -93,9 +93,12 @@ pub(crate) async fn open_canvas(
         .formats
         .first()
         .ok_or("the canvas offers no surface format")?;
-    let alpha_mode = if caps
-        .alpha_modes
-        .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+    // a WebGPU canvas always composites premultiplied (the spec's `alphaMode`), though wgpu lists only Opaque; a
+    // transparent scene must show the page behind it, as three's canvas does
+    let alpha_mode = if opened.webgpu
+        || caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
     {
         wgpu::CompositeAlphaMode::PreMultiplied
     } else {
