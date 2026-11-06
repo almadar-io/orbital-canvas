@@ -90,8 +90,8 @@ impl WebSceneCanvas {
         self.host.input(kind, x, y, button, None);
     }
 
-    pub fn zoom(&mut self, factor: f32, x: f32, y: f32) {
-        self.host.zoom(factor, x, y);
+    pub fn zoom(&mut self, factor: f32, x: f32, y: f32) -> bool {
+        self.host.zoom(factor, x, y)
     }
 
     pub fn double_tap(&mut self, x: f32, y: f32) {

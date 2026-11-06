@@ -416,7 +416,9 @@ pub unsafe extern "C" fn orbital_canvas_zoom(renderer: *mut Canvas, factor: f32,
     if renderer.is_null() {
         return;
     }
-    guarded("zoom", (), || (*renderer).zoom(factor, x, y));
+    guarded("zoom", (), || {
+        (*renderer).zoom(factor, x, y);
+    });
 }
 
 /// A view button on a pannable scene: `zoom-in`, `zoom-out` or `reset` (the web graph header).

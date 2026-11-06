@@ -518,16 +518,18 @@ impl SceneHost {
     }
 
     /// A pinch: zoom a pannable scene by `factor` about the focus point (logical points).
-    pub fn zoom(&mut self, factor: f32, x: f32, y: f32) {
+    /// Whether the scene takes zoom (a 3D camera or a pannable 2D scene): a host keeps the page from scrolling then.
+    pub fn zoom(&mut self, factor: f32, x: f32, y: f32) -> bool {
         if let Some(view) = self.view3d.as_mut() {
             // a pinch or wheel out (factor below 1) dollies the 3D camera away, as a wheel down does
             self.view3d_moving |= view.wheel(if factor < 1.0 { 1.0 } else { -1.0 });
-            return;
+            return true;
         }
         if self.pannable && factor.is_finite() && factor > 0.0 {
             self.memory.pending_zoom = Some((factor, x, y));
             self.relayout();
         }
+        self.pannable
     }
 
     /// The host surface in physical pixels; the scene is laid out in `size / density` points.
@@ -1275,10 +1277,22 @@ mod tests {
         host.set_clock(1000.0);
         assert_ne!(camera(&host).unwrap().eye, before.eye);
         assert!(host.take_scene_events().is_empty(), "a drag is not a click");
+        let orbited = camera(&host).unwrap().eye;
+        assert!(host.zoom(1.1, 400.0, 300.0), "a 3D scene takes the wheel");
+        host.set_clock(2000.0);
+        assert_ne!(
+            camera(&host).unwrap().eye,
+            orbited,
+            "the wheel dollies the camera"
+        );
 
         host.set_scene(serde_json::json!({"type": "canvas", "drawables": []}))
             .unwrap();
         assert!(host.view3d.is_none(), "a 2D scene has no 3D view");
+        assert!(
+            !host.zoom(1.1, 10.0, 10.0),
+            "a still 2D scene leaves the wheel to the page"
+        );
     }
 
     #[test]
