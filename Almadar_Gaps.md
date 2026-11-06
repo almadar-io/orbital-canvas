@@ -7,7 +7,9 @@ Every open gap this repo owns lives here. This file is the source of truth; the 
 - **Codes:** new gaps use this repo's prefix `G-ORBITAL-GAME-RENDERER-`. Take the "Next code" below, then bump it in the same edit. Codes are never reused or renamed.
 - **Close by deleting.** Remove the entry in the same commit as the fix.
 
-Next code: `G-ORBITAL-GAME-RENDERER-012`
+Next code: `G-ORBITAL-GAME-RENDERER-013`
+
+- **G-ORBITAL-GAME-RENDERER-012** [mechanical] — The 3D follow boards' selected unit (ui-racing-board-3d, ui-toy-track-board-3d "Player Car") draws its selection as a short flat green stroke under the car, where three drew a cyan ring around its base; the "Rival Car" label also sits at the frame's top-right edge instead of over the rival. Owner: orbital-canvas `mappers/canvas_scene3d.rs` selection ring and label anchoring. Reproduce: the paired captures of both boards (scratchpad pairs/s6, 2026-11-07). Rung (3): the paired parity capture. Root cause: one-off.
 
 - **G-ORBITAL-GAME-RENDERER-011** [owner-decision] — `camera.zoom` on a `follow`/`chase` camera: three's GameCamera3D ignores it (fixed offsets [0,12,14] / [0,4,-7]), and the racing and toy-track boards set it, so giving it a meaning (dolly the offset) changed how those boards look (P-025 parity run, 2026-11-06). orbital-canvas keeps three's fixed offsets for now; decide whether zoom should dolly a following camera, then retune the boards' `scale`. Rung: (1) the pattern's declared meaning. Root cause: one-off.
 
