@@ -4,7 +4,6 @@
 //! three.js scene and is refused.
 
 use super::canvas::{self, CanvasSpec};
-use super::gap_once;
 use super::shape::{parse_shapes, Align, Dash, Shape, ShapeType};
 use crate::mappers::game_canvas_2d::{get_f32, CanvasSceneError};
 use crate::mappers::scene::MappedScene;
