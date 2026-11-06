@@ -40,6 +40,8 @@ unicode-bidi = "0.3"
 unicode-script = "0.5"
 raw-window-handle = "0.6"
 bytemuck = { version = "1.16", features = ["derive"] }
+# 3D transforms (scene3d): pure Rust, no_std-capable, builds for wasm.
+glam = "0.30"
 ureq = { version = "2.9", default-features = false, features = ["json"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

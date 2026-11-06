@@ -16,6 +16,7 @@ pub mod packet;
 pub mod platform;
 pub mod projector;
 pub mod renderer;
+pub mod scene3d;
 pub mod skinning_2d;
 pub mod svg;
 #[cfg(feature = "system-fonts")]
