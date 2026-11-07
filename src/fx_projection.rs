@@ -313,6 +313,25 @@ fn procedural(view: &Value, pos: &Pos, fade: f64, progress: f64) -> Result<Vec<V
     }
 }
 
+const DEFAULT_TICK_MS: f64 = 500.0;
+const DEFAULT_TEXT_COLOR: &str = "#ffe066";
+const DEFAULT_FONT_FAMILY: &str = "system-ui, sans-serif";
+
+/// A layer with the host's `DrawFxLayer` defaults laid over it: `tickMs` and `textColor` when absent (or null), and the
+/// host's `fontFamily` always.
+pub fn with_host_defaults(layer: &Map<String, Value>) -> Value {
+    let mut layer = layer.clone();
+    let absent = |layer: &Map<String, Value>, key: &str| layer.get(key).is_none_or(Value::is_null);
+    if absent(&layer, "tickMs") {
+        layer.insert("tickMs".into(), DEFAULT_TICK_MS.into());
+    }
+    if absent(&layer, "textColor") {
+        layer.insert("textColor".into(), DEFAULT_TEXT_COLOR.into());
+    }
+    layer.insert("fontFamily".into(), DEFAULT_FONT_FAMILY.into());
+    Value::Object(layer)
+}
+
 /// Expand one `draw-fx-layer` descriptor at the host's paint clock instant.
 /// `std-fx-particles` still owns ttl decay and removal; this only derives pixels.
 pub fn expand_layer(
@@ -408,6 +427,15 @@ mod tests {
                 "color": "#00ff00", "vx": 1, "vz": 0, "gravity": 0 }],
             "tickMs": 500, "fontFamily": "system-ui, sans-serif", "textColor": "#ffe066"
         })
+    }
+
+    #[test]
+    fn g_orbital_game_renderer_006_host_defaults_fill_only_what_the_layer_leaves_out() {
+        let bare = with_host_defaults(json!({ "items": [] }).as_object().unwrap());
+        assert_eq!((bare["tickMs"].clone(), bare["textColor"].clone()), (json!(500.0), json!("#ffe066")));
+        assert_eq!(bare["fontFamily"], "system-ui, sans-serif");
+        let set = with_host_defaults(json!({ "tickMs": 250, "textColor": "#fff" }).as_object().unwrap());
+        assert_eq!((set["tickMs"].clone(), set["textColor"].clone()), (json!(250), json!("#fff")));
     }
 
     #[test]

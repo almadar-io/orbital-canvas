@@ -4,7 +4,7 @@
 //! to the scene's own click events, `Canvas3DHost`'s scene-edit gestures (select, drag with a live preview cell,
 //! move on drop), `FollowCamera3D`'s easing toward the follow pose, and the host's imperative camera handle.
 
-use super::model::{Camera, Projection, Scene3D};
+use super::model::{Camera, MaterialKind, Projection, Scene3D};
 use super::render::view_projection;
 use glam::{Mat4, Vec3};
 use std::collections::BTreeMap;
@@ -548,15 +548,34 @@ impl Scene3DView {
     /// The nearest mesh along the ray that carries an id; untagged meshes pass the ray on.
     fn nearest_tagged(&self, near: Vec3, direction: Vec3) -> Option<(f32, &str)> {
         let scene = self.scene.as_ref()?;
+        let camera = self.camera()?;
+        let eye_view = Mat4::look_at_rh(
+            Vec3::from(camera.eye),
+            Vec3::from(camera.target),
+            Vec3::from(camera.up),
+        );
+        let (right, up) = (eye_view.row(0).truncate(), eye_view.row(1).truncate());
         let mut best: Option<(f32, &str)> = None;
         for mesh in &scene.meshes {
             let Some(id) = mesh.id.as_deref() else {
                 continue;
             };
             let model = Mat4::from_cols_array(&mesh.transform);
+            let billboard = matches!(mesh.material.kind, MaterialKind::Flat(flat) if flat.billboard);
+            let (origin, sx, sy) = (
+                model.w_axis.truncate(),
+                model.x_axis.truncate().length(),
+                model.y_axis.truncate().length(),
+            );
             for tri in mesh.mesh.indices.chunks_exact(3) {
-                let [a, b, c] = [tri[0], tri[1], tri[2]]
-                    .map(|i| model.transform_point3(Vec3::from(mesh.mesh.positions[i as usize])));
+                let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| {
+                    let local = Vec3::from(mesh.mesh.positions[i as usize]);
+                    if billboard {
+                        origin + right * (local.x * sx) + up * (local.y * sy)
+                    } else {
+                        model.transform_point3(local)
+                    }
+                });
                 if let Some(t) = ray_triangle(near, direction, a, b, c) {
                     if best.is_none_or(|(d, _)| t < d) {
                         best = Some((t, id));
@@ -931,6 +950,38 @@ mod tests {
         assert_eq!(v.pick(x, y, false, true), None, "three cells off the board");
         let (x, y) = screen(&v, Vec3::new(-1.8, 0.0, 2.0));
         assert_eq!(v.pick(x, y, false, true), Some(Pick::Tile { x: -2, z: 2 }));
+    }
+
+    #[test]
+    fn g_orbital_game_renderer_007_a_billboard_is_picked_where_it_is_drawn_after_an_orbit() {
+        let pick_at_sign = |billboard: bool| {
+            let mut scene = scene_with_box(true);
+            scene.camera.eye = [10.0, 4.0, 0.0];
+            scene.camera.target = [0.0, 4.0, 0.0];
+            scene.meshes = vec![MeshInstance {
+                mesh: crate::scene3d::tessellate::quad(2.0, 2.0, [0.0, 0.0, 1.0, 1.0]).unwrap(),
+                transform: Mat4::from_translation(Vec3::new(0.0, 4.0, 0.0)).to_cols_array(),
+                material: Material {
+                    kind: MaterialKind::Flat(Flat {
+                        billboard,
+                        ..Flat::default()
+                    }),
+                    side: Side::Double,
+                    ..Material::default()
+                },
+                cast_shadow: false,
+                receive_shadow: false,
+                id: Some("sign".into()),
+                glow: None,
+            }];
+            scene.interaction.cells.clear();
+            let mut v = view(true);
+            v.set_scene(scene);
+            let (x, y) = screen(&v, Vec3::new(0.0, 4.0, 0.0));
+            v.pick(x, y, true, false)
+        };
+        assert!(matches!(pick_at_sign(true), Some(Pick::Unit { ref id, .. }) if id == "sign"));
+        assert_eq!(pick_at_sign(false), None, "control: an unturned quad is edge-on from the side");
     }
 
     #[test]

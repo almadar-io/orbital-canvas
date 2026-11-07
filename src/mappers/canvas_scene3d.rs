@@ -3,7 +3,7 @@
 //! is a typed error naming the field, never a silent drop.
 
 use super::game_canvas_2d::{
-    paint_drawables, parse_css_color, to_drawable_nodes, CanvasSceneError,
+    parse_css_color, to_drawable_nodes, CanvasSceneError,
 };
 use super::learning::shape::parse_path_data;
 use super::learning::Xf;
@@ -385,7 +385,7 @@ fn compose_with(
                 &interaction,
                 at,
                 color,
-            ));
+            )?);
         }
     }
     Ok(Scene3D {
@@ -1993,9 +1993,6 @@ const LABEL_LIFT: f64 = 1.2;
 const LABEL_EM: f32 = 0.32;
 const LABEL_OUTLINE: f32 = 0.02;
 /// `DrawFxLayer.tsx`'s declared defaults, and the family the bundled face answers to.
-const FX_TICK_MS: f64 = 500.0;
-const FX_TEXT_COLOR: &str = "#ffe066";
-const FX_FONT_FAMILY: &str = "system-ui, sans-serif";
 
 /// `Mesh3D`'s outline: an unlit back-face shell in `color`, standing `width` cells off the surface.
 struct Outline {
@@ -2197,29 +2194,6 @@ fn shape_animation(value: &Value, path: &str) -> Result<(), CanvasSceneError> {
         }
     }
     Ok(())
-}
-
-/// The CSS `font` as the 2D painter reads it (size in painter px, weight, monospace), by asking that painter to lay
-/// out one glyph in it, so the two hosts accept exactly the same fonts.
-fn font_of(font: &str) -> Option<(f32, u16, bool)> {
-    let probe = serde_json::json!({"type": "draw-text", "text": "x", "position": {"x": 0, "y": 0},
-        "color": "#000000", "font": font});
-    let projector = Projector::new(1.0, 0.0, Layout2D::Flat);
-    paint_drawables(
-        &[probe],
-        &projector,
-        &|c: &str| c.to_owned(),
-        &|x, y| (x, y),
-        1.0,
-    )
-    .ok()?
-    .into_iter()
-    .find_map(|c| match c {
-        DrawCommand::Text {
-            size, weight, mono, ..
-        } => Some((size, weight, mono)),
-        _ => None,
-    })
 }
 
 /// A sprite `frame`: `{x, y, w, h}` image pixels, a positive size.
@@ -2783,7 +2757,7 @@ impl Walk<'_> {
         let (em, bold, mono) = match opt_str(f, "font", path)? {
             None => (LABEL_EM, false, false),
             Some(font) => {
-                let (px, weight, mono) = font_of(font).ok_or_else(|| {
+                let (px, weight, mono) = super::game_canvas_2d::parse_text_font(Some(font)).ok_or_else(|| {
                     bad(
                         &join(path, "font"),
                         format!("`{font}` is not a font the bundled faces draw"),
@@ -2911,15 +2885,7 @@ impl Walk<'_> {
         opacity: f64,
     ) -> Result<(), CanvasSceneError> {
         check_keys(f, FX_LAYER_KEYS, path)?;
-        let mut layer = f.clone();
-        if present(&layer, "tickMs").is_none() {
-            layer.insert("tickMs".into(), FX_TICK_MS.into());
-        }
-        if present(&layer, "textColor").is_none() {
-            layer.insert("textColor".into(), FX_TEXT_COLOR.into());
-        }
-        layer.insert("fontFamily".into(), FX_FONT_FAMILY.into());
-        let layer = Value::Object(layer);
+        let layer = crate::fx_projection::with_host_defaults(f);
         if layer["items"]
             .as_array()
             .is_some_and(|items| !items.is_empty())

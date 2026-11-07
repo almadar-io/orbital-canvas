@@ -683,7 +683,7 @@ fn paint_text(
     });
 }
 
-fn parse_text_font(font: Option<&str>) -> Option<(f32, u16, bool)> {
+pub(crate) fn parse_text_font(font: Option<&str>) -> Option<(f32, u16, bool)> {
     let Some(font) = font else {
         return Some((10.0, 400, false));
     };

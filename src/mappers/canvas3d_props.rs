@@ -10,7 +10,7 @@ use crate::packet::{
     DrawCommand, Halo, LineCap, LineJoin, PathSegment, Rect, Stroke, TextAlign, Vec2,
 };
 use crate::scene3d::model::{
-    Flat, Interaction, Material, MaterialKind, MeshData, MeshInstance, Scene3D, Side,
+    Flat, Interaction, Material, MaterialKind, MeshInstance, Scene3D, Side,
 };
 use crate::scene3d::render::view_projection;
 use crate::scene3d::view::{js_round, EditMode};
@@ -167,46 +167,28 @@ pub fn backdrop_clear(node: &Value, theme: &SceneTheme) -> Result<DrawCommand, C
     Ok(DrawCommand::Clear { color })
 }
 
-/// three's `RingGeometry(inner, outer, segments)` with one ring of faces, facing +Z.
-pub fn ring_geometry(inner: f32, outer: f32, segments: usize) -> MeshData {
-    let mut mesh = MeshData::default();
-    for radius in [inner, outer] {
-        for i in 0..=segments {
-            let angle = i as f32 / segments as f32 * std::f32::consts::TAU;
-            let (x, y) = (radius * angle.cos(), radius * angle.sin());
-            mesh.positions.push([x, y, 0.0]);
-            mesh.normals.push([0.0, 0.0, 1.0]);
-            mesh.uvs
-                .push([(x / outer + 1.0) / 2.0, (y / outer + 1.0) / 2.0]);
-        }
-    }
-    for i in 0..segments as u32 {
-        let (a, b) = (i, i + segments as u32 + 1);
-        let (c, d) = (b + 1, a + 1);
-        mesh.indices.extend_from_slice(&[a, b, d, b, c, d]);
-    }
-    mesh
-}
-
 /// The edit-mode ring around the selected drawable at scene `position` (its drag preview while dragged), in the
 /// theme's `highlight` tone (linear RGB).
 pub fn selection_ring(
     interaction: &Interaction,
     position: [f64; 3],
     color: [f32; 3],
-) -> MeshInstance {
+) -> Result<MeshInstance, CanvasSceneError> {
     let cell = interaction.cell;
     let world = Vec3::new(
         (position[0] as f32 - interaction.min_x) * cell,
         position[2] as f32 + SHAPE_LIFT,
         (position[1] as f32 - interaction.min_z) * cell,
     );
-    MeshInstance {
-        mesh: ring_geometry(
-            SELECTION_RADIUS - RING_WIDTH,
-            SELECTION_RADIUS,
-            RING_SEGMENTS,
-        ),
+    let inner = SELECTION_RADIUS - RING_WIDTH;
+    let mesh = crate::scene3d::tessellate::ring(
+        [inner, inner],
+        [SELECTION_RADIUS; 2],
+        RING_SEGMENTS,
+    )
+    .map_err(|e| CanvasSceneError::Unsupported3DContract(format!("selection ring: {e}")))?;
+    Ok(MeshInstance {
+        mesh,
         transform: (Mat4::from_translation(world)
             * Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2))
         .to_cols_array(),
@@ -220,7 +202,7 @@ pub fn selection_ring(
         receive_shadow: false,
         id: None,
         glow: None,
-    }
+    })
 }
 
 /// `withPreviewPosition`: the drawables with the one carrying `id` (top level, a layer item or nested in a group)
@@ -669,7 +651,8 @@ mod tests {
             },
             [0.0; 3],
             [0.8, 0.4, 1.0],
-        )];
+        )
+        .unwrap()];
         shade_fogged(&mut meshes);
         assert_eq!(meshes[0].material.color, [0.2, 0.1, 0.25]);
     }
@@ -701,7 +684,7 @@ mod tests {
             min_z: -1.0,
             ..Default::default()
         };
-        let ring = selection_ring(&interaction, [3.0, 1.0, 0.5], [1.0, 1.0, 0.0]);
+        let ring = selection_ring(&interaction, [3.0, 1.0, 0.5], [1.0, 1.0, 0.0]).unwrap();
         assert_eq!(ring.mesh.positions.len(), 66);
         assert_eq!(ring.mesh.indices.len(), 192);
         let m = Mat4::from_cols_array(&ring.transform);
