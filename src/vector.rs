@@ -646,36 +646,95 @@ fn build_path(segments: &[PathSegment]) -> Option<tiny_skia::Path> {
     b.finish()
 }
 
-struct GlyphOutline<'a>(&'a mut PathBuilder, f32, f32, f32);
+/// A glyph's contours into a path builder, scaled and placed. A contour whose points all coincide encloses nothing, so
+/// filling ignores it, but a stroke (the halo, faux bold) would draw it as a dot: it is dropped (DejaVu's "u" carries
+/// one, which stroked as an umlaut).
+struct GlyphOutline<'a> {
+    out: &'a mut PathBuilder,
+    x: f32,
+    y: f32,
+    scale: f32,
+    contour: Vec<Segment>,
+}
 
-impl GlyphOutline<'_> {
+#[derive(Clone, Copy)]
+enum Segment {
+    Move(f32, f32),
+    Line(f32, f32),
+    Quad(f32, f32, f32, f32),
+    Cubic(f32, f32, f32, f32, f32, f32),
+}
+
+impl<'a> GlyphOutline<'a> {
+    fn new(out: &'a mut PathBuilder, x: f32, y: f32, scale: f32) -> Self {
+        Self {
+            out,
+            x,
+            y,
+            scale,
+            contour: Vec::new(),
+        }
+    }
+
     fn p(&self, x: f32, y: f32) -> (f32, f32) {
-        (self.1 + x * self.3, self.2 - y * self.3)
+        (self.x + x * self.scale, self.y - y * self.scale)
+    }
+
+    /// Emit the pending contour unless it is a single point; `close` closes it.
+    fn flush(&mut self, close: bool) {
+        let contour = std::mem::take(&mut self.contour);
+        let mut points = contour.iter().flat_map(|s| match *s {
+            Segment::Move(x, y) | Segment::Line(x, y) => vec![(x, y)],
+            Segment::Quad(x1, y1, x, y) => vec![(x1, y1), (x, y)],
+            Segment::Cubic(x1, y1, x2, y2, x, y) => vec![(x1, y1), (x2, y2), (x, y)],
+        });
+        let Some(first) = points.next() else { return };
+        if points.all(|p| p == first) {
+            return;
+        }
+        for s in contour {
+            match s {
+                Segment::Move(x, y) => self.out.move_to(x, y),
+                Segment::Line(x, y) => self.out.line_to(x, y),
+                Segment::Quad(x1, y1, x, y) => self.out.quad_to(x1, y1, x, y),
+                Segment::Cubic(x1, y1, x2, y2, x, y) => self.out.cubic_to(x1, y1, x2, y2, x, y),
+            }
+        }
+        if close {
+            self.out.close();
+        }
+    }
+}
+
+impl Drop for GlyphOutline<'_> {
+    fn drop(&mut self) {
+        self.flush(false);
     }
 }
 
 impl ttf_parser::OutlineBuilder for GlyphOutline<'_> {
     fn move_to(&mut self, x: f32, y: f32) {
+        self.flush(false);
         let (x, y) = self.p(x, y);
-        self.0.move_to(x, y);
+        self.contour.push(Segment::Move(x, y));
     }
     fn line_to(&mut self, x: f32, y: f32) {
         let (x, y) = self.p(x, y);
-        self.0.line_to(x, y);
+        self.contour.push(Segment::Line(x, y));
     }
     fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
         let (x1, y1) = self.p(x1, y1);
         let (x, y) = self.p(x, y);
-        self.0.quad_to(x1, y1, x, y);
+        self.contour.push(Segment::Quad(x1, y1, x, y));
     }
     fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
         let (x1, y1) = self.p(x1, y1);
         let (x2, y2) = self.p(x2, y2);
         let (x, y) = self.p(x, y);
-        self.0.cubic_to(x1, y1, x2, y2, x, y);
+        self.contour.push(Segment::Cubic(x1, y1, x2, y2, x, y));
     }
     fn close(&mut self) {
-        self.0.close();
+        self.flush(true);
     }
 }
 
@@ -714,12 +773,12 @@ fn text_path(
         let id = ttf_parser::GlyphId(g.gid);
         face.outline_glyph(
             id,
-            &mut GlyphOutline(&mut all, x0 + g.x, baseline + g.y, scale),
+            &mut GlyphOutline::new(&mut all, x0 + g.x, baseline + g.y, scale),
         );
         if bold && g.font.faux_bold() {
             face.outline_glyph(
                 id,
-                &mut GlyphOutline(&mut faux, x0 + g.x, baseline + g.y, scale),
+                &mut GlyphOutline::new(&mut faux, x0 + g.x, baseline + g.y, scale),
             );
         }
     }
@@ -1080,6 +1139,35 @@ mod tests {
             at(&plain, 40, 12, 20)[3],
             0,
             "control: the shape alone stops at its edge"
+        );
+    }
+
+    fn ink_top(text: &str, weight: u16) -> Option<u32> {
+        let cmd = DrawCommand::Text {
+            text: text.into(),
+            pos: Vec2 { x: 40.0, y: 40.0 },
+            size: 48.0,
+            color: [0.0, 0.0, 0.0, 1.0],
+            align: TextAlign::Center,
+            weight,
+            halo: None,
+            mono: false,
+        };
+        let rgba = rasterize(&[&cmd], 80, 80, 1.0, 1.0).unwrap();
+        (0..80).find(|&y| (0..80).any(|x| at(&rgba, 80, x, y)[3] > 0))
+    }
+
+    #[test]
+    fn a_bold_u_draws_no_umlaut_from_the_point_contour_in_its_glyph() {
+        let (u, v) = (ink_top("u", 700).unwrap(), ink_top("v", 700).unwrap());
+        assert!(
+            u + 1 >= v,
+            "bold u starts at row {u}, bold v at {v}: a dot above the u"
+        );
+        let (u, v) = (ink_top("u", 400).unwrap(), ink_top("v", 400).unwrap());
+        assert!(
+            u + 1 >= v,
+            "control: regular u ({u}) and v ({v}) share the x-height"
         );
     }
 
