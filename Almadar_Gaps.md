@@ -7,7 +7,9 @@ Every open gap this repo owns lives here. This file is the source of truth; the 
 - **Codes:** new gaps use this repo's prefix `G-ORBITAL-GAME-RENDERER-`. Take the "Next code" below, then bump it in the same edit. Codes are never reused or renamed.
 - **Close by deleting.** Remove the entry in the same commit as the fix.
 
-Next code: `G-ORBITAL-GAME-RENDERER-013`
+Next code: `G-ORBITAL-GAME-RENDERER-014`
+
+- **G-ORBITAL-GAME-RENDERER-013** [mechanical] — In the desktop window (`orb-desktop window`, dioxus) a 3D label's "u" draws as "ü" (std-math-vectors-3d's `u+v` and `u` labels), while the browser draws the same labels through the same `scene3d::label` rasterizer correctly. A glyph shaped against one face and drawn from another (the desktop registers system fonts, `system_fonts.rs`) fits the symptom; not yet confirmed. Reproduce: `orb resolve` std-math-vectors-3d to an .orb, `orb-desktop window` it, read the labels. Rung (3): a desktop label capture. Root cause: one-off.
 
 - **G-ORBITAL-GAME-RENDERER-011** [owner-decision] — `camera.zoom` on a `follow`/`chase` camera: three's GameCamera3D ignores it (fixed offsets [0,12,14] / [0,4,-7]), and the racing and toy-track boards set it, so giving it a meaning (dolly the offset) changed how those boards look (P-025 parity run, 2026-11-06). orbital-canvas keeps three's fixed offsets for now; decide whether zoom should dolly a following camera, then retune the boards' `scale`. Rung: (1) the pattern's declared meaning. Root cause: one-off.
 

@@ -183,7 +183,11 @@ pub fn learning_canvas_node_3d(node: &Value) -> Result<Value, CanvasSceneError> 
         Pattern::Chemistry => (CHEMISTRY_KEYS, CHEMISTRY_2D),
     };
     for key in fields.keys() {
-        if !COMMON_KEYS.contains(&key.as_str()) && !own.contains(&key.as_str()) {
+        let key_str = key.as_str();
+        let declared = [COMMON_KEYS, COMMON_2D, own, own_2d]
+            .iter()
+            .any(|list| list.contains(&key_str));
+        if !declared {
             return Err(bad(&join(path, key), "not a declared prop"));
         }
     }
@@ -1765,6 +1769,25 @@ mod tests {
             learning_canvas_node_3d(&json!({"type": "physics-canvas", "mode": "2d"})),
             Err(CanvasSceneError::UnsupportedMode(m)) if m == "2d"
         ));
+    }
+
+    #[test]
+    fn a_2d_only_prop_left_empty_is_declared_and_control_a_drawn_one_is_refused() {
+        let node = |meters: Value| json!({"type": "physics-canvas", "mode": "3d", "bodies": [{"id": "b", "x": 1, "y": 2}], "meters": meters});
+        assert!(learning_scene3d(&node(json!([])), 600.0, 400.0, &SceneTheme::default()).is_ok());
+        let refused = learning_scene3d(
+            &node(json!([{"label": "v", "value": 1}])),
+            600.0,
+            400.0,
+            &SceneTheme::default(),
+        )
+        .expect_err("a drawn 2D-only prop");
+        assert!(
+            refused
+                .to_string()
+                .contains("physics-canvas.meters: 2D only"),
+            "{refused}"
+        );
     }
 
     #[test]

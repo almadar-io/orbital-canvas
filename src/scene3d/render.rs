@@ -43,6 +43,8 @@ struct ObjectUniform {
     emissive: [f32; 4],
     params: [f32; 4],
     physical: [f32; 4],
+    quad: [f32; 4],
+    uv_rect: [f32; 4],
 }
 
 #[repr(C)]
@@ -69,6 +71,7 @@ const FLAG_RECEIVE_SHADOW: u32 = 2;
 const FLAG_MAP: u32 = 4;
 const FLAG_CUTOUT: u32 = 8;
 const FLAG_BILLBOARD: u32 = 16;
+const FLAG_QUAD: u32 = 32;
 
 struct GpuMesh {
     vertices: wgpu::Buffer,
@@ -105,6 +108,8 @@ struct Draw {
     side: Side,
     map: Option<(String, bool)>,
     cast_shadow: bool,
+    /// Draws its glow tile: a quad sampling the glow atlas.
+    glow: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -167,6 +172,7 @@ pub struct Renderer3D {
     meshes: HashMap<u64, GpuMesh>,
     targets: Option<Targets>,
     clock: u64,
+    glow: super::glow::GlowPass,
 }
 
 fn mesh_key(mesh: &MeshData) -> u64 {
@@ -203,6 +209,21 @@ fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
         array_stride: std::mem::size_of::<Vertex>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &ATTRIBUTES,
+    }
+}
+
+/// The unit square a glow tile draws on: (0,0)..(1,1) in XY, its V running down so the tile's top row is its top.
+fn unit_quad() -> MeshData {
+    MeshData {
+        positions: vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        normals: vec![[0.0, 0.0, 1.0]; 4],
+        uvs: vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+        indices: vec![0, 1, 2, 0, 2, 3],
     }
 }
 
@@ -421,6 +442,7 @@ impl Renderer3D {
         let mips = MipmapGenerator::new(device.clone());
         let no_environment = Environment::placeholder(&device);
         let transmission = Transmission::new(device.clone());
+        let glow = super::glow::GlowPass::new(&device, vertex_layout());
         Self {
             device,
             queue,
@@ -456,6 +478,7 @@ impl Renderer3D {
             meshes: HashMap::new(),
             targets: None,
             clock: 0,
+            glow,
         }
     }
 
@@ -934,8 +957,54 @@ impl Renderer3D {
             });
         }
         let mut objects = vec![0u8; (OBJECT_STRIDE * needed) as usize];
+        // Glows: each glowing mesh's coverage blurred in its atlas tile, drawn below as a quad over that tile.
+        let glowing: Vec<(usize, f32)> = scene
+            .meshes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| m.glow.map(|sigma| (i, sigma)))
+            .collect();
+        let glow_frame = if glowing.is_empty() {
+            None
+        } else {
+            let inputs: Vec<(&MeshData, f32)> = glowing
+                .iter()
+                .map(|&(i, sigma)| (&scene.meshes[i].mesh, sigma))
+                .collect();
+            let (tiles, size) =
+                super::glow::plan(&inputs).map_err(|e| Render3DError::Invalid(e.to_string()))?;
+            let keys: Vec<u64> = glowing
+                .iter()
+                .map(|&(i, _)| self.mesh(&scene.meshes[i].mesh))
+                .collect();
+            let quad = self.mesh(&unit_quad());
+            let buffers: Vec<(&wgpu::Buffer, &wgpu::Buffer, u32)> = keys
+                .iter()
+                .map(|k| {
+                    let m = &self.meshes[k];
+                    (&m.vertices, &m.indices, m.count)
+                })
+                .collect();
+            let atlas =
+                self.glow
+                    .encode(&self.device, &self.queue, encoder, size, &tiles, &buffers);
+            let group = map_bind_group(&self.device, &self.map_layout, atlas, &self.color_sampler);
+            let atlas_size = self.glow.atlas_size().expect("just drawn");
+            let uv: Vec<[f32; 4]> = tiles.iter().map(|t| t.uv(atlas_size)).collect();
+            Some((tiles, uv, quad, group))
+        };
         let mut draws = Vec::with_capacity(scene.meshes.len());
         for (i, instance) in scene.meshes.iter().enumerate() {
+            let glow_tile = match (&glow_frame, instance.glow) {
+                (Some((tiles, uv, _, _)), Some(_)) => {
+                    let n = glowing
+                        .iter()
+                        .position(|&(g, _)| g == i)
+                        .expect("a glowing mesh");
+                    Some((tiles[n].rect, uv[n]))
+                }
+                _ => None,
+            };
             let m = &instance.material;
             if instance.mesh.indices.len() % 3 != 0 {
                 return Err(Render3DError::Invalid(format!(
@@ -963,6 +1032,9 @@ impl Renderer3D {
             if flat.billboard {
                 flags |= FLAG_BILLBOARD;
             }
+            if glow_tile.is_some() {
+                flags |= FLAG_MAP | FLAG_QUAD;
+            }
             let kind = match m.kind {
                 MaterialKind::Basic => 0.0,
                 MaterialKind::Standard => 1.0,
@@ -978,11 +1050,16 @@ impl Renderer3D {
                 params: [m.metalness, m.roughness, kind, flags as f32],
                 // three's default thickness, 0
                 physical: [m.transmission, m.ior, 0.0, 0.0],
+                quad: glow_tile.map_or([0.0, 0.0, 1.0, 1.0], |(rect, _)| rect),
+                uv_rect: glow_tile.map_or([0.0, 0.0, 1.0, 1.0], |(_, uv)| uv),
             };
             let offset = i * OBJECT_STRIDE as usize;
             objects[offset..offset + std::mem::size_of::<ObjectUniform>()]
                 .copy_from_slice(bytemuck::bytes_of(&uniform));
-            let mesh = self.mesh(&instance.mesh);
+            let mesh = match (&glow_frame, glow_tile) {
+                (Some((_, _, quad, _)), Some(_)) => *quad,
+                _ => self.mesh(&instance.mesh),
+            };
             let center = if flat.billboard {
                 model.transform_point3(Vec3::ZERO)
             } else {
@@ -1004,8 +1081,15 @@ impl Renderer3D {
                 additive: flat.additive,
                 side: m.side,
                 map: m.map.clone().map(|url| (url, flat.nearest)),
-                cast_shadow: instance.cast_shadow,
+                cast_shadow: instance.cast_shadow && glow_tile.is_none(),
+                glow: glow_tile.is_some(),
             });
+        }
+        // a glow sorts with the shape the mapper emits right after it, and draws first: the sort is stable
+        for d in 0..draws.len().saturating_sub(1) {
+            if draws[d].glow && !draws[d + 1].glow {
+                draws[d].depth = draws[d + 1].depth;
+            }
         }
         self.queue.write_buffer(&self.object_buffer, 0, &objects);
         let object_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1087,9 +1171,10 @@ impl Renderer3D {
         });
         let mut map_groups: Vec<Option<wgpu::BindGroup>> = Vec::with_capacity(draws.len());
         for draw in &draws {
-            let group = match &draw.map {
-                Some((url, nearest)) => self.map(url, *nearest, encoder)?.cloned(),
-                None => None,
+            let group = match (&draw.map, &glow_frame) {
+                (_, Some((_, _, _, glow_group))) if draw.glow => Some(glow_group.clone()),
+                (Some((url, nearest)), _) => self.map(url, *nearest, encoder)?.cloned(),
+                _ => None,
             };
             map_groups.push(group);
         }
@@ -1648,6 +1733,54 @@ mod integration_tests {
         assert_eq!(
             pixel(&draw(&mut r, &lit), SIZE / 2, SIZE / 2),
             pixel(&draw(&mut r, &plain), SIZE / 2, SIZE / 2)
+        );
+    }
+
+    #[test]
+    fn a_glow_spreads_a_shape_coverage_past_its_edge_in_its_color_under_the_shape() {
+        let Some(mut r) = renderer() else { return };
+        let flat = |rgb: [f32; 3]| Material {
+            kind: MaterialKind::Flat(Flat::default()),
+            color: rgb,
+            side: Side::Double,
+            ..Material::default()
+        };
+        let square = instance(
+            geometry::plane(2.0, 2.0).unwrap(),
+            Mat4::IDENTITY,
+            flat([1.0, 1.0, 1.0]),
+        );
+        let mut glow = instance(
+            geometry::plane(2.0, 2.0).unwrap(),
+            Mat4::IDENTITY,
+            flat([0.0, 1.0, 0.0]),
+        );
+        glow.glow = Some(0.3);
+        let with = draw(&mut r, &scene(vec![glow, square.clone()]));
+        let without = draw(&mut r, &scene(vec![square]));
+        // the square spans about 19 pixels around the center; this one is a few pixels outside it
+        let outside = (SIZE / 2 + 13, SIZE / 2);
+        let p = pixel(&with, outside.0, outside.1);
+        assert!(
+            p[1] > 20 && p[0] < 8 && p[2] < 8,
+            "the glow reaches past the edge in its color: {p:?}"
+        );
+        assert_eq!(
+            pixel(&without, outside.0, outside.1),
+            [0, 0, 0, 255],
+            "control: without the glow nothing is drawn there"
+        );
+        let far = (2, 2);
+        assert_eq!(
+            pixel(&with, far.0, far.1),
+            [0, 0, 0, 255],
+            "three sigmas out the glow is gone"
+        );
+        let center = (SIZE / 2, SIZE / 2);
+        assert_eq!(
+            pixel(&with, center.0, center.1),
+            pixel(&without, center.0, center.1),
+            "the shape draws over its glow"
         );
     }
 

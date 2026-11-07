@@ -1136,14 +1136,20 @@ fn paint_shape(
     let shadow = match shadow {
         None => None,
         Some(shadow) => {
-            let color = shadow.get("color").and_then(Value::as_str).and_then(parse_css_color);
+            let color = shadow
+                .get("color")
+                .and_then(Value::as_str)
+                .and_then(parse_css_color);
             let blur = shadow.get("blur").and_then(Value::as_f64);
             match (color, blur) {
                 (Some(color), Some(blur)) if blur.is_finite() && blur >= 0.0 => {
                     (blur > 0.0 && color[3] > 0.0).then_some((color, blur as f32))
                 }
                 _ => {
-                    gap_once("shape-shadow", "draw-shape shadow needs a css `color` and a finite `blur` of zero or more");
+                    gap_once(
+                        "shape-shadow",
+                        "draw-shape shadow needs a css `color` and a finite `blur` of zero or more",
+                    );
                     return;
                 }
             }
@@ -1473,7 +1479,14 @@ fn paint_shape(
         // canvas shadowBlur is twice the Gaussian sigma; `blur` is in world units
         let commands = out[start..].to_vec();
         let sigma = blur * projector.tile_width * zoom / 2.0;
-        out.insert(start, DrawCommand::Shadow { commands, color, sigma });
+        out.insert(
+            start,
+            DrawCommand::Shadow {
+                commands,
+                color,
+                sigma,
+            },
+        );
     }
     if additive && out.len() > start {
         let commands = out.drain(start..).collect();
@@ -1830,8 +1843,11 @@ mod tests {
     #[test]
     fn a_shape_shadow_draws_its_coverage_blurred_under_the_shape() {
         let packet = shadowed_disc(0.25);
-        let [DrawCommand::Clear { .. }, DrawCommand::Shadow { commands, color, sigma }, shape] =
-            packet.draw_commands.as_slice()
+        let [DrawCommand::Clear { .. }, DrawCommand::Shadow {
+            commands,
+            color,
+            sigma,
+        }, shape] = packet.draw_commands.as_slice()
         else {
             panic!("expected clear, shadow, shape: {:?}", packet.draw_commands);
         };
@@ -1845,7 +1861,10 @@ mod tests {
     fn control_a_shadow_without_blur_draws_only_the_shape() {
         let packet = shadowed_disc(0.0);
         assert_eq!(packet.draw_commands.len(), 2);
-        assert!(!matches!(packet.draw_commands[1], DrawCommand::Shadow { .. }));
+        assert!(!matches!(
+            packet.draw_commands[1],
+            DrawCommand::Shadow { .. }
+        ));
     }
 
     #[test]

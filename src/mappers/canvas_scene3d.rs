@@ -76,6 +76,50 @@ impl Default for SceneTheme {
     }
 }
 
+impl SceneTheme {
+    /// The scene theme in a host's `canvasTheme`: its `ground` (`transparent` is none), its `tones` (one left at
+    /// `currentColor` is unset) and its `scene` axis; an axis field the canvas theme does not carry keeps the
+    /// resolver's fallback, as the web resolver keeps it for an undeclared CSS variable.
+    pub fn from_canvas_theme(theme: &Value) -> Result<Self, CanvasSceneError> {
+        let path = "canvasTheme";
+        let fields = theme
+            .as_object()
+            .ok_or_else(|| bad(path, "must be the resolved canvas theme"))?;
+        let mut out = SceneTheme::default();
+        if let Some(ground) = opt_str(fields, "ground", path)? {
+            out.ground = (ground != "transparent").then(|| ground.to_owned());
+        }
+        if let Some(tones) = opt_object(fields, "tones", path)? {
+            for (tone, css) in tones {
+                let css = css
+                    .as_str()
+                    .ok_or_else(|| bad(&join(&join(path, "tones"), tone), "must be a CSS color"))?;
+                if css != "currentColor" {
+                    out.tones.insert(tone.clone(), css.to_owned());
+                }
+            }
+        }
+        if let Some(scene) = opt_object(fields, "scene", path)? {
+            let at = join(path, "scene");
+            let num = |k: &str| opt_number(scene, k, &at);
+            out.ambient = num("ambient")?.map_or(out.ambient, |v| v as f32);
+            out.key = num("key")?.map_or(out.key, |v| v as f32);
+            out.roughness = num("roughness")?.map_or(out.roughness, |v| v as f32);
+            out.metalness = num("metalness")?.map_or(out.metalness, |v| v as f32);
+            out.outline = num("outline")?.map_or(out.outline, |v| v as f32);
+            if let Some(color) = opt_str(scene, "keyColor", &at)? {
+                out.key_color = color.to_owned();
+            }
+            if let Some(flat) = present(scene, "flat") {
+                out.flat = flat
+                    .as_bool()
+                    .ok_or_else(|| bad(&join(&at, "flat"), "must be a boolean"))?;
+            }
+        }
+        Ok(out)
+    }
+}
+
 pub fn scene_from_canvas_node(
     node: &Value,
     width: f32,
@@ -2678,7 +2722,10 @@ impl Walk<'_> {
             |c: [f32; 4]| flat_material(flat, [c[0], c[1], c[2]], opacity * f64::from(c[3]), None);
         let white = [1.0; 4];
         if let Some((color, blur)) = shadow_of(view, path)? {
-            let coverage = body.iter().chain(edge.iter()).fold(MeshData::default(), merged);
+            let coverage = body
+                .iter()
+                .chain(edge.iter())
+                .fold(MeshData::default(), merged);
             if !coverage.indices.is_empty() {
                 // canvas shadowBlur is twice the Gaussian sigma; `blur` is in cells
                 let mut glow = flat_instance(coverage, at, paint(color), None);
@@ -4123,16 +4170,24 @@ mod tests {
 
     #[test]
     fn a_shape_shadow_draws_a_glow_of_its_coverage_under_it() {
-        let s = shape_scene(json!({"shape": "rect", "width": 1, "height": 1, "fill": "#ffffff",
-            "stroke": "#000000", "strokeWidth": 4, "shadow": {"color": "#ff0000", "blur": 0.2}}))
+        let s = shape_scene(
+            json!({"shape": "rect", "width": 1, "height": 1, "fill": "#ffffff",
+            "stroke": "#000000", "strokeWidth": 4, "shadow": {"color": "#ff0000", "blur": 0.2}}),
+        )
         .unwrap();
         let [glow, body, edge] = s.meshes.as_slice() else {
             panic!("expected glow, body, edge: {} meshes", s.meshes.len());
         };
         let xs = body.mesh.positions.iter().map(|p| p[0]);
         let cell = xs.clone().fold(f32::MIN, f32::max) - xs.fold(f32::MAX, f32::min);
-        assert!((glow.glow.unwrap() - 0.2 * cell / 2.0).abs() < 1e-6, "sigma is half the blur, in cells");
-        assert_eq!(glow.mesh.indices.len(), body.mesh.indices.len() + edge.mesh.indices.len());
+        assert!(
+            (glow.glow.unwrap() - 0.2 * cell / 2.0).abs() < 1e-6,
+            "sigma is half the blur, in cells"
+        );
+        assert_eq!(
+            glow.mesh.indices.len(),
+            body.mesh.indices.len() + edge.mesh.indices.len()
+        );
         assert_eq!(glow.transform, body.transform);
         assert_eq!(glow.material.color, [1.0, 0.0, 0.0]);
         assert!(glow.id.is_none(), "a glow is never picked");
@@ -4141,8 +4196,12 @@ mod tests {
 
     #[test]
     fn control_a_shadow_canvas_would_not_draw_adds_no_glow_and_a_bad_one_is_refused() {
-        for shadow in [json!({"color": "#ff0000", "blur": 0}), json!({"color": "rgba(255,0,0,0)", "blur": 1})] {
-            let s = shape_scene(json!({"shape": "ellipse", "fill": "#ffffff", "shadow": shadow})).unwrap();
+        for shadow in [
+            json!({"color": "#ff0000", "blur": 0}),
+            json!({"color": "rgba(255,0,0,0)", "blur": 1}),
+        ] {
+            let s = shape_scene(json!({"shape": "ellipse", "fill": "#ffffff", "shadow": shadow}))
+                .unwrap();
             assert_eq!(s.meshes.len(), 1);
             assert_eq!(s.meshes[0].glow, None);
         }

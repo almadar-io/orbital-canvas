@@ -9,6 +9,9 @@ struct Object {
   params: vec4<f32>,
   // x: transmission, y: ior, z: thickness
   physical: vec4<f32>,
+  // with FLAG_QUAD, the unit quad's local rect (min x, min y, width, height) and the map rect its UVs span
+  quad: vec4<f32>,
+  uv_rect: vec4<f32>,
 };
 
 const FLAG_FLAT: u32 = 1u;
@@ -16,6 +19,7 @@ const FLAG_RECEIVE_SHADOW: u32 = 2u;
 const FLAG_MAP: u32 = 4u;
 const FLAG_CUTOUT: u32 = 8u;
 const FLAG_BILLBOARD: u32 = 16u;
+const FLAG_QUAD: u32 = 32u;
 const ALPHA_TEST: f32 = 0.1;
 
 @group(0) @binding(1) var shadow_map: texture_depth_2d;
@@ -56,15 +60,22 @@ fn world_normal(normal: vec3<f32>) -> vec3<f32> {
   return normalize(cross(frame.camera_right.xyz, frame.camera_up.xyz));
 }
 
+fn local_position(position: vec3<f32>) -> vec3<f32> {
+  if ((u32(object.params.w) & FLAG_QUAD) == 0u) {
+    return position;
+  }
+  return vec3<f32>(object.quad.xy + position.xy * object.quad.zw, 0.0);
+}
+
 @vertex
 fn vs_main(in: VertexIn) -> VertexOut {
-  let world = world_position(in.position);
+  let world = world_position(local_position(in.position));
   let normal = world_normal(in.normal);
   var out: VertexOut;
   out.clip = frame.view_proj * world;
   out.world = world.xyz;
   out.normal = normal;
-  out.uv = in.uv;
+  out.uv = select(in.uv, object.uv_rect.xy + in.uv * object.uv_rect.zw, (u32(object.params.w) & FLAG_QUAD) != 0u);
   out.shadow_coord = frame.light_view_proj * vec4<f32>(world.xyz + normal * frame.shadow.y, 1.0);
   return out;
 }

@@ -218,11 +218,18 @@ fn scene3d_packet(
     viewport: Option<(f32, f32)>,
 ) -> Result<MappedScene, CanvasSceneError> {
     let (width, height) = viewport.unwrap_or((800.0, 600.0));
-    let theme = super::canvas_scene3d::SceneTheme::default();
+    let mut node = fields.clone();
+    // the host's canvas theme is the scene's theme, not one of the pattern's props
+    let theme = match node
+        .as_object_mut()
+        .and_then(|map| map.remove("canvasTheme"))
+    {
+        Some(theme) => super::canvas_scene3d::SceneTheme::from_canvas_theme(&theme)?,
+        None => super::canvas_scene3d::SceneTheme::default(),
+    };
     let scene = if pattern == "canvas" {
-        super::canvas_scene3d::scene_from_canvas_node_themed(fields, width, height, &theme)?
+        super::canvas_scene3d::scene_from_canvas_node_themed(&node, width, height, &theme)?
     } else {
-        let mut node = fields.clone();
         if let Some(map) = node.as_object_mut() {
             map.insert("type".into(), Value::String(pattern.into()));
         }
@@ -276,6 +283,63 @@ pub fn scene_size(node: &Value) -> Result<(f32, f32), CanvasSceneError> {
 
 #[cfg(test)]
 mod tests {
+    fn scene3d(node: serde_json::Value) -> crate::scene3d::Scene3D {
+        let mapped = super::map_scene(&node, Some((600.0, 400.0))).expect("a 3D scene");
+        match mapped.packet.draw_commands.as_slice() {
+            [crate::packet::DrawCommand::Scene3D { scene }] => (**scene).clone(),
+            other => panic!("expected one 3D scene: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_host_canvas_theme_themes_a_3d_scene_instead_of_being_refused_as_a_prop() {
+        let node = |theme: Option<serde_json::Value>| {
+            let mut n = json!({"type": "physics-canvas", "mode": "3d", "bodies": [{"id": "b", "x": 1, "y": 2}]});
+            if let Some(t) = theme {
+                n["canvasTheme"] = t;
+            }
+            n
+        };
+        let themed = scene3d(node(Some(
+            json!({"ground": "transparent", "tones": {"ink": "currentColor"},
+            "scene": {"ambient": 0.2}}),
+        )));
+        let plain = scene3d(node(None));
+        assert_ne!(
+            themed.lights.ambient, plain.lights.ambient,
+            "the theme's ambient reaches the lights"
+        );
+        let unset = scene3d(node(Some(json!({"ground": "transparent", "tones": {}}))));
+        assert_eq!(
+            unset, plain,
+            "control: a theme without a scene axis draws the resolver's fallbacks"
+        );
+    }
+
+    #[test]
+    fn a_canvas_theme_reads_ground_tones_and_the_scene_axis() {
+        let t = crate::mappers::canvas_scene3d::SceneTheme::from_canvas_theme(&json!({
+            "ground": "#112233", "tones": {"ink": "#000000", "axis": "currentColor"},
+            "scene": {"ambient": 0.3, "keyColor": "#ff0000", "flat": true}}))
+        .unwrap();
+        assert_eq!(t.ground.as_deref(), Some("#112233"));
+        assert_eq!(t.tones.get("ink").map(String::as_str), Some("#000000"));
+        assert!(
+            !t.tones.contains_key("axis"),
+            "a tone left at currentColor is unset"
+        );
+        assert_eq!(
+            (t.ambient, t.key_color.as_str(), t.flat, t.key),
+            (0.3, "#ff0000", true, 1.0)
+        );
+        assert!(
+            crate::mappers::canvas_scene3d::SceneTheme::from_canvas_theme(
+                &json!({"scene": {"flat": 1}})
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn scene_patterns_are_the_registry_names_every_host_draws_as_a_scene() {
         let names: Vec<&str> = super::scene_patterns().collect();

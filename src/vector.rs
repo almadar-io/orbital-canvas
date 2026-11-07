@@ -1060,11 +1060,27 @@ mod tests {
         };
         let glow = rasterize(&[&shadow], 40, 40, 1.0, 1.0).unwrap();
         let [r, g, b, a] = at(&glow, 40, 12, 20);
-        assert!(a > 0 && g > 0, "past the edge the blur reaches: {:?}", [r, g, b, a]);
-        assert_eq!((r, b), (0, 0), "painted in the shadow color, not the shape's");
-        assert_eq!(at(&glow, 40, 2, 2)[3], 0, "far from the shape nothing paints");
+        assert!(
+            a > 0 && g > 0,
+            "past the edge the blur reaches: {:?}",
+            [r, g, b, a]
+        );
+        assert_eq!(
+            (r, b),
+            (0, 0),
+            "painted in the shadow color, not the shape's"
+        );
+        assert_eq!(
+            at(&glow, 40, 2, 2)[3],
+            0,
+            "far from the shape nothing paints"
+        );
         let plain = rasterize(&[&square], 40, 40, 1.0, 1.0).unwrap();
-        assert_eq!(at(&plain, 40, 12, 20)[3], 0, "control: the shape alone stops at its edge");
+        assert_eq!(
+            at(&plain, 40, 12, 20)[3],
+            0,
+            "control: the shape alone stops at its edge"
+        );
     }
 
     #[test]

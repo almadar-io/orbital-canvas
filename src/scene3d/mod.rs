@@ -4,6 +4,7 @@
 pub mod animation;
 pub mod environment;
 pub mod geometry;
+pub mod glow;
 pub mod gltf;
 pub mod label;
 pub mod mipmap;
