@@ -432,6 +432,18 @@ impl Xform {
                 command: Box::new(self.command(command)),
                 radius: *radius,
             },
+            DrawCommand::Shadow {
+                commands,
+                color,
+                sigma,
+            } => DrawCommand::Shadow {
+                commands: commands
+                    .iter()
+                    .map(|command| self.command(command))
+                    .collect(),
+                color: *color,
+                sigma: *sigma * self.scale.abs(),
+            },
             DrawCommand::AdditiveGroup { commands } => DrawCommand::AdditiveGroup {
                 commands: commands
                     .iter()

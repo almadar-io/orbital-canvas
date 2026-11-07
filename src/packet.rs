@@ -368,6 +368,13 @@ pub enum DrawCommand {
         command: Box<DrawCommand>,
         radius: f32,
     },
+    /// Canvas `shadowColor`/`shadowBlur` under one shape: the coverage of its vector operations painted in `color`,
+    /// Gaussian-blurred by `sigma` painter pixels.
+    Shadow {
+        commands: Vec<DrawCommand>,
+        color: [f32; 4],
+        sigma: f32,
+    },
     /// Composite one shape's vector operations with canvas `lighter` blending.
     AdditiveGroup { commands: Vec<DrawCommand> },
     /// Scope mixed child commands to an authored SVG path in packet pixels.

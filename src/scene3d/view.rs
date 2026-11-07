@@ -711,6 +711,7 @@ mod tests {
                 cast_shadow: true,
                 receive_shadow: true,
                 id: Some("crate".into()),
+                glow: None,
             }],
             grid: None,
             interaction: Interaction {

@@ -1042,6 +1042,7 @@ impl SharedDeviceRenderer {
                 | DrawCommand::PatternPath { .. }
                 | DrawCommand::GradientPath { .. }
                 | DrawCommand::Blurred { .. }
+                | DrawCommand::Shadow { .. }
                 | DrawCommand::ClippedPath { .. }
                 | DrawCommand::Line { .. }
                 | DrawCommand::Text { .. } => {

@@ -219,6 +219,7 @@ pub fn selection_ring(
         cast_shadow: false,
         receive_shadow: false,
         id: None,
+        glow: None,
     }
 }
 

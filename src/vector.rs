@@ -288,6 +288,7 @@ pub fn is_vector(command: &DrawCommand) -> bool {
             | DrawCommand::GradientPath { .. }
             | DrawCommand::PatternPath { .. }
             | DrawCommand::Blurred { .. }
+            | DrawCommand::Shadow { .. }
             | DrawCommand::ClippedPath { .. }
             | DrawCommand::Line { .. }
             | DrawCommand::Text { .. }
@@ -302,6 +303,7 @@ pub fn uses_image_pattern(command: &DrawCommand) -> bool {
             ..
         } => true,
         DrawCommand::Blurred { command, .. } => uses_image_pattern(command),
+        DrawCommand::Shadow { commands, .. } => commands.iter().any(uses_image_pattern),
         DrawCommand::AdditiveGroup { commands } => commands.iter().any(uses_image_pattern),
         _ => false,
     }
@@ -311,6 +313,7 @@ pub fn uses_text(command: &DrawCommand) -> bool {
     match command {
         DrawCommand::Text { .. } => true,
         DrawCommand::Blurred { command, .. } => uses_text(command),
+        DrawCommand::Shadow { commands, .. } => commands.iter().any(uses_text),
         DrawCommand::AdditiveGroup { commands } => commands.iter().any(uses_text),
         _ => false,
     }
@@ -821,6 +824,47 @@ fn draw_command(pixmap: &mut Pixmap, command: &DrawCommand, ts: Transform) {
                 None,
             );
         }
+        DrawCommand::Shadow {
+            commands,
+            color,
+            sigma,
+        } => {
+            let (width, height) = (pixmap.width(), pixmap.height());
+            let Some(mut layer) = Pixmap::new(width, height) else {
+                return;
+            };
+            for command in commands {
+                draw_command(&mut layer, command, ts);
+            }
+            let tint = color.map(|c| c.clamp(0.0, 1.0));
+            let mut coverage = layer.take();
+            for px in coverage.chunks_exact_mut(4) {
+                let a = f32::from(px[3]) / 255.0 * tint[3];
+                for (channel, c) in px.iter_mut().zip(tint) {
+                    *channel = (c * a * 255.0).round() as u8;
+                }
+                px[3] = (a * 255.0).round() as u8;
+            }
+            let Some(image) = image::RgbaImage::from_raw(width, height, coverage) else {
+                return;
+            };
+            let sigma = sigma.max(0.0) * (ts.sx.abs() + ts.sy.abs()) / 2.0;
+            let blurred = image::imageops::blur(&image, sigma);
+            let Some(size) = tiny_skia::IntSize::from_wh(width, height) else {
+                return;
+            };
+            let Some(result) = Pixmap::from_vec(blurred.into_raw(), size) else {
+                return;
+            };
+            pixmap.draw_pixmap(
+                0,
+                0,
+                result.as_ref(),
+                &tiny_skia::PixmapPaint::default(),
+                Transform::identity(),
+                None,
+            );
+        }
         DrawCommand::ClippedPath {
             segments,
             fill,
@@ -1000,6 +1044,27 @@ mod tests {
             PathSegment::LineTo { x, y: y + h },
             PathSegment::Close,
         ]
+    }
+
+    #[test]
+    fn a_shadow_paints_the_coverage_in_its_color_blurred_past_the_edge() {
+        let square = DrawCommand::Path {
+            segments: rect(15.0, 15.0, 10.0, 10.0),
+            fill: Some([1.0, 1.0, 1.0, 1.0]),
+            stroke: None,
+        };
+        let shadow = DrawCommand::Shadow {
+            commands: vec![square.clone()],
+            color: [0.0, 1.0, 0.0, 1.0],
+            sigma: 3.0,
+        };
+        let glow = rasterize(&[&shadow], 40, 40, 1.0, 1.0).unwrap();
+        let [r, g, b, a] = at(&glow, 40, 12, 20);
+        assert!(a > 0 && g > 0, "past the edge the blur reaches: {:?}", [r, g, b, a]);
+        assert_eq!((r, b), (0, 0), "painted in the shadow color, not the shape's");
+        assert_eq!(at(&glow, 40, 2, 2)[3], 0, "far from the shape nothing paints");
+        let plain = rasterize(&[&square], 40, 40, 1.0, 1.0).unwrap();
+        assert_eq!(at(&plain, 40, 12, 20)[3], 0, "control: the shape alone stops at its edge");
     }
 
     #[test]

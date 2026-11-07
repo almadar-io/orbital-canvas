@@ -692,6 +692,7 @@ impl Model {
                     cast_shadow: true,
                     receive_shadow: true,
                     id: None,
+                    glow: None,
                 });
             }
         }

@@ -198,6 +198,10 @@ pub struct MeshInstance {
     /// The id of the innermost drawable this mesh belongs to, for picking.
     #[serde(default)]
     pub id: Option<String>,
+    /// Draw only the mesh's coverage, Gaussian-blurred by this sigma in its local units within its local XY plane, in
+    /// the material's color: canvas `shadowBlur` (twice the sigma) under a flat shape.
+    #[serde(default)]
+    pub glow: Option<f32>,
 }
 
 /// Indexed triangles in the mesh's local space, counter-clockwise front faces.

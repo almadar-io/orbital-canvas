@@ -1132,13 +1132,23 @@ fn paint_shape(
     }
     let blur = get_f32(node, "blur", 0.0).max(0.0);
     let additive = blend_mode == Some("lighter");
-    if node.get("shadow").is_some_and(|shadow| !shadow.is_null()) {
-        gap_once(
-            "shape-shadow",
-            "draw-shape shadow needs a GPU silhouette blur pass",
-        );
-        return;
-    }
+    let shadow = node.get("shadow").filter(|shadow| !shadow.is_null());
+    let shadow = match shadow {
+        None => None,
+        Some(shadow) => {
+            let color = shadow.get("color").and_then(Value::as_str).and_then(parse_css_color);
+            let blur = shadow.get("blur").and_then(Value::as_f64);
+            match (color, blur) {
+                (Some(color), Some(blur)) if blur.is_finite() && blur >= 0.0 => {
+                    (blur > 0.0 && color[3] > 0.0).then_some((color, blur as f32))
+                }
+                _ => {
+                    gap_once("shape-shadow", "draw-shape shadow needs a css `color` and a finite `blur` of zero or more");
+                    return;
+                }
+            }
+        }
+    };
     let opacity = get_f32(node, "opacity", 1.0);
     let fill_gradient = node
         .get("gradient")
@@ -1151,7 +1161,8 @@ fn paint_shape(
         || stroke_gradient.is_some()
         || pattern.is_some()
         || blur > 0.0
-        || additive;
+        || additive
+        || shadow.is_some();
     let fill = node
         .get("fill")
         .and_then(Value::as_str)
@@ -1457,6 +1468,12 @@ fn paint_shape(
             radians,
             1.0,
         );
+    }
+    if let Some((color, blur)) = shadow.filter(|_| out.len() > start) {
+        // canvas shadowBlur is twice the Gaussian sigma; `blur` is in world units
+        let commands = out[start..].to_vec();
+        let sigma = blur * projector.tile_width * zoom / 2.0;
+        out.insert(start, DrawCommand::Shadow { commands, color, sigma });
     }
     if additive && out.len() > start {
         let commands = out.drain(start..).collect();
@@ -1799,8 +1816,40 @@ mod tests {
         assert_eq!(frame(&scene, 150.0).x, 0.0);
     }
 
+    fn shadowed_disc(blur: f64) -> GameRenderPacket {
+        packet_for(json!({
+            "projection": "free", "scale": 1.0,
+            "drawables": [
+                {"type": "draw-shape", "shape": "ellipse", "position": {"x": 1, "y": 1},
+                    "anchor": "center", "radiusX": 0.5, "fill": "#ffffff",
+                    "shadow": {"color": "#00ff00", "blur": blur}}
+            ]
+        }))
+    }
+
     #[test]
-    fn blur_is_scoped_and_unsupported_shadow_and_blend_do_not_paint_base() {
+    fn a_shape_shadow_draws_its_coverage_blurred_under_the_shape() {
+        let packet = shadowed_disc(0.25);
+        let [DrawCommand::Clear { .. }, DrawCommand::Shadow { commands, color, sigma }, shape] =
+            packet.draw_commands.as_slice()
+        else {
+            panic!("expected clear, shadow, shape: {:?}", packet.draw_commands);
+        };
+        assert_eq!(*color, [0.0, 1.0, 0.0, 1.0]);
+        // canvas shadowBlur is twice the Gaussian sigma; blur is in world units
+        assert_eq!(*sigma, 0.25 * crate::projector::TILE_WIDTH / 2.0);
+        assert_eq!(format!("{commands:?}"), format!("{:?}", [shape]));
+    }
+
+    #[test]
+    fn control_a_shadow_without_blur_draws_only_the_shape() {
+        let packet = shadowed_disc(0.0);
+        assert_eq!(packet.draw_commands.len(), 2);
+        assert!(!matches!(packet.draw_commands[1], DrawCommand::Shadow { .. }));
+    }
+
+    #[test]
+    fn blur_is_scoped_and_unsupported_sprite_shadow_and_blend_do_not_paint_base() {
         let scene = json!({
             "projection": "free", "scale": 1.0,
             "drawables": [
@@ -1808,9 +1857,6 @@ mod tests {
                     "width": 1, "height": 1, "fill": "#ffffff", "blur": 4},
                 {"type": "draw-shape", "shape": "rect", "position": {"x": 1, "y": 0},
                     "width": 1, "height": 1, "fill": "#ffffff", "blendMode": "multiply"},
-                {"type": "draw-shape", "shape": "rect", "position": {"x": 2, "y": 0},
-                    "width": 1, "height": 1, "fill": "#ffffff",
-                    "shadow": {"color": "#000000", "blur": 1}},
                 {"type": "draw-sprite", "position": {"x": 3, "y": 0},
                     "asset": {"url": "data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%271%27%20height%3D%271%27%2F%3E"},
                     "shadow": {"color": "#000000", "blur": 1}}

@@ -1541,6 +1541,7 @@ mod integration_tests {
             cast_shadow: false,
             receive_shadow: false,
             id: None,
+            glow: None,
         }
     }
 

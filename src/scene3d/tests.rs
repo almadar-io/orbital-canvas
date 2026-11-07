@@ -49,6 +49,7 @@ fn instance(mesh: MeshData, transform: Mat4, material: Material) -> MeshInstance
         cast_shadow: true,
         receive_shadow: true,
         id: None,
+        glow: None,
     }
 }
 

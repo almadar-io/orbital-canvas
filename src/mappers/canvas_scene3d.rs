@@ -1405,6 +1405,7 @@ impl Walk<'_> {
             cast_shadow: opt_bool(f, "castShadow", path)?.unwrap_or(true),
             receive_shadow: opt_bool(f, "receiveShadow", path)?.unwrap_or(true),
             id: self.pick_id.clone(),
+            glow: None,
         });
         if let (Some(o), Some((mesh, at))) = (outline, hull) {
             self.meshes
@@ -1528,6 +1529,7 @@ impl Walk<'_> {
             cast_shadow: opt_bool(f, "castShadow", path)?.unwrap_or(true),
             receive_shadow: opt_bool(f, "receiveShadow", path)?.unwrap_or(true),
             id: self.pick_id.clone(),
+            glow: None,
         });
         let skinned = self.meshes.len() - 1;
         // three draws no hull on a skinned mesh; ours is the posed surface pushed out along its normals
@@ -1748,6 +1750,7 @@ impl Walk<'_> {
             cast_shadow: false,
             receive_shadow: false,
             id: self.pick_id.clone(),
+            glow: None,
         });
         Ok(())
     }
@@ -1857,6 +1860,7 @@ impl Walk<'_> {
                 cast_shadow: false,
                 receive_shadow: false,
                 id: self.pick_id.clone(),
+                glow: None,
             });
         }
         Ok(())
@@ -1976,6 +1980,7 @@ impl Outline {
             cast_shadow: false,
             receive_shadow: false,
             id,
+            glow: None,
         }
     }
 }
@@ -2040,7 +2045,42 @@ fn flat_instance(
         cast_shadow: false,
         receive_shadow: false,
         id,
+        glow: None,
     }
+}
+
+/// A shape's `shadow` as straight sRGB RGBA and its blur in cells; `None` when canvas draws none (no blur, since a
+/// shadow here has no offset, or a transparent color).
+fn shadow_of(f: &Fields, path: &str) -> Result<Option<([f32; 4], f64)>, CanvasSceneError> {
+    let Some(v) = present(f, "shadow").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let field = join(path, "shadow");
+    let o = v
+        .as_object()
+        .ok_or_else(|| bad(&field, "must be {color, blur}"))?;
+    check_keys(o, &["color", "blur"], &field)?;
+    let color =
+        opt_css(o, "color", &field)?.ok_or_else(|| bad(&join(&field, "color"), "is required"))?;
+    let blur =
+        opt_number(o, "blur", &field)?.ok_or_else(|| bad(&join(&field, "blur"), "is required"))?;
+    if !(blur.is_finite() && blur >= 0.0) {
+        return Err(bad(
+            &join(&field, "blur"),
+            format!("{blur} is not a finite blur of zero or more"),
+        ));
+    }
+    Ok((blur > 0.0 && color[3] > 0.0).then_some((color, blur)))
+}
+
+/// `a` and `b` as one mesh.
+fn merged(mut a: MeshData, b: &MeshData) -> MeshData {
+    let base = a.positions.len() as u32;
+    a.positions.extend_from_slice(&b.positions);
+    a.normals.extend_from_slice(&b.normals);
+    a.uvs.extend_from_slice(&b.uvs);
+    a.indices.extend(b.indices.iter().map(|i| i + base));
+    a
 }
 
 /// three's flat shapes are built in XY and laid on the ground facing up: local +Y runs to world −Z.
@@ -2192,6 +2232,7 @@ impl Walk<'_> {
             cast_shadow: false,
             receive_shadow: false,
             id: self.pick_id.clone(),
+            glow: None,
         });
         Ok(())
     }
@@ -2382,7 +2423,6 @@ impl Walk<'_> {
             "strokeGradient",
             "strokeDashOffset",
             "blur",
-            "shadow",
         ] {
             if present(f, key).is_some() {
                 return Err(undrawn(&join(path, key), STEP_PARITY));
@@ -2637,6 +2677,15 @@ impl Walk<'_> {
         let paint =
             |c: [f32; 4]| flat_material(flat, [c[0], c[1], c[2]], opacity * f64::from(c[3]), None);
         let white = [1.0; 4];
+        if let Some((color, blur)) = shadow_of(view, path)? {
+            let coverage = body.iter().chain(edge.iter()).fold(MeshData::default(), merged);
+            if !coverage.indices.is_empty() {
+                // canvas shadowBlur is twice the Gaussian sigma; `blur` is in cells
+                let mut glow = flat_instance(coverage, at, paint(color), None);
+                glow.glow = Some((blur * cell / 2.0) as f32);
+                self.meshes.push(glow);
+            }
+        }
         if let Some(mesh) = body {
             let color = match shape {
                 "path" => fill.unwrap_or(white),
@@ -4070,6 +4119,36 @@ mod tests {
             node[key] = value.clone();
         }
         scene(json!({ "drawables": [node] }))
+    }
+
+    #[test]
+    fn a_shape_shadow_draws_a_glow_of_its_coverage_under_it() {
+        let s = shape_scene(json!({"shape": "rect", "width": 1, "height": 1, "fill": "#ffffff",
+            "stroke": "#000000", "strokeWidth": 4, "shadow": {"color": "#ff0000", "blur": 0.2}}))
+        .unwrap();
+        let [glow, body, edge] = s.meshes.as_slice() else {
+            panic!("expected glow, body, edge: {} meshes", s.meshes.len());
+        };
+        let xs = body.mesh.positions.iter().map(|p| p[0]);
+        let cell = xs.clone().fold(f32::MIN, f32::max) - xs.fold(f32::MAX, f32::min);
+        assert!((glow.glow.unwrap() - 0.2 * cell / 2.0).abs() < 1e-6, "sigma is half the blur, in cells");
+        assert_eq!(glow.mesh.indices.len(), body.mesh.indices.len() + edge.mesh.indices.len());
+        assert_eq!(glow.transform, body.transform);
+        assert_eq!(glow.material.color, [1.0, 0.0, 0.0]);
+        assert!(glow.id.is_none(), "a glow is never picked");
+        assert_eq!((body.glow, edge.glow), (None, None));
+    }
+
+    #[test]
+    fn control_a_shadow_canvas_would_not_draw_adds_no_glow_and_a_bad_one_is_refused() {
+        for shadow in [json!({"color": "#ff0000", "blur": 0}), json!({"color": "rgba(255,0,0,0)", "blur": 1})] {
+            let s = shape_scene(json!({"shape": "ellipse", "fill": "#ffffff", "shadow": shadow})).unwrap();
+            assert_eq!(s.meshes.len(), 1);
+            assert_eq!(s.meshes[0].glow, None);
+        }
+        let refused = message(shape_scene(json!({"shape": "ellipse", "fill": "#ffffff",
+            "shadow": {"color": "#ff0000", "blur": -1}})));
+        assert!(refused.starts_with("drawables[0].shadow.blur"), "{refused}");
     }
 
     #[test]
