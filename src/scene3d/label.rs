@@ -121,3 +121,14 @@ pub fn label(text: &str, style: &LabelStyle) -> Result<Label, String> {
         descent,
     })
 }
+
+#[cfg(test)]
+mod zz_probe {
+    #[test]
+    fn zz_write_u_label() {
+        let style = super::LabelStyle { em: 0.32, bold: true, mono: false, color: [0.0, 0.0, 0.0, 1.0], halo: 0.02, halo_color: [1.0, 1.0, 1.0, 1.0] };
+        let l = super::label("u+v", &style).unwrap();
+        let bytes = crate::asset::asset_bytes(&l.key).unwrap();
+        std::fs::write("/private/tmp/claude-501/-Users-osamaalghanmi-kflow-ai-builder/50357319-b734-4e98-8048-80b5e76ff042/scratchpad/desk/label-u.png", bytes).unwrap();
+    }
+}
