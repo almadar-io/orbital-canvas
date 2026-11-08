@@ -119,6 +119,15 @@ pub async fn shared_device_async() -> Result<SharedDevice> {
     Ok(guard.get_or_insert(opened).clone())
 }
 
+/// The instance a platform surface must be created on: the shared slot's own when the slot is open (its adapter
+/// belongs to that instance and no other), else `fresh` (the platform's backend choice), which then opens the slot.
+pub(crate) fn instance_for_surface(fresh: impl FnOnce() -> wgpu::Instance) -> wgpu::Instance {
+    match slot().as_ref().and_then(|shared| shared.instance.clone()) {
+        Some(instance) => instance,
+        None => fresh(),
+    }
+}
+
 /// The slot for a `Canvas` that owns `instance` (and maybe a surface): reuse the slot, or open on that instance so
 /// the adapter is compatible with the surface. The slot outlives the Canvas, so mobile surface recreation keeps it.
 pub(crate) fn acquire(
@@ -132,4 +141,27 @@ pub(crate) fn acquire(
     let opened = open(instance, surface)?;
     *guard = Some(opened.clone());
     Ok(opened)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_surface_is_created_on_the_open_slot_instance_and_opens_a_fresh_one_only_when_the_slot_is_empty() {
+        let Ok(opened) = shared_device() else {
+            eprintln!("no GPU adapter on this host; the slot cannot open");
+            return;
+        };
+        let mut fresh_called = false;
+        let _instance = instance_for_surface(|| {
+            fresh_called = true;
+            new_instance()
+        });
+        assert_eq!(
+            fresh_called,
+            opened.instance.is_none(),
+            "an open slot with an instance hands that instance out, never a second one"
+        );
+    }
 }

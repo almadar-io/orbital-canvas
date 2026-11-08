@@ -24,11 +24,13 @@ pub unsafe fn init_from_native_window(
     let raw_window = raw_window_handle::AndroidNdkWindowHandle::new(nn).into();
     let raw_display = raw_window_handle::AndroidDisplayHandle::new().into();
 
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN,
-        flags: wgpu::InstanceFlags::default(),
-        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-        backend_options: wgpu::BackendOptions::default(),
+    let instance = crate::device::instance_for_surface(|| {
+        wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            backend_options: wgpu::BackendOptions::default(),
+        })
     });
 
     // SAFETY: `window` (ANativeWindow*) is valid and outlives the surface per the caller contract.
