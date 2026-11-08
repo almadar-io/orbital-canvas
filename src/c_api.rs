@@ -630,6 +630,171 @@ pub unsafe extern "C" fn orbital_canvas_render_scene_rgba(
     })
 }
 
+/// Decode a `data:` URL (base64 or percent-encoded) the way the canvas asset loader does.
+/// Returns 1 and writes the bytes (free with `orbital_canvas_free_rgba`; null with length 0 when
+/// empty) and the declared mime type (free with `orbital_canvas_free_string`; null when none);
+/// 0 on a null argument or a malformed URL (reason via last error).
+///
+/// # Safety
+/// `url` must be a valid null-terminated UTF-8 string and every out pointer valid.
+#[no_mangle]
+pub unsafe extern "C" fn orbital_canvas_decode_data_url(
+    url: *const c_char,
+    out_bytes: *mut *mut u8,
+    out_len: *mut usize,
+    out_mime: *mut *mut c_char,
+) -> c_int {
+    if url.is_null() || out_bytes.is_null() || out_len.is_null() || out_mime.is_null() {
+        return 0;
+    }
+    guarded("decode_data_url", 0, || {
+        let Ok(url) = CStr::from_ptr(url).to_str() else {
+            set_last_error("decode_data_url: url is not valid UTF-8");
+            return 0;
+        };
+        match crate::asset::decode_data_url(url) {
+            Ok((bytes, mime)) => {
+                *out_mime = mime
+                    .and_then(|m| CString::new(m).ok())
+                    .map_or(ptr::null_mut(), CString::into_raw);
+                if bytes.is_empty() {
+                    *out_bytes = ptr::null_mut();
+                    *out_len = 0;
+                } else {
+                    let mut buf = bytes.into_boxed_slice();
+                    *out_len = buf.len();
+                    *out_bytes = buf.as_mut_ptr();
+                    std::mem::forget(buf);
+                }
+                1
+            }
+            Err(err) => {
+                set_last_error(&format!("decode_data_url: {err}"));
+                0
+            }
+        }
+    })
+}
+
+/// 1 when an image fetched from `url` with the transport's `content_type` (null when none was
+/// declared) decodes as SVG, else 0: the same rule the canvas asset loader applies.
+///
+/// # Safety
+/// `url` must be a valid null-terminated UTF-8 string; `content_type` such a string or null.
+#[no_mangle]
+pub unsafe extern "C" fn orbital_canvas_asset_is_svg(
+    url: *const c_char,
+    content_type: *const c_char,
+) -> c_int {
+    if url.is_null() {
+        return 0;
+    }
+    guarded("asset_is_svg", 0, || {
+        let url = CStr::from_ptr(url).to_str().unwrap_or("");
+        let declared = if content_type.is_null() {
+            None
+        } else {
+            CStr::from_ptr(content_type).to_str().ok()
+        };
+        c_int::from(
+            crate::asset::AssetKind::classify(url, declared) == crate::asset::AssetKind::Svg,
+        )
+    })
+}
+
+/// The intrinsic size (SVG user units, rounded up) of the SVG in `bytes`, cached under `key`.
+/// Returns 1 and writes the size; 0 on a null argument or an SVG that does not parse.
+///
+/// # Safety
+/// `key` must be a valid null-terminated UTF-8 string, `bytes` valid for `len` bytes, and the out
+/// pointers valid.
+#[no_mangle]
+pub unsafe extern "C" fn orbital_canvas_svg_size(
+    key: *const c_char,
+    bytes: *const u8,
+    len: usize,
+    out_width: *mut u32,
+    out_height: *mut u32,
+) -> c_int {
+    if key.is_null() || bytes.is_null() || out_width.is_null() || out_height.is_null() {
+        return 0;
+    }
+    guarded("svg_size", 0, || {
+        let Ok(key) = CStr::from_ptr(key).to_str() else {
+            set_last_error("svg_size: key is not valid UTF-8");
+            return 0;
+        };
+        match crate::svg::intrinsic_size(key, std::slice::from_raw_parts(bytes, len)) {
+            Some((w, h)) => {
+                *out_width = w;
+                *out_height = h;
+                1
+            }
+            None => {
+                set_last_error(&format!("svg_size: {key} is not a parsable SVG"));
+                0
+            }
+        }
+    })
+}
+
+/// Rasterize an SVG image for a host image view: `key` names it for the parse cache (its URL),
+/// `bytes`/`len` are the fetched SVG. The size is the intrinsic size times `scale` (device pixels
+/// per SVG unit, bucketed like sprites), clamped to `max_dim`. Returns 1 and writes the size and a
+/// straight-alpha RGBA buffer (free with `orbital_canvas_free_rgba`); 0 on a null argument or an
+/// SVG that does not parse (reason via last error).
+///
+/// # Safety
+/// `key` must be a valid null-terminated UTF-8 string, `bytes` valid for `len` bytes, and every
+/// out pointer valid.
+#[no_mangle]
+pub unsafe extern "C" fn orbital_canvas_svg_rasterize(
+    key: *const c_char,
+    bytes: *const u8,
+    len: usize,
+    scale: f32,
+    max_dim: u32,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_pixels: *mut *mut u8,
+    out_len: *mut usize,
+) -> c_int {
+    if key.is_null()
+        || bytes.is_null()
+        || out_width.is_null()
+        || out_height.is_null()
+        || out_pixels.is_null()
+        || out_len.is_null()
+    {
+        return 0;
+    }
+    guarded("svg_rasterize", 0, || {
+        let Ok(key) = CStr::from_ptr(key).to_str() else {
+            set_last_error("svg_rasterize: key is not valid UTF-8");
+            return 0;
+        };
+        let data = std::slice::from_raw_parts(bytes, len);
+        let Some(intrinsic) = crate::svg::intrinsic_size(key, data) else {
+            set_last_error(&format!("svg_rasterize: {key} is not a parsable SVG"));
+            return 0;
+        };
+        let (w, h) = crate::svg::raster_size(intrinsic, crate::svg::raster_scale(scale), max_dim);
+        let Some(raster) = crate::svg::rasterize(key, data, w, h) else {
+            set_last_error(&format!(
+                "svg_rasterize: {key} could not be drawn at {w}x{h}"
+            ));
+            return 0;
+        };
+        let mut buf = raster.rgba.into_boxed_slice();
+        *out_width = raster.width;
+        *out_height = raster.height;
+        *out_len = buf.len();
+        *out_pixels = buf.as_mut_ptr();
+        std::mem::forget(buf);
+        1
+    })
+}
+
 /// Free an RGBA buffer returned by `orbital_canvas_render_to_rgba`.
 ///
 /// # Safety
@@ -684,6 +849,130 @@ mod tests {
         let s = unsafe { CStr::from_ptr(ptr).to_str().unwrap() };
         assert_eq!(s, "render: surface error: Lost");
         unsafe { orbital_canvas_free_string(ptr) };
+        set_last_error("");
+    }
+
+    fn svg_raster(key: &str, svg: &str, scale: f32) -> Option<(u32, u32, Vec<u8>)> {
+        let key = CString::new(key).unwrap();
+        let (mut w, mut h, mut px, mut len) = (0u32, 0u32, std::ptr::null_mut(), 0usize);
+        let ok = unsafe {
+            orbital_canvas_svg_rasterize(
+                key.as_ptr(),
+                svg.as_ptr(),
+                svg.len(),
+                scale,
+                4096,
+                &mut w,
+                &mut h,
+                &mut px,
+                &mut len,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let rgba = unsafe { std::slice::from_raw_parts(px, len) }.to_vec();
+        unsafe { orbital_canvas_free_rgba(px, len) };
+        Some((w, h, rgba))
+    }
+
+    #[test]
+    fn svg_rasterize_draws_at_intrinsic_size_times_scale() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="5"><rect width="10" height="5" fill="#0000ff"/></svg>"##;
+        let (w, h, rgba) = svg_raster("t://blue", svg, 2.0).expect("rasterized");
+        assert_eq!((w, h), (20, 10));
+        assert_eq!(rgba.len(), 20 * 10 * 4);
+        assert_eq!(&rgba[0..4], &[0, 0, 255, 255]);
+        let (w1, h1, _) = svg_raster("t://blue", svg, 1.0).expect("rasterized");
+        assert_eq!((w1, h1), (10, 5));
+    }
+
+    fn decode(url: &str) -> Option<(Vec<u8>, Option<String>)> {
+        let url = CString::new(url).unwrap();
+        let (mut bytes, mut len, mut mime) = (ptr::null_mut(), 0usize, ptr::null_mut());
+        if unsafe { orbital_canvas_decode_data_url(url.as_ptr(), &mut bytes, &mut len, &mut mime) }
+            == 0
+        {
+            return None;
+        }
+        let data = if bytes.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec()
+        };
+        unsafe { orbital_canvas_free_rgba(bytes, len) };
+        let mime = (!mime.is_null()).then(|| {
+            let m = unsafe { CStr::from_ptr(mime) }
+                .to_str()
+                .unwrap()
+                .to_string();
+            unsafe { orbital_canvas_free_string(mime) };
+            m
+        });
+        Some((data, mime))
+    }
+
+    #[test]
+    fn decode_data_url_percent_and_base64_payloads_and_refuses_malformed() {
+        assert_eq!(
+            decode("data:image/svg+xml;utf8,%3Csvg xmlns=%22a%22/%3E"),
+            Some((b"<svg xmlns=\"a\"/>".to_vec(), Some("image/svg+xml".into())))
+        );
+        assert_eq!(
+            decode("data:text/plain;base64,aGk="),
+            Some((b"hi".to_vec(), Some("text/plain".into())))
+        );
+        assert_eq!(decode("data:,"), Some((Vec::new(), None)));
+        set_last_error("");
+        assert_eq!(decode("data:image/png;base64"), None);
+        assert!(get_last_error().contains("no `,`"));
+        set_last_error("");
+    }
+
+    #[test]
+    fn asset_is_svg_follows_the_declared_type_then_the_path_extension() {
+        let is_svg = |url: &str, ct: Option<&str>| {
+            let url = CString::new(url).unwrap();
+            let ct = ct.map(|c| CString::new(c).unwrap());
+            unsafe {
+                orbital_canvas_asset_is_svg(
+                    url.as_ptr(),
+                    ct.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                )
+            }
+        };
+        assert_eq!(
+            is_svg("data:image/svg+xml;base64,AA==", Some("image/svg+xml")),
+            1
+        );
+        assert_eq!(is_svg("https://x/logo.svg?v=1", None), 1);
+        assert_eq!(is_svg("https://x/photo.png", Some("image/png")), 0);
+        assert_eq!(is_svg("https://x/render", None), 0);
+    }
+
+    #[test]
+    fn svg_size_reads_intrinsic_units_and_refuses_non_svg() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="12.5" height="4"/>"##;
+        let key = CString::new("t://size").unwrap();
+        let (mut w, mut h) = (0u32, 0u32);
+        let ok = unsafe {
+            orbital_canvas_svg_size(key.as_ptr(), svg.as_ptr(), svg.len(), &mut w, &mut h)
+        };
+        assert_eq!((ok, w, h), (1, 13, 4));
+        let bad = "plain text";
+        let key = CString::new("t://size-bad").unwrap();
+        let ok = unsafe {
+            orbital_canvas_svg_size(key.as_ptr(), bad.as_ptr(), bad.len(), &mut w, &mut h)
+        };
+        assert_eq!(ok, 0);
+        set_last_error("");
+    }
+
+    #[test]
+    fn svg_rasterize_refuses_bytes_that_are_not_svg() {
+        set_last_error("");
+        assert!(svg_raster("t://not-svg", "not an svg", 2.0).is_none());
+        assert!(get_last_error().contains("not a parsable SVG"));
         set_last_error("");
     }
 

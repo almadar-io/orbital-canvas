@@ -37,7 +37,7 @@ pub enum AssetKind {
 }
 
 impl AssetKind {
-    fn classify(url: &str, content_type: Option<&str>) -> Self {
+    pub(crate) fn classify(url: &str, content_type: Option<&str>) -> Self {
         let declared = content_type.map(|c| {
             c.split(';')
                 .next()
@@ -275,7 +275,7 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
 }
 
 /// `data:[<mime>][;base64],<payload>` -> bytes plus the declared mime type.
-fn decode_data_url(url: &str) -> Result<Fetched, String> {
+pub(crate) fn decode_data_url(url: &str) -> Result<Fetched, String> {
     let rest = url.strip_prefix("data:").ok_or("not a data url")?;
     let (meta, payload) = rest.split_once(',').ok_or("data url has no `,`")?;
     let mut parts = meta.split(';');
