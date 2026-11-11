@@ -52,7 +52,13 @@ pub fn label(text: &str, style: &LabelStyle) -> Result<Label, String> {
     let text_width = crate::vector::shape(text, style.em, style.bold, style.mono).width;
     // the AA fringe and the halo stroke sit outside the glyph box
     let pad = style.halo + 1.0 / DENSITY;
-    let (width, height) = (text_width + 2.0 * pad, ascent - descent + 2.0 * pad);
+    // the raster draws the Latin face's middle on the quad's center, so the quad grows evenly around it to hold the
+    // tallest face the text is shaped with
+    let (top, bottom) = crate::vector::text_run_extent(text, style.em, style.bold, style.mono)
+        .ok_or("the bundled text face is unavailable")?;
+    let middle = (ascent + descent) / 2.0;
+    let half = (top - middle).max(middle - bottom);
+    let (width, height) = (text_width + 2.0 * pad, 2.0 * half + 2.0 * pad);
     let limit = wgpu::Limits::downlevel_webgl2_defaults().max_texture_dimension_2d as f32;
     let density = DENSITY.min(limit / width.max(height));
     let (px_w, px_h) = (
@@ -120,4 +126,56 @@ pub fn label(text: &str, style: &LabelStyle) -> Result<Label, String> {
         ascent,
         descent,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn style(bold: bool) -> LabelStyle {
+        LabelStyle {
+            em: 1.0,
+            bold,
+            mono: false,
+            color: [1.0, 1.0, 1.0, 1.0],
+            halo: 0.0,
+            halo_color: [0.0, 0.0, 0.0, 1.0],
+        }
+    }
+
+    fn inked_pixels(l: &Label) -> usize {
+        let png = crate::asset::asset_bytes(&l.key).expect("the label image is registered");
+        image::load_from_memory(&png)
+            .expect("the label image decodes")
+            .into_rgba8()
+            .pixels()
+            .filter(|p| p.0[3] > 0)
+            .count()
+    }
+
+    // the Arabic face hangs a yeh's two dots lower than the Latin face's descent, which the label box was cut to
+    #[test]
+    fn an_arabic_label_keeps_the_dots_under_a_yeh() {
+        for bold in [false, true] {
+            let yeh = label("\u{064A}", &style(bold)).expect("yeh");
+            let alef_maksura = label("\u{0649}", &style(bold)).expect("alef maksura");
+            assert!(
+                inked_pixels(&yeh) > inked_pixels(&alef_maksura),
+                "bold {bold}: the yeh draws its dots under the shape it shares with the alef maksura"
+            );
+        }
+    }
+
+    #[test]
+    fn control_a_latin_label_keeps_the_latin_box() {
+        let s = style(false);
+        let l = label("Ag", &s).expect("label");
+        let (ascent, descent) = crate::vector::text_font_metrics(s.em).expect("the bundled face");
+        let px = 1.0 / DENSITY;
+        assert!(
+            (l.height - (ascent - descent + 2.0 * px)).abs() <= px,
+            "height {} for ascent {ascent} and descent {descent}",
+            l.height
+        );
+    }
 }

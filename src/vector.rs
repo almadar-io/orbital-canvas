@@ -340,6 +340,20 @@ pub fn text_font_metrics(size: f32) -> Option<(f32, f32)> {
     ))
 }
 
+/// The highest ascent and the lowest descent among the faces `text` is shaped with, in packet units. A face taller
+/// than the Latin one (the Arabic face, whose dots hang under its letters) reaches past [`text_font_metrics`].
+pub(crate) fn text_run_extent(text: &str, size: f32, bold: bool, mono: bool) -> Option<(f32, f32)> {
+    let (mut top, mut bottom) = text_font_metrics(size)?;
+    for font in char_fonts(text, bold, mono) {
+        if let Some(face) = font_for(font) {
+            let scale = size / face.units_per_em() as f32;
+            top = top.max(face.ascender() as f32 * scale);
+            bottom = bottom.min(face.descender() as f32 * scale);
+        }
+    }
+    Some((top, bottom))
+}
+
 fn color(c: [f32; 4]) -> tiny_skia::Color {
     tiny_skia::Color::from_rgba(
         c[0].clamp(0.0, 1.0),

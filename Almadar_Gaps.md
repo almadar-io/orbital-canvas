@@ -7,7 +7,13 @@ Every open gap this repo owns lives here. This file is the source of truth; the 
 - **Codes:** new gaps use this repo's prefix `G-ORBITAL-GAME-RENDERER-`. Take the "Next code" below, then bump it in the same edit. Codes are never reused or renamed.
 - **Close by deleting.** Remove the entry in the same commit as the fix.
 
-Next code: `G-ORBITAL-GAME-RENDERER-014`
+Next code: `G-ORBITAL-GAME-RENDERER-016`
+
+- **G-ORBITAL-GAME-RENDERER-014** [architectural] — A panic inside the browser renderer takes the whole page down. The kernel and every canvas share one wasm module, so after a renderer panic each later call into it throws `recursive use of an object detected which would lead to unsafe aliasing in rust` and the client replaces the page with that error text. Seen 2026-11-11 with WebGPU hidden on a `canvas mode:"3d"` page: glow panicked at `web_sys.rs:4223` (`Tex storage 2D multisample is not supported`, the multisampled depth target, fixed the same day in `scene3d/render.rs` `depth_texture`) and the page showed nothing but the error. The trigger is fixed; the class is not: any renderer panic still ends the app, not the canvas. Fix: the canvas boundary in orbital-wasm catches a renderer failure and reports it as that canvas's scene error (the path `take_scene3d_error` already feeds), leaving the kernel usable. orbital-canvas, orbital-wasm. Reproduce: make any `scene3d` path panic in the browser build. Prevention rung: (3) the verifiers (a page whose canvas fails must still paint its other content).
+  Severity: high. Root cause: one-off.
+
+- **G-ORBITAL-GAME-RENDERER-015** [mechanical] — Nothing runs the WebGL2 backend. The native tests draw on Metal or Vulkan, where a multisampled texture with `TEXTURE_BINDING` is legal, so the 3D canvas crashed on every browser without WebGPU and no gate saw it (found by hand 2026-11-11). `scene3d::render::integration_tests::every_multisampled_target_is_only_a_render_attachment` now pins that one rule; other WebGL2 limits (formats, features, limits of `downlevel_webgl2_defaults`) have no check. Fix: a browser check that loads a 3D and a 2D canvas page with `navigator.gpu` removed and asserts a painted frame, in the release gates. orbital-canvas, orbital-integration-tests. Reproduce: serve any 3D canvas behavior, open it with `Navigator.prototype.gpu` redefined to `undefined` before load. Prevention rung: (3) the verifiers.
+  Severity: medium. Root cause: one-off.
 
 - **G-ORBITAL-GAME-RENDERER-011** [owner-decision] — `camera.zoom` on a `follow`/`chase` camera: three's GameCamera3D ignores it (fixed offsets [0,12,14] / [0,4,-7]), and the racing and toy-track boards set it, so giving it a meaning (dolly the offset) changed how those boards look (P-025 parity run, 2026-11-06). orbital-canvas keeps three's fixed offsets for now; decide whether zoom should dolly a following camera, then retune the boards' `scale`. Rung: (1) the pattern's declared meaning. Severity: low. Root cause: one-off.
 

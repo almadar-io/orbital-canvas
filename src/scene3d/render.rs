@@ -436,7 +436,7 @@ impl Renderer3D {
             compare: Some(wgpu::CompareFunction::LessEqual),
             ..Default::default()
         });
-        let placeholder_shadow = depth_texture(&device, 1, 1, 1, "scene3d no shadow");
+        let placeholder_shadow = depth_texture(&device, 1, 1, 1, true, "scene3d no shadow");
         let white = upload_rgba(&device, &queue, 1, 1, 1, &[255, 255, 255, 255]);
         let white_map = map_bind_group(&device, &map_layout, &white, &color_sampler);
         let mips = MipmapGenerator::new(device.clone());
@@ -717,7 +717,7 @@ impl Renderer3D {
                 })
                 .create_view(&Default::default())
         });
-        let depth = depth_texture(&self.device, width, height, samples, "scene3d depth");
+        let depth = depth_texture(&self.device, width, height, samples, false, "scene3d depth");
         self.targets = Some(Targets {
             width,
             height,
@@ -732,7 +732,7 @@ impl Renderer3D {
         if self.shadow_map.as_ref().map(|(s, _)| *s) != Some(size) {
             self.shadow_map = Some((
                 size,
-                depth_texture(&self.device, size, size, 1, "scene3d shadow map"),
+                depth_texture(&self.device, size, size, 1, true, "scene3d shadow map"),
             ));
         }
         self.shadow_map
@@ -1488,13 +1488,21 @@ fn centroid(mesh: &MeshData) -> Vec3 {
     sum / mesh.positions.len() as f32
 }
 
+/// `sampled` is for a depth texture a shader reads (the shadow map); the frame's own depth target is only an attachment,
+/// which a WebGL2 device can make at any sample count (it has no multisampled textures).
 fn depth_texture(
     device: &wgpu::Device,
     width: u32,
     height: u32,
     samples: u32,
+    sampled: bool,
     label: &str,
 ) -> wgpu::TextureView {
+    let usage = if sampled {
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+    } else {
+        wgpu::TextureUsages::RENDER_ATTACHMENT
+    };
     device
         .create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
@@ -1507,7 +1515,7 @@ fn depth_texture(
             sample_count: samples,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage,
             view_formats: &[],
         })
         .create_view(&Default::default())
@@ -2022,5 +2030,43 @@ mod integration_tests {
             n < 10 || n > 245,
             "control: nearest sampling picks one texel: {n}"
         );
+    }
+
+    // WebGL2 has multisampled renderbuffers and no multisampled textures, and the GL backend makes a renderbuffer only
+    // of a multisampled texture whose one usage is RENDER_ATTACHMENT; any other usage aborts the browser's fallback.
+    #[test]
+    fn every_multisampled_target_is_only_a_render_attachment() {
+        let Some(mut r) = renderer() else { return };
+        let sphere = instance(
+            geometry::sphere(2.0, 16, 8).unwrap(),
+            Mat4::IDENTITY,
+            Material::default(),
+        );
+        draw(&mut r, &scene(vec![sphere]));
+        let targets = r.targets.as_ref().expect("the frame made its targets");
+        assert_eq!(targets.samples, 4);
+        let color = targets
+            .color
+            .as_ref()
+            .expect("the multisampled color target");
+        for (name, view) in [("color", color), ("depth", &targets.depth)] {
+            assert_eq!(view.texture().sample_count(), 4, "{name}");
+            assert_eq!(
+                view.texture().usage(),
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn control_the_shadow_map_is_a_single_sample_texture_the_shader_reads() {
+        let Some(mut r) = renderer() else { return };
+        let view = r.shadow_view(256);
+        assert_eq!(view.texture().sample_count(), 1);
+        assert!(view
+            .texture()
+            .usage()
+            .contains(wgpu::TextureUsages::TEXTURE_BINDING));
     }
 }
