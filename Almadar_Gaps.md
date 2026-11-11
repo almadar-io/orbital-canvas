@@ -7,7 +7,10 @@ Every open gap this repo owns lives here. This file is the source of truth; the 
 - **Codes:** new gaps use this repo's prefix `G-ORBITAL-GAME-RENDERER-`. Take the "Next code" below, then bump it in the same edit. Codes are never reused or renamed.
 - **Close by deleting.** Remove the entry in the same commit as the fix.
 
-Next code: `G-ORBITAL-GAME-RENDERER-016`
+Next code: `G-ORBITAL-GAME-RENDERER-017`
+
+- **G-ORBITAL-GAME-RENDERER-016** [mechanical] — `cargo clippy -p orbital-canvas --tests` does not pass: three test fixtures write a literal clippy reads as an approximate constant and denies (`approx_constant`): `"rotate": 1.5707963267948966` in `mappers/game_canvas_2d.rs:2244` and `renderer.rs:2119`, `"value": 3.14159` in `mappers/learning/physics_canvas.rs:1167`. The crate's test target therefore fails the check AGENTS.md names as done, whatever a change touched (seen 2026-11-11 at a checkpoint run; 41 warnings beside them). Fix: write the fixtures from `std::f64::consts` (or a value that is no constant), then clear the warnings. orbital-canvas. Reproduce: `cargo clippy -p orbital-canvas --tests`. Prevention rung: (3) the release check runs clippy per crate.
+  Severity: medium. Root cause: one-off.
 
 - **G-ORBITAL-GAME-RENDERER-014** [architectural] — A panic inside the browser renderer takes the whole page down. The kernel and every canvas share one wasm module, so after a renderer panic each later call into it throws `recursive use of an object detected which would lead to unsafe aliasing in rust` and the client replaces the page with that error text. Seen 2026-11-11 with WebGPU hidden on a `canvas mode:"3d"` page: glow panicked at `web_sys.rs:4223` (`Tex storage 2D multisample is not supported`, the multisampled depth target, fixed the same day in `scene3d/render.rs` `depth_texture`) and the page showed nothing but the error. The trigger is fixed; the class is not: any renderer panic still ends the app, not the canvas. Fix: the canvas boundary in orbital-wasm catches a renderer failure and reports it as that canvas's scene error (the path `take_scene3d_error` already feeds), leaving the kernel usable. orbital-canvas, orbital-wasm. Reproduce: make any `scene3d` path panic in the browser build. Prevention rung: (3) the verifiers (a page whose canvas fails must still paint its other content).
   Severity: high. Root cause: one-off.

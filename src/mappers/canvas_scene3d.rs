@@ -559,7 +559,7 @@ fn check_canvas_keys(fields: &Fields) -> Result<(), CanvasSceneError> {
             | "pixelsPerUnit" | "showGrid" | "shadows" | "lighting" | "post" => {}
             // Interaction and DOM-wrapper props: they change no pixel of the scene.
             "tileClickEvent" | "unitClickEvent" | "tileHoverEvent" | "tileLeaveEvent"
-            | "featureClickEvent" | "keyMap" | "keyUpMap" | "selectedId" | "onSelect"
+            | "featureClickEvent" | "keyMap" | "keyUpMap" | "gestureMap" | "selectedId" | "onSelect"
             | "onMove" | "selectEvent" | "moveEvent" | "className" | "enter" | "enterDelay"
             | "skeleton" | "aria-label" | "aria-labelledby" | "aria-describedby" | "aria-live"
             | "aria-current" | "aria-pressed" | "aria-expanded" | "aria-selected"
@@ -3767,6 +3767,18 @@ mod tests {
             "{ignored}"
         );
         assert!(scene(json!({"keyMap": {"KeyW": "UP"}, "tileClickEvent": "TILE", "camera": {"controls": false}})).is_ok());
+    }
+
+    #[test]
+    fn a_gesture_map_is_an_input_prop_and_changes_no_scene() {
+        let plain = scene(json!({"camera": {"controls": false}})).expect("a scene");
+        let mapped = scene(json!({"gestureMap": {"WheelDown": "NEXT", "SwipeLeft": "NEXT"}, "camera": {"controls": false}})).expect("a scene with a gesture map");
+        assert_eq!(format!("{plain:?}"), format!("{mapped:?}"));
+    }
+
+    #[test]
+    fn control_an_undeclared_prop_is_still_refused_by_name() {
+        assert!(message(scene(json!({"gestureMaps": {"WheelDown": "NEXT"}}))).starts_with("canvas.gestureMaps"));
     }
 
     fn pulsing_box(animation: Value) -> Value {
