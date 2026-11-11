@@ -38,6 +38,7 @@ fn scene(meshes: Vec<MeshInstance>, lights: Lights, shadows: bool) -> Scene3D {
         animated: false,
         environment: None,
         post: None,
+        time: 0.0,
     }
 }
 

@@ -22,6 +22,8 @@ struct Frame {
   // the camera's world-space right and up axes, for billboards
   camera_right: vec4<f32>,
   camera_up: vec4<f32>,
+  // x: seconds on the canvas clock
+  clock: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;

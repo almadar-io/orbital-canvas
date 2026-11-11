@@ -748,6 +748,7 @@ mod tests {
             animated: false,
             environment: None,
             post: None,
+            time: 0.0,
         }
     }
 

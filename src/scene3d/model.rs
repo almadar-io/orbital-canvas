@@ -26,6 +26,9 @@ pub struct Scene3D {
     /// The post-processing stack (`post`): bloom and vignette as @react-three/postprocessing draws them.
     #[serde(default)]
     pub post: Option<PostSettings>,
+    /// Seconds on the canvas clock; a shader material reads it as `px.time`.
+    #[serde(default)]
+    pub time: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -221,6 +224,29 @@ pub enum MaterialKind {
     Physical,
     Toon,
     Flat(Flat),
+    /// The surface is coloured by the program's own WGSL ([`Material::shader`]).
+    Shader,
+}
+
+/// How a shader material's colour meets what is behind it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShaderBlend {
+    #[default]
+    Opaque,
+    Alpha,
+    Additive,
+}
+
+/// A surface coloured by a program's own WGSL (`material.kind: "shader"`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SurfaceShader {
+    /// WGSL that declares `fn shade(px: Pixel) -> vec4<f32>`: the pixel's linear colour and alpha.
+    pub wgsl: String,
+    /// `material.uniforms.a` and `.b`, read as `px.a` and `px.b`.
+    pub a: [f32; 4],
+    pub b: [f32; 4],
+    pub blend: ShaderBlend,
 }
 
 /// An unlit, always-blended surface as three draws its 2D drawables in a 3D scene (`MeshBasicMaterial` with
@@ -264,6 +290,9 @@ pub struct Material {
     pub side: Side,
     /// An image the renderer resolves like a sprite texture; sampled with repeat wrapping.
     pub map: Option<String>,
+    /// The WGSL of a [`MaterialKind::Shader`] surface.
+    #[serde(default)]
+    pub shader: Option<SurfaceShader>,
 }
 
 impl Default for Material {
@@ -281,13 +310,19 @@ impl Default for Material {
             flat_shading: false,
             side: Side::Front,
             map: None,
+            shader: None,
         }
     }
 }
 
 impl Material {
     pub fn is_transparent(&self) -> bool {
-        self.opacity < 1.0 || matches!(self.kind, MaterialKind::Flat(_))
+        self.opacity < 1.0
+            || matches!(self.kind, MaterialKind::Flat(_))
+            || self
+                .shader
+                .as_ref()
+                .is_some_and(|s| s.blend != ShaderBlend::Opaque)
     }
 }
 

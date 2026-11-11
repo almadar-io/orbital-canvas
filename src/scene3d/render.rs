@@ -3,7 +3,9 @@
 
 use super::environment::{self, Environment};
 use super::mipmap::{mip_level_count, MipmapError, MipmapGenerator};
-use super::model::{EnvironmentKind, Flat, MaterialKind, MeshData, Projection, Scene3D, Side};
+use super::model::{
+    EnvironmentKind, Flat, MaterialKind, MeshData, Projection, Scene3D, ShaderBlend, Side,
+};
 use super::post::{self, PostStack};
 use super::transmission::{self, Transmission};
 use glam::{Mat4, Vec3};
@@ -32,6 +34,7 @@ struct FrameUniform {
     options: [f32; 4],
     camera_right: [f32; 4],
     camera_up: [f32; 4],
+    clock: [f32; 4],
 }
 
 #[repr(C)]
@@ -45,6 +48,8 @@ struct ObjectUniform {
     physical: [f32; 4],
     quad: [f32; 4],
     uv_rect: [f32; 4],
+    custom_a: [f32; 4],
+    custom_b: [f32; 4],
 }
 
 #[repr(C)]
@@ -87,6 +92,8 @@ struct PipelineKey {
     side: Side,
     transparent: bool,
     additive: bool,
+    /// A shader material's module, by the hash of its WGSL; the lit module without one.
+    surface: Option<u64>,
 }
 
 /// three's `WebGLRenderList` lists, in drawing order.
@@ -110,6 +117,7 @@ struct Draw {
     cast_shadow: bool,
     /// Draws its glow tile: a quad sampling the glow atlas.
     glow: bool,
+    surface: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -146,6 +154,8 @@ pub struct Renderer3D {
     lit_layout: wgpu::PipelineLayout,
     shadow_pipeline: wgpu::RenderPipeline,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
+    /// One module per shader material's WGSL, keyed by its hash.
+    surfaces: HashMap<u64, wgpu::ShaderModule>,
     grid_shader: wgpu::ShaderModule,
     grid_layout: wgpu::BindGroupLayout,
     grid_pipeline_layout: wgpu::PipelineLayout,
@@ -240,6 +250,47 @@ pub(super) fn lit_source() -> String {
         transmission::WGSL,
     ]
     .concat()
+}
+
+/// A shader material's whole module: the lit source (its vertex stage and bindings), the fragment stage that calls
+/// `shade`, and the program's WGSL that declares it.
+pub(crate) fn surface_source(wgsl: &str) -> String {
+    [lit_source().as_str(), include_str!("surface.wgsl"), wgsl].concat()
+}
+
+fn surface_key(wgsl: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    wgsl.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Whether a shader material's WGSL makes a valid module: the mapper refuses a scene whose shader does not, so the
+/// device never sees it. Answers are kept by the WGSL's hash, since a canvas maps its scene every frame.
+pub(crate) fn check_surface(wgsl: &str) -> Result<(), String> {
+    use std::sync::{Mutex, OnceLock};
+    static CHECKED: OnceLock<Mutex<HashMap<u64, Result<(), String>>>> = OnceLock::new();
+    let key = surface_key(wgsl);
+    let checked = CHECKED.get_or_init(Default::default);
+    if let Some(known) = checked.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return known.clone();
+    }
+    let source = surface_source(wgsl);
+    let answer = wgpu::naga::front::wgsl::parse_str(&source)
+        .map_err(|e| e.emit_to_string(&source))
+        .and_then(|module| {
+            wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::empty(),
+            )
+            .validate(&module)
+            .map(|_| ())
+            .map_err(|e| e.emit_to_string(&source))
+        });
+    checked
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key, answer.clone());
+    answer
 }
 
 /// The camera's view-projection for an `aspect` (width over height).
@@ -454,6 +505,7 @@ impl Renderer3D {
             lit_layout,
             shadow_pipeline,
             pipelines: HashMap::new(),
+            surfaces: HashMap::new(),
             grid_shader,
             grid_layout,
             grid_pipeline_layout,
@@ -487,8 +539,25 @@ impl Renderer3D {
         self.meshes.len()
     }
 
+    /// The module of a shader material's WGSL, made on first use.
+    fn surface(&mut self, wgsl: &str) -> u64 {
+        let key = surface_key(wgsl);
+        let device = &self.device;
+        self.surfaces.entry(key).or_insert_with(|| {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("scene3d shader material"),
+                source: wgpu::ShaderSource::Wgsl(surface_source(wgsl).into()),
+            })
+        });
+        key
+    }
+
     fn pipeline(&mut self, key: PipelineKey) -> &wgpu::RenderPipeline {
-        let (device, shader, layout) = (&self.device, &self.shader, &self.lit_layout);
+        let (device, layout) = (&self.device, &self.lit_layout);
+        let (shader, fragment_entry) = match key.surface {
+            Some(surface) => (&self.surfaces[&surface], "fs_surface"),
+            None => (&self.shader, "fs_main"),
+        };
         self.pipelines.entry(key).or_insert_with(|| {
             let cull_mode = match key.side {
                 Side::Front => Some(wgpu::Face::Back),
@@ -506,7 +575,7 @@ impl Renderer3D {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(fragment_entry),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: key.format,
                         blend: match (key.transparent, key.additive) {
@@ -918,6 +987,7 @@ impl Renderer3D {
             ],
             camera_right: [right.x, right.y, right.z, 0.0],
             camera_up: [up.x, up.y, up.z, 0.0],
+            clock: [scene.time, 0.0, 0.0, 0.0],
         };
         if let Some(light) = scene.lights.directional {
             let to_light =
@@ -1041,6 +1111,16 @@ impl Renderer3D {
                 MaterialKind::Physical => 2.0,
                 MaterialKind::Toon => 3.0,
                 MaterialKind::Flat(_) => 4.0,
+                MaterialKind::Shader => 5.0,
+            };
+            let surface = match (m.kind, &m.shader) {
+                (MaterialKind::Shader, Some(shader)) => Some(shader),
+                (MaterialKind::Shader, None) => {
+                    return Err(Render3DError::Invalid(format!(
+                        "mesh {i}: a shader material without its WGSL"
+                    )))
+                }
+                _ => None,
             };
             let uniform = ObjectUniform {
                 model: model.to_cols_array_2d(),
@@ -1052,6 +1132,8 @@ impl Renderer3D {
                 physical: [m.transmission, m.ior, 0.0, 0.0],
                 quad: glow_tile.map_or([0.0, 0.0, 1.0, 1.0], |(rect, _)| rect),
                 uv_rect: glow_tile.map_or([0.0, 0.0, 1.0, 1.0], |(_, uv)| uv),
+                custom_a: surface.map_or([0.0; 4], |s| s.a),
+                custom_b: surface.map_or([0.0; 4], |s| s.b),
             };
             let offset = i * OBJECT_STRIDE as usize;
             objects[offset..offset + std::mem::size_of::<ObjectUniform>()]
@@ -1078,11 +1160,13 @@ impl Renderer3D {
                 depth: view_proj.project_point3(center).z,
                 list,
                 transparent: m.is_transparent(),
-                additive: flat.additive,
+                additive: flat.additive
+                    || surface.is_some_and(|s| s.blend == ShaderBlend::Additive),
                 side: m.side,
                 map: m.map.clone().map(|url| (url, flat.nearest)),
                 cast_shadow: instance.cast_shadow && glow_tile.is_none(),
                 glow: glow_tile.is_some(),
+                surface: surface.map(|s| self.surface(&s.wgsl)),
             });
         }
         // a glow sorts with the shape the mapper emits right after it, and draws first: the sort is stable
@@ -1451,6 +1535,7 @@ fn pipeline_key(draw: &Draw, format: wgpu::TextureFormat, samples: u32, side: Si
         side,
         transparent: draw.transparent,
         additive: draw.additive,
+        surface: draw.surface,
     }
 }
 
@@ -1623,6 +1708,7 @@ mod integration_tests {
             animated: false,
             environment: None,
             post: None,
+            time: 0.0,
         }
     }
 
@@ -2034,6 +2120,105 @@ mod integration_tests {
 
     // WebGL2 has multisampled renderbuffers and no multisampled textures, and the GL backend makes a renderbuffer only
     // of a multisampled texture whose one usage is RENDER_ATTACHMENT; any other usage aborts the browser's fallback.
+    fn shaded(wgsl: &str, a: [f32; 4], blend: ShaderBlend) -> Material {
+        Material {
+            kind: MaterialKind::Shader,
+            side: Side::Double,
+            shader: Some(SurfaceShader {
+                wgsl: wgsl.to_owned(),
+                a,
+                b: [0.0; 4],
+                blend,
+            }),
+            ..Material::default()
+        }
+    }
+
+    const PAINT_A: &str = "fn shade(px: Pixel) -> vec4<f32> { return vec4<f32>(px.a.rgb, px.a.a); }";
+
+    #[test]
+    fn a_shader_material_colours_its_surface_with_the_programs_wgsl() {
+        let Some(mut r) = renderer() else { return };
+        let red = shaded(PAINT_A, [1.0, 0.0, 0.0, 1.0], ShaderBlend::Opaque);
+        let plane = instance(geometry::plane(2.0, 2.0).unwrap(), Mat4::IDENTITY, red);
+        let rgba = draw(&mut r, &scene(vec![plane]));
+        assert_eq!(pixel(&rgba, SIZE / 2, SIZE / 2), [255, 0, 0, 255]);
+        assert_eq!(pixel(&rgba, 2, 2), [0, 0, 0, 255], "control: nothing outside the plane");
+    }
+
+    #[test]
+    fn two_shader_materials_each_run_their_own_wgsl() {
+        let Some(mut r) = renderer() else { return };
+        let left = instance(
+            geometry::plane(1.0, 1.0).unwrap(),
+            Mat4::from_translation(glam::Vec3::new(-1.0, 0.0, 0.0)),
+            shaded(PAINT_A, [0.0, 1.0, 0.0, 1.0], ShaderBlend::Opaque),
+        );
+        let right = instance(
+            geometry::plane(1.0, 1.0).unwrap(),
+            Mat4::from_translation(glam::Vec3::new(1.0, 0.0, 0.0)),
+            shaded(
+                "fn shade(px: Pixel) -> vec4<f32> { return vec4<f32>(0.0, 0.0, 1.0, 1.0); }",
+                [0.0; 4],
+                ShaderBlend::Opaque,
+            ),
+        );
+        let rgba = draw(&mut r, &scene(vec![left, right]));
+        // a unit of the scene is about 9.7 pixels here
+        assert_eq!(pixel(&rgba, SIZE / 2 - 10, SIZE / 2), [0, 255, 0, 255]);
+        assert_eq!(pixel(&rgba, SIZE / 2 + 10, SIZE / 2), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn a_shader_material_reads_the_canvas_clock_and_its_place_on_the_mesh() {
+        let Some(mut r) = renderer() else { return };
+        let wgsl = "fn shade(px: Pixel) -> vec4<f32> { return vec4<f32>(px.time, step(0.0, px.local.x), 0.0, 1.0); }";
+        let plane = instance(
+            geometry::plane(2.0, 2.0).unwrap(),
+            Mat4::IDENTITY,
+            shaded(wgsl, [0.0; 4], ShaderBlend::Opaque),
+        );
+        let at = |time: f32| Scene3D {
+            time,
+            ..scene(vec![plane.clone()])
+        };
+        let start = draw(&mut r, &at(0.0));
+        let later = draw(&mut r, &at(1.0));
+        assert_eq!(pixel(&start, SIZE / 2 + 5, SIZE / 2), [0, 255, 0, 255]);
+        assert_eq!(pixel(&later, SIZE / 2 + 5, SIZE / 2), [255, 255, 0, 255]);
+        assert_eq!(pixel(&later, SIZE / 2 - 5, SIZE / 2), [255, 0, 0, 255], "the mesh's left half");
+    }
+
+    #[test]
+    fn an_additive_shader_material_adds_to_what_is_behind_it() {
+        let Some(mut r) = renderer() else { return };
+        let behind = instance(
+            geometry::plane(2.0, 2.0).unwrap(),
+            Mat4::from_translation(glam::Vec3::new(0.0, 0.0, -1.0)),
+            shaded(PAINT_A, [1.0, 0.0, 0.0, 1.0], ShaderBlend::Opaque),
+        );
+        let glow = |blend| {
+            instance(
+                geometry::plane(2.0, 2.0).unwrap(),
+                Mat4::IDENTITY,
+                shaded(PAINT_A, [0.0, 0.0, 1.0, 1.0], blend),
+            )
+        };
+        let added = draw(&mut r, &scene(vec![behind.clone(), glow(ShaderBlend::Additive)]));
+        let over = draw(&mut r, &scene(vec![behind, glow(ShaderBlend::Opaque)]));
+        assert_eq!(pixel(&added, SIZE / 2, SIZE / 2), [255, 0, 255, 255]);
+        assert_eq!(pixel(&over, SIZE / 2, SIZE / 2), [0, 0, 255, 255], "control: opaque covers");
+    }
+
+    #[test]
+    fn a_shader_that_does_not_declare_shade_is_refused_before_the_device_sees_it() {
+        assert!(super::check_surface(PAINT_A).is_ok());
+        let wrong = super::check_surface("fn tint(px: Pixel) -> vec4<f32> { return px.a; }");
+        assert!(wrong.is_err_and(|e| e.contains("shade")));
+        let mistyped = super::check_surface("fn shade(px: Pixel) -> vec4<f32> { return px.time; }");
+        assert!(mistyped.is_err());
+    }
+
     #[test]
     fn every_multisampled_target_is_only_a_render_attachment() {
         let Some(mut r) = renderer() else { return };

@@ -12,6 +12,9 @@ struct Object {
   // with FLAG_QUAD, the unit quad's local rect (min x, min y, width, height) and the map rect its UVs span
   quad: vec4<f32>,
   uv_rect: vec4<f32>,
+  // a shader material's two parameter vectors
+  custom_a: vec4<f32>,
+  custom_b: vec4<f32>,
 };
 
 const FLAG_FLAT: u32 = 1u;
@@ -40,6 +43,7 @@ struct VertexOut {
   @location(1) normal: vec3<f32>,
   @location(2) uv: vec2<f32>,
   @location(3) shadow_coord: vec4<f32>,
+  @location(4) local: vec3<f32>,
 };
 
 // drei's Billboard: the camera's rotation with the object's own origin and scale
@@ -69,9 +73,11 @@ fn local_position(position: vec3<f32>) -> vec3<f32> {
 
 @vertex
 fn vs_main(in: VertexIn) -> VertexOut {
-  let world = world_position(local_position(in.position));
+  let local = local_position(in.position);
+  let world = world_position(local);
   let normal = world_normal(in.normal);
   var out: VertexOut;
+  out.local = local;
   out.clip = frame.view_proj * world;
   out.world = world.xyz;
   out.normal = normal;

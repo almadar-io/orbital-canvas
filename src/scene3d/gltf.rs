@@ -939,6 +939,7 @@ fn read_material(
             Side::Front
         },
         map,
+        shader: None,
     })
 }
 

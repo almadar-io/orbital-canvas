@@ -19,7 +19,7 @@ use crate::scene3d::label::{label, LabelStyle};
 use crate::scene3d::model::{
     srgb_to_linear, srgb_to_linear_rgb, AmbientLight, Camera, DirectionalLight, Flat, Grid,
     HemisphereLight, Lights, Material, MaterialKind, MeshData, MeshInstance, PointLight,
-    Projection, Scene3D, ShadowSettings, Side, ToneMapping,
+    Projection, Scene3D, ShaderBlend, ShadowSettings, Side, SurfaceShader, ToneMapping,
 };
 use crate::scene3d::model::{CellId, Interaction};
 use crate::scene3d::skin;
@@ -388,6 +388,12 @@ fn compose_with(
             )?);
         }
     }
+    // only a shader material reads the clock: a scene without one is the same scene at every instant
+    let time = if meshes.iter().any(|m| m.material.shader.is_some()) {
+        elapsed_ms.map_or(0.0, |ms| (ms / 1000.0) as f32)
+    } else {
+        0.0
+    };
     Ok(Scene3D {
         camera,
         background,
@@ -400,6 +406,7 @@ fn compose_with(
         animated: walk.animated,
         environment,
         post,
+        time,
     })
 }
 
@@ -1053,6 +1060,9 @@ const MATERIAL_KEYS: &[&str] = &[
     "flatShading",
     "side",
     "map",
+    "wgsl",
+    "uniforms",
+    "blend",
 ];
 
 impl Walk<'_> {
@@ -1385,6 +1395,8 @@ impl Walk<'_> {
             opacity,
             self.theme,
         )?;
+        // a shader material may read the canvas clock, so the host keeps drawing
+        self.animated |= material.shader.is_some();
         if let Some((declared, _)) = &animated {
             let anim_path = join(path, "animation");
             animated_colors(declared, &anim_path)?;
@@ -1564,6 +1576,7 @@ impl Walk<'_> {
             opacity,
             self.theme,
         )?;
+        self.animated |= material.shader.is_some();
         let transform = parent * DMat4::from_translation(world);
         let outline = outline(f, path, self.theme)?;
         self.meshes.push(MeshInstance {
@@ -3127,10 +3140,11 @@ fn material(
         Some("physical") => MaterialKind::Physical,
         Some("toon") => MaterialKind::Toon,
         Some("basic") => MaterialKind::Basic,
+        Some("shader") => MaterialKind::Shader,
         Some(_) => {
             return Err(bad(
                 &join(path, "kind"),
-                "must be standard, physical, toon or basic",
+                "must be standard, physical, toon, basic or shader",
             ))
         }
     };
@@ -3157,7 +3171,31 @@ fn material(
             "roughness",
             "flatShading",
         ],
-        MaterialKind::Physical | MaterialKind::Flat(_) => MATERIAL_KEYS,
+        MaterialKind::Shader => &[
+            "kind",
+            "color",
+            "opacity",
+            "side",
+            "emissive",
+            "emissiveIntensity",
+            "wgsl",
+            "uniforms",
+            "blend",
+        ],
+        MaterialKind::Physical | MaterialKind::Flat(_) => &[
+            "kind",
+            "color",
+            "metalness",
+            "roughness",
+            "emissive",
+            "emissiveIntensity",
+            "opacity",
+            "transmission",
+            "ior",
+            "flatShading",
+            "side",
+            "map",
+        ],
     };
     for (key, value) in m {
         if !value.is_null() && !drawn.contains(&key.as_str()) {
@@ -3194,6 +3232,51 @@ fn material(
         }
         Some(url) => Some(url.to_owned()),
     };
+    let shader = if matches!(kind, MaterialKind::Shader) {
+        let wgsl = match opt_str(m, "wgsl", path)? {
+            Some(code) if !code.trim().is_empty() => code,
+            _ => {
+                return Err(bad(
+                    &join(path, "wgsl"),
+                    "a shader material needs its WGSL, declaring `fn shade(px: Pixel) -> vec4<f32>`",
+                ))
+            }
+        };
+        crate::scene3d::render::check_surface(wgsl).map_err(|e| bad(&join(path, "wgsl"), e))?;
+        let uniforms = opt_object(m, "uniforms", path)?;
+        let uniforms_path = join(path, "uniforms");
+        if let Some(u) = uniforms {
+            check_keys(u, &["a", "b"], &uniforms_path)?;
+        }
+        let vector = |key: &str| -> Result<[f32; 4], CanvasSceneError> {
+            let Some(value) = uniforms.and_then(|u| present(u, key)) else {
+                return Ok([0.0; 4]);
+            };
+            let field = join(&uniforms_path, key);
+            let numbers: Option<Vec<f32>> = value
+                .as_array()
+                .map(|list| list.iter().map(|n| n.as_f64().map(|n| n as f32)).collect())
+                .unwrap_or(None);
+            match numbers.as_deref() {
+                Some(&[x, y, z, w]) => Ok([x, y, z, w]),
+                _ => Err(bad(&field, "must be four numbers")),
+            }
+        };
+        let blend = match opt_str(m, "blend", path)? {
+            None | Some("opaque") => ShaderBlend::Opaque,
+            Some("alpha") => ShaderBlend::Alpha,
+            Some("additive") => ShaderBlend::Additive,
+            Some(_) => return Err(bad(&join(path, "blend"), "must be opaque, alpha or additive")),
+        };
+        Some(SurfaceShader {
+            wgsl: wgsl.to_owned(),
+            a: vector("a")?,
+            b: vector("b")?,
+            blend,
+        })
+    } else {
+        None
+    };
     let pbr = matches!(kind, MaterialKind::Standard | MaterialKind::Physical);
     let defaults = Material::default();
     Ok(Material {
@@ -3217,6 +3300,7 @@ fn material(
         flat_shading: pbr && opt_bool(m, "flatShading", path)?.unwrap_or(theme.flat),
         side,
         map,
+        shader,
     })
 }
 
@@ -3241,6 +3325,7 @@ fn kind_name(kind: MaterialKind) -> &'static str {
         MaterialKind::Physical => "physical",
         MaterialKind::Toon => "toon",
         MaterialKind::Flat(_) => "flat",
+        MaterialKind::Shader => "shader",
     }
 }
 
@@ -3701,6 +3786,7 @@ mod tests {
                 flat_shading: true,
                 side: Side::Double,
                 map: Some("textures/rock.png".into()),
+                shader: None,
             }
         );
         assert!(!mesh.cast_shadow);
@@ -3767,6 +3853,59 @@ mod tests {
             "{ignored}"
         );
         assert!(scene(json!({"keyMap": {"KeyW": "UP"}, "tileClickEvent": "TILE", "camera": {"controls": false}})).is_ok());
+    }
+
+    fn shader_mesh(material: Value) -> Value {
+        json!({"drawables": [{"type": "draw-mesh", "shape": "plane", "position": {"x": 0, "y": 0}, "material": material}]})
+    }
+
+    const SHADE: &str = "fn shade(px: Pixel) -> vec4<f32> { return vec4<f32>(px.a.rgb, 1.0); }";
+
+    #[test]
+    fn a_shader_material_carries_its_wgsl_its_two_vectors_and_its_blend() {
+        let mapped = scene(shader_mesh(json!({
+            "kind": "shader", "wgsl": SHADE, "blend": "additive",
+            "uniforms": {"a": [1, 0.5, 0, 2], "b": [0, 0, 0, 9]}
+        })))
+        .expect("a shader material");
+        let material = &mapped.meshes[0].material;
+        assert_eq!(material.kind, MaterialKind::Shader);
+        assert_eq!(
+            material.shader,
+            Some(SurfaceShader {
+                wgsl: SHADE.to_owned(),
+                a: [1.0, 0.5, 0.0, 2.0],
+                b: [0.0, 0.0, 0.0, 9.0],
+                blend: ShaderBlend::Additive,
+            })
+        );
+        assert!(mapped.animated, "a shader may read the clock, so the canvas keeps drawing");
+    }
+
+    #[test]
+    fn a_shader_material_reads_the_canvas_clock_in_seconds() {
+        let at = scene_at(shader_mesh(json!({"kind": "shader", "wgsl": SHADE})), 2500.0).expect("a scene");
+        assert_eq!(at.time, 2.5);
+        let plain = scene_at(shader_mesh(json!({"kind": "standard"})), 2500.0).expect("a scene");
+        assert_eq!(plain.time, 0.0, "control: without a shader the scene does not carry the clock");
+    }
+
+    #[test]
+    fn a_shader_material_is_refused_without_wgsl_with_wgsl_that_does_not_check_or_with_a_bad_vector() {
+        assert!(message(scene(shader_mesh(json!({"kind": "shader"})))).starts_with("drawables[0].material.wgsl: "));
+        assert!(message(scene(shader_mesh(json!({"kind": "shader", "wgsl": "fn shade(px: Pixel) -> vec4<f32> { return 1.0; }"}))))
+            .starts_with("drawables[0].material.wgsl: "));
+        assert!(message(scene(shader_mesh(json!({"kind": "shader", "wgsl": SHADE, "uniforms": {"a": [1, 2, 3]}}))))
+            .starts_with("drawables[0].material.uniforms.a: "));
+        assert!(message(scene(shader_mesh(json!({"kind": "shader", "wgsl": SHADE, "blend": "screen"}))))
+            .starts_with("drawables[0].material.blend: "));
+    }
+
+    #[test]
+    fn control_another_material_kind_does_not_take_wgsl() {
+        assert!(message(scene(shader_mesh(json!({"kind": "standard", "wgsl": SHADE}))))
+            .starts_with("drawables[0].material.wgsl: "));
+        assert!(!scene(shader_mesh(json!({"kind": "standard"}))).expect("a scene").animated);
     }
 
     #[test]
