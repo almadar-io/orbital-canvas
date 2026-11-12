@@ -280,6 +280,9 @@ pub struct SdfMaterial {
     /// The material reads `Pixel.time`: the host asks for a frame every tick.
     #[serde(default)]
     pub live: bool,
+    /// Seconds from `material.anchor` to this frame's epoch, read as `Pixel.since`; 0 without an anchor or an epoch.
+    #[serde(default)]
+    pub since: f32,
 }
 
 /// One path operation. Angles are radians in screen convention (0 = +x,

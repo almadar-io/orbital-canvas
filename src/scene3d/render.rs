@@ -1129,7 +1129,7 @@ impl Renderer3D {
                 emissive: color3(m.emissive, m.emissive_intensity, 0.0),
                 params: [m.metalness, m.roughness, kind, flags as f32],
                 // three's default thickness, 0
-                physical: [m.transmission, m.ior, 0.0, 0.0],
+                physical: [m.transmission, m.ior, 0.0, surface.map_or(0.0, |s| s.since)],
                 quad: glow_tile.map_or([0.0, 0.0, 1.0, 1.0], |(rect, _)| rect),
                 uv_rect: glow_tile.map_or([0.0, 0.0, 1.0, 1.0], |(_, uv)| uv),
                 custom_a: surface.map_or([0.0; 4], |s| s.a),
@@ -2128,6 +2128,7 @@ mod integration_tests {
                 wgsl: wgsl.to_owned(),
                 a,
                 b: [0.0; 4],
+                since: 0.0,
                 blend,
             }),
             ..Material::default()

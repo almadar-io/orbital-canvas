@@ -7,7 +7,7 @@ struct Object {
   emissive: vec4<f32>,
   // x: metalness, y: roughness, z: kind (0 basic, 1 standard, 2 physical, 3 toon, 4 flat), w: flags
   params: vec4<f32>,
-  // x: transmission, y: ior, z: thickness
+  // x: transmission, y: ior, z: thickness, w: a shader material's `since` (seconds from its anchor)
   physical: vec4<f32>,
   // with FLAG_QUAD, the unit quad's local rect (min x, min y, width, height) and the map rect its UVs span
   quad: vec4<f32>,

@@ -118,6 +118,25 @@ pub struct PointerRegion {
     pub events: PointerEvents,
 }
 
+/// One node of a canvas's semantic tree: a drawable with `semantic` and `id`, at its pointer region
+/// (or its painted bounds when it has no `hit`), in packet units.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticNode {
+    pub id: String,
+    pub role: String,
+    pub name: String,
+    pub value: Option<String>,
+    pub checked: Option<bool>,
+    pub disabled: bool,
+    pub focused: bool,
+    pub caret: Option<usize>,
+    pub selection_start: Option<usize>,
+    pub selection_end: Option<usize>,
+    pub multiline: bool,
+    pub order: f32,
+    pub rect: Rect,
+}
+
 /// The size of a `draw-text` with `measure: true`, in packet units.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Measured {
@@ -142,6 +161,8 @@ pub struct MappedScene {
     pub pointer_regions: Vec<PointerRegion>,
     /// Every `draw-text` with `measure: true` and an `id`, in paint order.
     pub measured: Vec<Measured>,
+    /// The semantic tree, in reading order (`order`, then paint order).
+    pub semantic_nodes: Vec<SemanticNode>,
 }
 
 impl MappedScene {
@@ -261,6 +282,11 @@ pub fn map_scene(
             })
             .collect(),
         measured: gathered.measured,
+        semantic_nodes: {
+            let mut nodes = gathered.semantic;
+            nodes.sort_by(|a, b| a.order.total_cmp(&b.order));
+            nodes
+        },
         ..MappedScene::drawn(packet)
     })
 }
@@ -499,6 +525,16 @@ mod tests {
             map_scene(&json!(3), None).unwrap_err(),
             CanvasSceneError::NotAnObject
         );
+    }
+
+    #[test]
+    fn an_orbital_painter_canvas_takes_its_declared_world_size_and_a_plain_one_does_not() {
+        let orbital = json!({"type": "canvas", "mode": "2d", "projection": "free", "painter": "orbital",
+            "worldWidth": 1200, "worldHeight": 760, "drawables": []});
+        assert_eq!(scene_size(&orbital).unwrap(), (1200.0, 760.0));
+        let plain = json!({"type": "canvas", "mode": "2d", "projection": "free",
+            "worldWidth": 1200, "worldHeight": 760, "drawables": []});
+        assert_eq!(scene_size(&plain).unwrap(), (800.0, 600.0), "control: today's games keep width/height");
     }
 
     #[test]

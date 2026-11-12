@@ -246,6 +246,9 @@ pub struct SurfaceShader {
     /// `material.uniforms.a` and `.b`, read as `px.a` and `px.b`.
     pub a: [f32; 4],
     pub b: [f32; 4],
+    /// Seconds from `material.anchor` to this frame's epoch, read as `px.since`; 0 without an anchor or an epoch.
+    #[serde(default)]
+    pub since: f32,
     pub blend: ShaderBlend,
 }
 

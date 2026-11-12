@@ -5,6 +5,9 @@ use crate::{Canvas, RendererError, Result};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
+#[path = "glyph_atlas.rs"]
+mod glyph_atlas;
+
 fn align_up(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & !(alignment - 1)
 }
@@ -382,6 +385,16 @@ enum Draw {
         bind_group: wgpu::BindGroup,
         count: u32,
     },
+    /// Glyph quads of one atlas page, before adjacent runs of the page are merged.
+    GlyphRun {
+        page: u64,
+        instances: Vec<glyph_atlas::GlyphInstance>,
+    },
+    Glyphs {
+        page: u64,
+        buffer: wgpu::Buffer,
+        count: u32,
+    },
 }
 
 /// Cache-key prefix of vector layer textures (never a fetchable URL).
@@ -427,6 +440,7 @@ pub struct SharedDeviceRenderer {
     format: wgpu::TextureFormat,
     particles: Option<crate::particles::ParticlePass>,
     sdf: Option<crate::sdf::SdfPass>,
+    glyphs: Option<glyph_atlas::GlyphPass>,
 }
 
 impl SharedDeviceRenderer {
@@ -485,6 +499,7 @@ impl SharedDeviceRenderer {
             format,
             particles: None,
             sdf: None,
+            glyphs: None,
         }
     }
 
@@ -1029,6 +1044,69 @@ impl SharedDeviceRenderer {
         }
     }
 
+    /// The atlas draws for a plain `Text`; `None` sends it to the CPU vector layer.
+    fn atlas_text(
+        &mut self,
+        command: &DrawCommand,
+        packet: &GameRenderPacket,
+        target: &wgpu::Texture,
+    ) -> Option<Vec<Draw>> {
+        let (device, queue, format) = (self.device.clone(), self.queue.clone(), self.format);
+        let (tw, th) = (target.width(), target.height());
+        let scale = (
+            tw as f32 / packet.width.max(1.0),
+            th as f32 / packet.height.max(1.0),
+        );
+        let pass = self
+            .glyphs
+            .get_or_insert_with(|| glyph_atlas::GlyphPass::new(&device, format));
+        let runs = pass.place_text(&device, &queue, command, scale, (tw, th))?;
+        Some(
+            runs.into_iter()
+                .map(|(page, instances)| Draw::GlyphRun { page, instances })
+                .collect(),
+        )
+    }
+
+    /// Merge adjacent glyph runs of one page into one instance buffer each.
+    fn finalize_glyphs(&self, draws: Vec<Draw>) -> Vec<Draw> {
+        let mut out: Vec<Draw> = Vec::with_capacity(draws.len());
+        let mut pending: Option<(u64, Vec<glyph_atlas::GlyphInstance>)> = None;
+        let flush = |pending: Option<(u64, Vec<glyph_atlas::GlyphInstance>)>,
+                     out: &mut Vec<Draw>| {
+            if let Some((page, instances)) = pending {
+                out.push(Draw::Glyphs {
+                    page,
+                    buffer: glyph_atlas::GlyphPass::instance_buffer(&self.device, &instances),
+                    count: instances.len() as u32,
+                });
+            }
+        };
+        for draw in draws {
+            match draw {
+                Draw::GlyphRun {
+                    page,
+                    mut instances,
+                } => match pending.take() {
+                    Some((p, mut list)) if p == page => {
+                        list.append(&mut instances);
+                        pending = Some((p, list));
+                    }
+                    other => {
+                        flush(other, &mut out);
+                        pending = Some((page, instances));
+                    }
+                },
+                other => {
+                    flush(pending.take(), &mut out);
+                    out.push(other);
+                }
+            }
+        }
+        flush(pending, &mut out);
+        out
+    }
+
     /// The error that kept the last packet's 3D scene from drawing, once.
     pub fn take_scene3d_error(&mut self) -> Option<String> {
         self.scene3d_error.take()
@@ -1041,6 +1119,9 @@ impl SharedDeviceRenderer {
     ) -> bool {
         if self.render_depth == 0 {
             self.frame_epoch = self.use_clock;
+            if let Some(glyphs) = self.glyphs.as_mut() {
+                glyphs.begin_frame();
+            }
         }
         self.render_depth += 1;
         let width = packet.width.max(1.0) as u32;
@@ -1147,6 +1228,16 @@ impl SharedDeviceRenderer {
                             wgsl,
                             instances: vec![instance],
                         });
+                    }
+                }
+                DrawCommand::Text { halo: None, .. } => {
+                    self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
+                    if !quad_batch.is_empty() {
+                        draws.push(Draw::Quads(std::mem::take(&mut quad_batch)));
+                    }
+                    match self.atlas_text(command, packet, target) {
+                        Some(runs) => draws.extend(runs),
+                        None => vector_run.push(command),
                     }
                 }
                 DrawCommand::Path { .. }
@@ -1282,6 +1373,7 @@ impl SharedDeviceRenderer {
             draws.push(Draw::Quads(quad_batch));
         }
         let draws = self.finalize_sdf(draws, packet);
+        let draws = self.finalize_glyphs(draws);
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1357,7 +1449,24 @@ impl SharedDeviceRenderer {
                         pass.draw(0..verts.len() as u32, 0..1);
                         drew = true;
                     }
-                    Draw::SdfRun { .. } => {}
+                    Draw::SdfRun { .. } | Draw::GlyphRun { .. } => {}
+                    Draw::Glyphs {
+                        page,
+                        buffer,
+                        count,
+                    } => {
+                        let Some(glyphs) = self.glyphs.as_ref() else {
+                            continue;
+                        };
+                        let Some(bind_group) = glyphs.bind_group(*page) else {
+                            continue;
+                        };
+                        pass.set_pipeline(glyphs.pipeline());
+                        pass.set_bind_group(0, bind_group, &[]);
+                        pass.set_vertex_buffer(0, buffer.slice(..));
+                        pass.draw(0..6, 0..*count);
+                        drew = true;
+                    }
                     Draw::Sdf {
                         key,
                         bind_group,
@@ -2395,6 +2504,216 @@ mod vector_layer_tests {
         assert!(r.vector_layer_count() <= MAX_VECTOR_LAYERS);
     }
 
+    const SIDE: u32 = 128;
+
+    fn text_packet(commands: Vec<DrawCommand>) -> GameRenderPacket {
+        GameRenderPacket {
+            pattern: "learning-canvas".into(),
+            width: SIDE as f32,
+            height: SIDE as f32,
+            draw_commands: commands,
+            ..Default::default()
+        }
+    }
+
+    fn word(text: &str, x: f32, y: f32, size: f32) -> DrawCommand {
+        DrawCommand::Text {
+            text: text.into(),
+            pos: Vec2 { x, y },
+            size,
+            color: RED,
+            align: TextAlign::Left,
+            weight: 400,
+            mono: false,
+            halo: None,
+        }
+    }
+
+    fn alpha(rgba: &[u8]) -> Vec<u8> {
+        rgba.chunks_exact(4).map(|p| p[3]).collect()
+    }
+
+    fn cpu_alpha(command: &DrawCommand) -> Vec<u8> {
+        alpha(&crate::vector::rasterize(&[command], SIDE, SIDE, 1.0, 1.0).expect("cpu layer"))
+    }
+
+    fn gpu_alpha(r: &mut SharedDeviceRenderer, command: &DrawCommand) -> Option<Vec<u8>> {
+        draw(r, &text_packet(vec![command.clone()]), SIDE).map(|rgba| alpha(&rgba))
+    }
+
+    fn mean_diff(a: &[u8], b: &[u8]) -> f64 {
+        let total: u64 = a.iter().zip(b).map(|(x, y)| x.abs_diff(*y) as u64).sum();
+        total as f64 / a.len() as f64
+    }
+
+    fn ink_sum(a: &[u8]) -> u64 {
+        a.iter().map(|v| *v as u64).sum()
+    }
+
+    fn ink_width(a: &[u8]) -> u32 {
+        let cols: Vec<u32> = (0..SIDE)
+            .filter(|x| (0..SIDE).any(|y| a[(y * SIDE + x) as usize] > 40))
+            .collect();
+        match (cols.first(), cols.last()) {
+            (Some(first), Some(last)) => last - first + 1,
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn atlas_text_paints_the_same_pixels_as_the_cpu_path() {
+        let Some(mut r) = renderer() else { return };
+        let command = word("Hello Wg", 10.3, 40.7, 24.0);
+        let cpu = cpu_alpha(&command);
+        let Some(gpu) = gpu_alpha(&mut r, &command) else {
+            return;
+        };
+        assert!(ink_sum(&cpu) > 0, "the CPU path inks");
+        let diff = mean_diff(&cpu, &gpu);
+        assert!(diff < 0.6, "mean alpha difference {diff}");
+        let (c, g) = (ink_sum(&cpu) as f64, ink_sum(&gpu) as f64);
+        assert!((c - g).abs() / c < 0.03, "ink {c} vs {g}");
+        let shifted = cpu_alpha(&word("Hello Wg", 13.3, 40.7, 24.0));
+        assert!(
+            mean_diff(&shifted, &gpu) > diff * 4.0,
+            "control: text three pixels over is far from the atlas pixels"
+        );
+    }
+
+    #[test]
+    fn atlas_text_draws_in_the_text_colour_and_keeps_z_order() {
+        let Some(mut r) = renderer() else { return };
+        let under = DrawCommand::Quad {
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: SIDE as f32,
+                h: SIDE as f32,
+            },
+            color: [0.0, 0.0, 1.0, 1.0],
+        };
+        let text = word("WWW", 4.0, 40.0, 40.0);
+        let Some(over) = draw(
+            &mut r,
+            &text_packet(vec![under.clone(), text.clone()]),
+            SIDE,
+        ) else {
+            return;
+        };
+        assert!(
+            over.chunks_exact(4).any(|p| p[0] > 240 && p[2] < 15),
+            "red text over the blue quad"
+        );
+        let Some(hidden) = draw(&mut r, &text_packet(vec![text, under]), SIDE) else {
+            return;
+        };
+        assert!(
+            hidden.chunks_exact(4).all(|p| p[0] == 0 && p[2] == 255),
+            "control: the quad last covers the text"
+        );
+    }
+
+    #[test]
+    fn arabic_through_the_atlas_is_drawn_and_joined() {
+        let Some(mut r) = renderer() else { return };
+        let joined = word("بيت", 20.0, 40.0, 28.0);
+        let apart = word("ب ي ت", 20.0, 40.0, 28.0);
+        let Some(gpu) = gpu_alpha(&mut r, &joined) else {
+            return;
+        };
+        assert!(ink_sum(&gpu) > 0, "the joined word has coverage");
+        let diff = mean_diff(&cpu_alpha(&joined), &gpu);
+        assert!(diff < 0.6, "the atlas draws the CPU's joined glyphs: {diff}");
+        let Some(spread) = gpu_alpha(&mut r, &apart) else {
+            return;
+        };
+        assert!(ink_sum(&spread) > 0);
+        assert!(
+            ink_width(&gpu) < ink_width(&spread),
+            "control: the letters set apart are wider than the joined word"
+        );
+    }
+
+    fn rasterized(r: &SharedDeviceRenderer) -> u64 {
+        r.glyphs.as_ref().map_or(0, |g| g.rasterized())
+    }
+
+    #[test]
+    fn a_second_frame_of_the_same_text_rasterizes_no_new_glyphs() {
+        let Some(mut r) = renderer() else { return };
+        let command = word("Cache", 8.0, 40.0, 20.0);
+        let Some(first) = gpu_alpha(&mut r, &command) else {
+            return;
+        };
+        let after_first = rasterized(&r);
+        assert!(after_first > 0);
+        let Some(second) = gpu_alpha(&mut r, &command) else {
+            return;
+        };
+        assert_eq!(rasterized(&r), after_first, "a cache hit");
+        assert_eq!(first, second, "the same pixels");
+        let _ = gpu_alpha(&mut r, &word("Xyz", 8.0, 40.0, 20.0));
+        assert!(rasterized(&r) > after_first, "control: new letters rasterize");
+    }
+
+    #[test]
+    fn a_full_atlas_evicts_a_page_and_still_draws() {
+        let Some(mut r) = renderer() else { return };
+        r.glyphs = Some(glyph_atlas::GlyphPass::with_limits(
+            r.device(),
+            wgpu::TextureFormat::Rgba8Unorm,
+            64,
+            1,
+        ));
+        let first = word("WMNO", 2.0, 30.0, 24.0);
+        let second = word("QG", 2.0, 30.0, 24.0);
+        let Some(_) = gpu_alpha(&mut r, &first) else {
+            return;
+        };
+        let after_first = rasterized(&r);
+        let Some(drawn) = gpu_alpha(&mut r, &second) else {
+            return;
+        };
+        assert!(ink_sum(&drawn) > 0, "the evicting frame still draws");
+        let diff = mean_diff(&cpu_alpha(&second), &drawn);
+        assert!(diff < 0.6, "and draws the CPU's pixels: {diff}");
+        assert_eq!(r.glyphs.as_ref().map(|g| g.page_count()), Some(1));
+        let before_again = rasterized(&r);
+        assert!(before_again > after_first);
+        let Some(_) = gpu_alpha(&mut r, &first) else {
+            return;
+        };
+        assert!(
+            rasterized(&r) > before_again,
+            "the evicted letters rasterize again"
+        );
+        let Some(_) = gpu_alpha(&mut r, &first) else {
+            return;
+        };
+        let settled = rasterized(&r);
+        let _ = gpu_alpha(&mut r, &first);
+        assert_eq!(rasterized(&r), settled, "control: resident letters do not");
+    }
+
+    #[test]
+    fn one_frame_wider_than_the_budget_grows_then_trims_back() {
+        let Some(mut r) = renderer() else { return };
+        r.glyphs = Some(glyph_atlas::GlyphPass::with_limits(
+            r.device(),
+            wgpu::TextureFormat::Rgba8Unorm,
+            64,
+            1,
+        ));
+        let wide = word("WMNOQGHKRS", 2.0, 30.0, 24.0);
+        let Some(drawn) = gpu_alpha(&mut r, &wide) else {
+            return;
+        };
+        assert!(ink_width(&drawn) > 100, "every glyph of the frame draws");
+        assert!(r.glyphs.as_ref().is_some_and(|g| g.page_count() > 1));
+        let _ = gpu_alpha(&mut r, &word("i", 2.0, 30.0, 24.0));
+        assert_eq!(r.glyphs.as_ref().map(|g| g.page_count()), Some(1));
+    }
+
     #[test]
     fn stroke_and_text_commands_draw() {
         let Some(mut r) = renderer() else { return };
@@ -2531,6 +2850,7 @@ mod sdf_tests {
                 wgsl: wgsl.into(),
                 params: vec![],
                 live: true,
+                since: 0.0,
             });
         }
         command

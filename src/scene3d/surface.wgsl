@@ -13,6 +13,8 @@ struct Pixel {
   uv: vec2<f32>,
   // seconds on the canvas clock
   time: f32,
+  // seconds from the material's `anchor` (epoch ms on the page wall clock) to this frame, 0 without an anchor
+  since: f32,
   // the material's colour and opacity, its emissive times its intensity, and its two parameter vectors
   color: vec4<f32>,
   emissive: vec3<f32>,
@@ -30,6 +32,7 @@ fn fs_surface(in: VertexOut, @builtin(front_facing) front: bool) -> @location(0)
   px.view = normalize(frame.camera_pos.xyz - in.world);
   px.uv = in.uv;
   px.time = frame.clock.x;
+  px.since = object.physical.w;
   px.color = object.color;
   px.emissive = object.emissive.rgb;
   px.a = object.custom_a;

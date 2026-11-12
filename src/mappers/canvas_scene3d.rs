@@ -1060,6 +1060,7 @@ const MATERIAL_KEYS: &[&str] = &[
     "map",
     "wgsl",
     "uniforms",
+    "anchor",
     "blend",
 ];
 
@@ -1392,6 +1393,7 @@ impl Walk<'_> {
             &join(path, "material"),
             opacity,
             self.theme,
+            self.epoch_ms,
         )?;
         // a shader material may read the canvas clock, so the host keeps drawing
         self.animated |= material.shader.is_some();
@@ -1573,6 +1575,7 @@ impl Walk<'_> {
             &join(path, "material"),
             opacity,
             self.theme,
+            self.epoch_ms,
         )?;
         self.animated |= material.shader.is_some();
         let transform = parent * DMat4::from_translation(world);
@@ -3125,11 +3128,24 @@ fn polyhedron(f: &Fields, path: &str, cell: f64) -> Result<(MeshData, f64), Canv
     Ok((mesh, -min_z * cell))
 }
 
+/// Seconds from `material.anchor` (epoch ms) to the frame's epoch, in f64 before the f32 narrowing; 0 without either.
+fn anchor_since(
+    m: &Fields,
+    path: &str,
+    epoch_ms: Option<f64>,
+) -> Result<f32, CanvasSceneError> {
+    let Some(anchor) = opt_number(m, "anchor", path)? else {
+        return Ok(0.0);
+    };
+    Ok(epoch_ms.map_or(0.0, |epoch| ((epoch - anchor) / 1000.0) as f32))
+}
+
 fn material(
     m: Option<&Fields>,
     path: &str,
     opacity: f64,
     theme: &SceneTheme,
+    epoch_ms: Option<f64>,
 ) -> Result<Material, CanvasSceneError> {
     let empty = Fields::new();
     let m = m.unwrap_or(&empty);
@@ -3179,6 +3195,7 @@ fn material(
             "emissiveIntensity",
             "wgsl",
             "uniforms",
+            "anchor",
             "blend",
         ],
         MaterialKind::Physical | MaterialKind::Flat(_) => &[
@@ -3274,6 +3291,7 @@ fn material(
             wgsl: wgsl.to_owned(),
             a: vector("a")?,
             b: vector("b")?,
+            since: anchor_since(m, path, epoch_ms)?,
             blend,
         })
     } else {
@@ -3878,6 +3896,7 @@ mod tests {
                 wgsl: SHADE.to_owned(),
                 a: [1.0, 0.5, 0.0, 2.0],
                 b: [0.0, 0.0, 0.0, 9.0],
+                since: 0.0,
                 blend: ShaderBlend::Additive,
             })
         );
@@ -3885,6 +3904,57 @@ mod tests {
             mapped.animated,
             "a shader may read the clock, so the canvas keeps drawing"
         );
+    }
+
+    fn shader_scene(material: Value, epoch_ms: Option<f64>) -> Result<Scene3D, CanvasSceneError> {
+        let canvas = json!({"type": "canvas", "mode": "3d", "showGrid": false,
+            "drawables": [{"type": "draw-mesh", "shape": "plane", "position": {"x": 0, "y": 0}, "material": material}]});
+        match epoch_ms {
+            Some(epoch) => scene_from_canvas_node_at_epoch(
+                &canvas,
+                800.0,
+                600.0,
+                &SceneTheme::default(),
+                0.0,
+                epoch,
+            ),
+            None => scene_from_canvas_node(&canvas, 800.0, 600.0),
+        }
+    }
+
+    fn shader_since(material: Value, epoch_ms: Option<f64>) -> f32 {
+        let s = shader_scene(material, epoch_ms).expect("a scene");
+        s.meshes[0].material.shader.as_ref().expect("a shader").since
+    }
+
+    #[test]
+    fn anchor_since_is_seconds_from_the_anchor_to_the_frame_epoch() {
+        let material = json!({"kind": "shader", "wgsl": SHADE, "anchor": 1_700_000_000_000.0});
+        assert_eq!(
+            shader_since(material.clone(), Some(1_700_000_002_500.0)),
+            2.5
+        );
+        assert_eq!(
+            shader_since(material, Some(1_699_999_999_000.0)),
+            -1.0,
+            "before the anchor is negative"
+        );
+    }
+
+    #[test]
+    fn anchor_since_is_zero_without_an_anchor_or_without_an_epoch() {
+        let plain = json!({"kind": "shader", "wgsl": SHADE});
+        assert_eq!(shader_since(plain, Some(1_700_000_002_500.0)), 0.0);
+        let anchored = json!({"kind": "shader", "wgsl": SHADE, "anchor": 1_700_000_000_000.0});
+        assert_eq!(shader_since(anchored, None), 0.0);
+    }
+
+    #[test]
+    fn anchor_since_refuses_a_non_finite_anchor_and_a_kind_that_does_not_draw_it() {
+        let bad_anchor = shader_scene(json!({"kind": "shader", "wgsl": SHADE, "anchor": "soon"}), None);
+        assert!(message(bad_anchor).starts_with("drawables[0].material.anchor: "));
+        let other = shader_scene(json!({"kind": "standard", "anchor": 5}), None);
+        assert!(message(other).starts_with("drawables[0].material.anchor: "));
     }
 
     #[test]

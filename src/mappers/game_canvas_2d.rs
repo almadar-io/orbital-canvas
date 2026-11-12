@@ -78,6 +78,7 @@ pub struct Region {
 pub struct Gathered {
     pub regions: Vec<Region>,
     pub measured: Vec<Measured>,
+    pub semantic: Vec<super::scene::SemanticNode>,
 }
 
 fn invalid(field: &str, detail: impl Into<String>) -> CanvasSceneError {
@@ -115,8 +116,15 @@ pub fn from_props_mapped(
     epoch_now_ms: f64,
 ) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
     let mut gathered = Gathered::default();
-    let width = get_f32(props, "width", 800.0);
-    let height = get_f32(props, "height", 600.0);
+    // An orbital-painter canvas is sized by its declared world, as the web host sizes it.
+    let orbital = props.get("painter").and_then(Value::as_str) == Some("orbital");
+    let (width_key, height_key) = if orbital {
+        ("worldWidth", "worldHeight")
+    } else {
+        ("width", "height")
+    };
+    let width = get_f32(props, width_key, 800.0);
+    let height = get_f32(props, height_key, 600.0);
     let scale = get_f32(props, "scale", 0.4);
     let projection = match props.get("projection").and_then(Value::as_str) {
         Some(s) => Projection::from_str(s).unwrap_or_else(|| {
@@ -399,7 +407,59 @@ pub(crate) fn to_drawable_nodes(children: &Value) -> Vec<Value> {
 /// Dispatch one drawable node. Layer molecules paint their `items` with the
 /// layer's own atom painter (the layer contract — `DrawSpriteLayer.tsx`), not
 /// by the item's `type`.
+/// Paint one drawable, then record it in the semantic tree when it carries `semantic` and an `id`.
 fn walk(
+    node: &Value,
+    projector: &Projector,
+    to_screen: &dyn Fn(f32, f32) -> (f32, f32),
+    zoom: f32,
+    epoch_now_ms: f64,
+    gathered: &mut Gathered,
+    out: &mut Vec<DrawCommand>,
+) -> Result<(), CanvasSceneError> {
+    let (out_start, region_start) = (out.len(), gathered.regions.len());
+    walk_paint(node, projector, to_screen, zoom, epoch_now_ms, gathered, out)?;
+    let Some(id) = node.get("id").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some(semantic) = node.get("semantic").filter(|v| v.is_object()) else {
+        return Ok(());
+    };
+    let rect = gathered.regions[region_start..]
+        .iter()
+        .rev()
+        .find(|r| r.id == id)
+        .map(|r| r.rect)
+        .or_else(|| commands_bounds(&out[out_start..]));
+    let Some(rect) = rect else {
+        return Ok(());
+    };
+    let text = |k: &str| semantic.get(k).and_then(Value::as_str).map(str::to_owned);
+    let flag = |k: &str| semantic.get(k).and_then(Value::as_bool);
+    let index = |k: &str| semantic.get(k).and_then(Value::as_u64).map(|n| n as usize);
+    let paint_order = gathered.semantic.len() as f32;
+    gathered.semantic.push(super::scene::SemanticNode {
+        id: id.to_owned(),
+        role: text("role").ok_or_else(|| invalid("semantic.role", "a semantic node needs a role"))?,
+        name: text("name").unwrap_or_default(),
+        value: text("value"),
+        checked: flag("checked"),
+        disabled: flag("disabled").unwrap_or(false),
+        focused: flag("focused").unwrap_or(false),
+        caret: index("caret"),
+        selection_start: index("selectionStart"),
+        selection_end: index("selectionEnd"),
+        multiline: flag("multiline").unwrap_or(false),
+        order: semantic
+            .get("order")
+            .and_then(Value::as_f64)
+            .map_or(paint_order, |o| o as f32),
+        rect,
+    });
+    Ok(())
+}
+
+fn walk_paint(
     node: &Value,
     projector: &Projector,
     to_screen: &dyn Fn(f32, f32) -> (f32, f32),
@@ -627,6 +687,12 @@ pub fn has_active_fx(node: &Value) -> bool {
                 .and_then(Value::as_array)
                 .is_some_and(|v| !v.is_empty())
     }) {
+        return true;
+    }
+    if node
+        .pointer("/material/anchor")
+        .is_some_and(|anchor| anchor.as_f64().is_some())
+    {
         return true;
     }
     ["props", "drawables", "children", "items"]
@@ -1735,6 +1801,7 @@ fn paint_shape(
         projector,
         to_screen,
         zoom,
+        epoch_now_ms,
         gathered,
         out,
     )
@@ -1745,6 +1812,7 @@ fn paint_sdf_shape(
     projector: &Projector,
     to_screen: &dyn Fn(f32, f32) -> (f32, f32),
     zoom: f32,
+    epoch_now_ms: f64,
     gathered: &mut Gathered,
     out: &mut Vec<DrawCommand>,
 ) -> Result<(), CanvasSceneError> {
@@ -1910,10 +1978,25 @@ fn paint_sdf_shape(
                 return Err(invalid("material.params", "at most 8 parameters"));
             }
             crate::sdf::check_material(wgsl).map_err(|detail| invalid("material.wgsl", detail))?;
+            let since = match spec.get("anchor").filter(|a| !a.is_null()) {
+                None => 0.0,
+                Some(anchor) => {
+                    let anchor = anchor
+                        .as_f64()
+                        .filter(|a| a.is_finite())
+                        .ok_or_else(|| invalid("material.anchor", "must be a finite number of epoch milliseconds"))?;
+                    if epoch_now_ms > 0.0 {
+                        ((epoch_now_ms - anchor) / 1000.0) as f32
+                    } else {
+                        0.0
+                    }
+                }
+            };
             Some(SdfMaterial {
                 wgsl: wgsl.to_owned(),
                 params,
                 live: spec.get("live").and_then(Value::as_bool).unwrap_or(false),
+                since,
             })
         }
     };
@@ -3725,6 +3808,68 @@ mod tests {
             matches!(&kind, CanvasSceneError::InvalidProp { field, .. } if field == "corners.kind"),
             "{kind:?}"
         );
+    }
+
+    #[test]
+    fn anchor_since_reaches_an_sdf_material_in_seconds_and_rests_without_an_anchor_or_epoch() {
+        const WGSL: &str = "fn shade(px: Pixel) -> vec4<f32> { return vec4<f32>(px.since, 0.0, 0.0, 1.0); }";
+        let since_at = |material: Value, epoch: f64| {
+            let packet =
+                from_props_at(&free_props(json!([rect_shape(json!({"material": material}))])), epoch)
+                    .unwrap();
+            match sdf_commands(&packet).as_slice() {
+                [DrawCommand::Sdf { material: Some(m), .. }] => m.since,
+                other => panic!("one material shape, got {other:?}"),
+            }
+        };
+        let anchored = json!({"wgsl": WGSL, "anchor": 1_700_000_000_000.0});
+        assert_eq!(since_at(anchored.clone(), 1_700_000_002_500.0), 2.5);
+        assert_eq!(since_at(anchored, 0.0), 0.0);
+        assert_eq!(since_at(json!({"wgsl": WGSL}), 1_700_000_002_500.0), 0.0);
+        let bad = from_props(&free_props(json!([rect_shape(
+            json!({"material": {"wgsl": WGSL, "anchor": "soon"}})
+        )])))
+        .unwrap_err();
+        assert!(
+            matches!(&bad, CanvasSceneError::InvalidProp { field, .. } if field == "material.anchor"),
+            "{bad:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_drawables_form_the_tree_in_reading_order_at_their_regions() {
+        let node = |id: &str, hit: bool, x: i32, sem: Value| {
+            json!({"type": "draw-shape", "shape": "rect", "id": id, "hit": hit, "anchor": "top-left",
+                "position": {"x": x, "y": 0}, "width": 40, "height": 20, "fill": "#000000", "semantic": sem})
+        };
+        let (_, gathered) = from_props_mapped(
+            &free_props(json!([
+                node("second", true, 0, json!({"role": "button", "name": "Two", "order": 2})),
+                node("first", false, 50, json!({"role": "textbox", "name": "One", "value": "hi", "caret": 1, "focused": true, "order": 1})),
+                json!({"type": "draw-shape", "shape": "rect", "anchor": "top-left", "position": {"x": 0, "y": 0},
+                    "width": 10, "height": 10, "fill": "#000000", "semantic": {"role": "button", "name": "no id"}}),
+            ])),
+            0.0,
+        )
+        .unwrap();
+        let mut nodes = gathered.semantic.clone();
+        nodes.sort_by(|a, b| a.order.total_cmp(&b.order));
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["first", "second"], "control: a semantic drawable with no id is no node");
+        assert_eq!(nodes[0].caret, Some(1));
+        assert!(nodes[0].focused && nodes[0].value.as_deref() == Some("hi"));
+        assert_eq!((nodes[0].rect.x, nodes[0].rect.w), (50.0, 40.0), "painted bounds without a hit");
+        assert_eq!((nodes[1].rect.x, nodes[1].rect.w), (0.0, 40.0), "the pointer region with a hit");
+    }
+
+    #[test]
+    fn a_semantic_node_without_a_role_is_a_scene_error() {
+        let result = from_props_mapped(
+            &free_props(json!([{"type": "draw-shape", "shape": "rect", "id": "x", "anchor": "top-left",
+                "position": {"x": 0, "y": 0}, "width": 10, "height": 10, "fill": "#000000", "semantic": {"name": "nameless role"}}])),
+            0.0,
+        );
+        assert!(result.is_err());
     }
 
     #[test]

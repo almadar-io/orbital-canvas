@@ -4,7 +4,7 @@
 //   0 rect (x y w h)            1 corner radii (tl tr br bl)     2 (shape, corner kind, rotation, opacity)
 //   3 (arc start, sweep, thickness, polygon sides)               4 (star ratio, stroke width, dash on, dash off)
 //   5 (dash offset, shadow sigma, shadow dx, shadow dy)          6 fill   7 stroke colour   8 shadow colour
-//   9 material params 0..4      10 material params 4..8
+//   9 material params 0..4      10 material params 4..8          11 (since, 0, 0, 0)
 
 struct Pixel {
   local: vec2<f32>,
@@ -12,6 +12,8 @@ struct Pixel {
   uv: vec2<f32>,
   sdf: f32,
   time: f32,
+  // seconds from the material's `anchor` (epoch ms on the page wall clock) to this frame, 0 without an anchor
+  since: f32,
   pointer: vec2<f32>,
   color: vec4<f32>,
   a: vec4<f32>,
@@ -21,12 +23,12 @@ struct Pixel {
 struct SdfParams {
   frame: vec4<f32>,
   pointer: vec4<f32>,
-  data: array<vec4<f32>, 704>,
+  data: array<vec4<f32>, 768>,
 }
 
 @group(0) @binding(0) var<uniform> sdf_params: SdfParams;
 
-const SDF_FIELDS: u32 = 11u;
+const SDF_FIELDS: u32 = 12u;
 const SDF_PI: f32 = 3.14159265358979;
 const SDF_TAU: f32 = 6.28318530717959;
 
@@ -273,7 +275,7 @@ fn fs_main(in: SdfVsOut) -> @location(0) vec4<f32> {
     let sn = sin(misc.z);
     pointer = vec2<f32>(dd.x * cs + dd.y * sn, -dd.x * sn + dd.y * cs) + hs;
   }
-  let px = Pixel(in.local, size, in.local / size, shape.d, sdf_params.frame.z, pointer, fill, sdf_inst(i, 9u), sdf_inst(i, 10u));
+  let px = Pixel(in.local, size, in.local / size, shape.d, sdf_params.frame.z, sdf_inst(i, 11u).x, pointer, fill, sdf_inst(i, 9u), sdf_inst(i, 10u));
   var base = shade(px);
   let fill_cov = clamp(0.5 - shape.d / aa, 0.0, 1.0);
   let base_a = base.a * fill_cov * opacity;

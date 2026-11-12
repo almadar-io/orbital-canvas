@@ -12,9 +12,9 @@ const PLAIN_SHADE: &str = "\nfn shade(px: Pixel) -> vec4<f32> { return px.color;
 
 /// Shapes per uniform buffer; the WGSL array holds `MAX_INSTANCES * FIELDS` vec4 slots.
 pub(crate) const MAX_INSTANCES: usize = 64;
-const FIELDS: usize = 11;
+const FIELDS: usize = 12;
 const HEADER_FLOATS: usize = 8;
-const _: () = assert!(MAX_INSTANCES * FIELDS == 704);
+const _: () = assert!(MAX_INSTANCES * FIELDS == 768);
 
 /// The pipeline key of the plain (no material) pass.
 pub(crate) const PLAIN_KEY: u64 = 0;
@@ -60,6 +60,7 @@ impl SdfInstance {
         };
         let mut a = [0.0; 4];
         let mut b = [0.0; 4];
+        let since = material.as_ref().map_or(0.0, |m| m.since);
         if let Some(m) = material {
             for (i, v) in m.params.iter().take(8).enumerate() {
                 if i < 4 {
@@ -81,6 +82,7 @@ impl SdfInstance {
             shadow_color,
             a,
             b,
+            [since, 0.0, 0.0, 0.0],
         ];
         Some((Self(slots), material.as_ref()))
     }

@@ -31,33 +31,63 @@ static ARABIC_REGULAR_BYTES: &[u8] =
     include_bytes!("../assets/fonts/NotoSansArabic-Regular-subset.ttf");
 static ARABIC_BOLD_BYTES: &[u8] = include_bytes!("../assets/fonts/NotoSansArabic-Bold-subset.ttf");
 static MONO_BYTES: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono-subset.ttf");
+static SERIF_REGULAR_BYTES: &[u8] = include_bytes!("../assets/fonts/Amiri-Regular.ttf");
+static SERIF_BOLD_BYTES: &[u8] = include_bytes!("../assets/fonts/Amiri-Bold.ttf");
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum FontId {
     Latin,
     ArabicRegular,
     ArabicBold,
     /// DejaVu Sans Mono: text a theme draws in its `mono` face.
     Mono,
+    /// Amiri Regular: the generic family `serif` (Latin and Arabic Naskh).
+    Serif,
+    /// Amiri Bold.
+    SerifBold,
     /// A face the host supplied for a script no bundled face covers (`add_font_face`).
     Host(u16),
 }
 
 impl FontId {
     /// Only the bundled Arabic has a real bold; every other face is emboldened by stroking.
-    fn faux_bold(self) -> bool {
-        !matches!(self, FontId::ArabicRegular | FontId::ArabicBold)
+    pub(crate) fn faux_bold(self) -> bool {
+        !matches!(
+            self,
+            FontId::ArabicRegular | FontId::ArabicBold | FontId::Serif | FontId::SerifBold
+        )
+    }
+}
+
+/// The generic family a run of text is drawn in.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum Family {
+    Sans,
+    Mono,
+    #[allow(dead_code)]
+    Serif,
+}
+
+impl Family {
+    pub(crate) fn of_mono(mono: bool) -> Self {
+        if mono {
+            Family::Mono
+        } else {
+            Family::Sans
+        }
     }
 }
 
 fn font_for(id: FontId) -> Option<&'static rustybuzz::Face<'static>> {
-    static FACES: OnceLock<[Option<rustybuzz::Face<'static>>; 4]> = OnceLock::new();
+    static FACES: OnceLock<[Option<rustybuzz::Face<'static>>; 6]> = OnceLock::new();
     let faces = FACES.get_or_init(|| {
         [
             rustybuzz::Face::from_slice(LATIN_BYTES, 0),
             rustybuzz::Face::from_slice(ARABIC_REGULAR_BYTES, 0),
             rustybuzz::Face::from_slice(ARABIC_BOLD_BYTES, 0),
             rustybuzz::Face::from_slice(MONO_BYTES, 0),
+            rustybuzz::Face::from_slice(SERIF_REGULAR_BYTES, 0),
+            rustybuzz::Face::from_slice(SERIF_BOLD_BYTES, 0),
         ]
     });
     match id {
@@ -65,6 +95,8 @@ fn font_for(id: FontId) -> Option<&'static rustybuzz::Face<'static>> {
         FontId::ArabicRegular => faces[1].as_ref(),
         FontId::ArabicBold => faces[2].as_ref(),
         FontId::Mono => faces[3].as_ref(),
+        FontId::Serif => faces[4].as_ref(),
+        FontId::SerifBold => faces[5].as_ref(),
         FontId::Host(i) => host_fonts().read().ok()?.get(i as usize).map(|(_, f)| *f),
     }
 }
@@ -182,9 +214,20 @@ pub(crate) struct Shaped {
 
 /// The face for `c` in `script`: the mono face when asked and it covers `c`, bundled Arabic, the bundled face when its cmap covers the
 /// char, a host face for the script, else the bundled face (`.notdef`) with the script noted.
-fn char_font(c: char, script: Script, bold: bool, mono: bool) -> FontId {
-    if mono && font_for(FontId::Mono).is_some_and(|f| f.glyph_index(c).is_some()) {
+fn char_font(c: char, script: Script, bold: bool, family: Family) -> FontId {
+    if family == Family::Mono && font_for(FontId::Mono).is_some_and(|f| f.glyph_index(c).is_some())
+    {
         return FontId::Mono;
+    }
+    if family == Family::Serif {
+        let serif = if bold {
+            FontId::SerifBold
+        } else {
+            FontId::Serif
+        };
+        if font_for(serif).is_some_and(|f| f.glyph_index(c).is_some()) {
+            return serif;
+        }
     }
     if script == Script::Arabic {
         return if bold {
@@ -211,7 +254,7 @@ fn char_font(c: char, script: Script, bold: bool, mono: bool) -> FontId {
 
 /// Face per char; Common/Inherited chars take the preceding script (the
 /// following one when the text opens with them).
-fn char_fonts(text: &str, bold: bool, mono: bool) -> Vec<FontId> {
+fn char_fonts(text: &str, bold: bool, family: Family) -> Vec<FontId> {
     let scripts: Vec<Script> = text.chars().map(|c| c.script()).collect();
     let neutral = |s: Script| matches!(s, Script::Common | Script::Inherited);
     let first = scripts.iter().copied().find(|s| !neutral(*s));
@@ -222,18 +265,23 @@ fn char_fonts(text: &str, bold: bool, mono: bool) -> Vec<FontId> {
             if !neutral(*s) {
                 current = *s;
             }
-            char_font(c, current, bold, mono)
+            char_font(c, current, bold, family)
         })
         .collect()
 }
 
 /// Shape `text` at `size` into glyphs laid out left to right in visual order.
 pub(crate) fn shape(text: &str, size: f32, bold: bool, mono: bool) -> Shaped {
+    shape_in(text, size, bold, Family::of_mono(mono))
+}
+
+/// [`shape`] in a generic family.
+pub(crate) fn shape_in(text: &str, size: f32, bold: bool, family: Family) -> Shaped {
     let mut out = Shaped::default();
     if text.is_empty() {
         return out;
     }
-    let fonts = char_fonts(text, bold, mono);
+    let fonts = char_fonts(text, bold, family);
     let font_at = |byte: usize| fonts[text[..byte].chars().count()];
     let info = BidiInfo::new(text, None);
     let mut pen = 0.0f32;
@@ -344,7 +392,7 @@ pub fn text_font_metrics(size: f32) -> Option<(f32, f32)> {
 /// than the Latin one (the Arabic face, whose dots hang under its letters) reaches past [`text_font_metrics`].
 pub(crate) fn text_run_extent(text: &str, size: f32, bold: bool, mono: bool) -> Option<(f32, f32)> {
     let (mut top, mut bottom) = text_font_metrics(size)?;
-    for font in char_fonts(text, bold, mono) {
+    for font in char_fonts(text, bold, Family::of_mono(mono)) {
         if let Some(face) = font_for(font) {
             let scale = size / face.units_per_em() as f32;
             top = top.max(face.ascender() as f32 * scale);
@@ -757,17 +805,22 @@ struct TextPaths {
     faux_bold: Option<tiny_skia::Path>,
 }
 
-/// Outline of `text` with its anchor placed per `align`, `pos.y` at the em box
-/// middle of the Latin face. Bold glyphs from faces without a real bold are
-/// returned apart so the caller can thicken them.
-fn text_path(
+/// Shaped `text` with its anchor placed per `align`: the left pen `x0` and the baseline, `pos.y` at the em box
+/// middle of the Latin face. Glyph `x`/`y` are offsets from them.
+pub(crate) struct TextLayout {
+    pub shaped: Shaped,
+    pub x0: f32,
+    pub baseline: f32,
+}
+
+pub(crate) fn text_layout(
     text: &str,
     pos: Vec2,
     size: f32,
     align: TextAlign,
     bold: bool,
     mono: bool,
-) -> Option<TextPaths> {
+) -> Option<TextLayout> {
     let base = face()?;
     let shaped = shape(text, size, bold, mono);
     let x0 = match align {
@@ -777,6 +830,28 @@ fn text_path(
     };
     let base_scale = size / base.units_per_em() as f32;
     let baseline = pos.y + (base.ascender() as f32 + base.descender() as f32) / 2.0 * base_scale;
+    Some(TextLayout {
+        shaped,
+        x0,
+        baseline,
+    })
+}
+
+/// Outline of `text` placed by [`text_layout`]. Bold glyphs from faces without a real bold are
+/// returned apart so the caller can thicken them.
+fn text_path(
+    text: &str,
+    pos: Vec2,
+    size: f32,
+    align: TextAlign,
+    bold: bool,
+    mono: bool,
+) -> Option<TextPaths> {
+    let TextLayout {
+        shaped,
+        x0,
+        baseline,
+    } = text_layout(text, pos, size, align, bold, mono)?;
     let mut all = PathBuilder::new();
     let mut faux = PathBuilder::new();
     for g in &shaped.glyphs {
@@ -799,6 +874,66 @@ fn text_path(
     Some(TextPaths {
         all: all.finish()?,
         faux_bold: faux.finish(),
+    })
+}
+
+/// One glyph's anti-aliased coverage, `left`/`top` being the bitmap's offset from the glyph origin in pixels.
+pub(crate) struct GlyphBitmap {
+    pub left: i32,
+    pub top: i32,
+    pub width: u32,
+    pub height: u32,
+    pub coverage: Vec<u8>,
+}
+
+/// The coverage of glyph `gid` of `font` at `size` px with its origin `frac` px past a pixel corner, filled
+/// (and, for a bold run in a face without a real bold, stroked) exactly as [`draw_command`] draws text.
+/// `None` for a glyph with no outline.
+pub(crate) fn rasterize_glyph(
+    font: FontId,
+    gid: u16,
+    size: f32,
+    faux_bold: bool,
+    frac: (f32, f32),
+) -> Option<GlyphBitmap> {
+    let face = font_for(font)?;
+    let scale = size / face.units_per_em() as f32;
+    let id = ttf_parser::GlyphId(gid);
+    let mut builder = PathBuilder::new();
+    face.outline_glyph(
+        id,
+        &mut GlyphOutline::new(&mut builder, frac.0, frac.1, scale),
+    )?;
+    let path = builder.finish()?;
+    let stroke_width = size * 0.045;
+    let pad = 1.0 + if faux_bold { stroke_width / 2.0 } else { 0.0 };
+    let bounds = path.bounds();
+    let left = (bounds.left() - pad).floor();
+    let top = (bounds.top() - pad).floor();
+    let right = (bounds.right() + pad).ceil();
+    let bottom = (bounds.bottom() + pad).ceil();
+    let (width, height) = ((right - left) as u32, (bottom - top) as u32);
+    let mut pixmap = Pixmap::new(width, height)?;
+    let ts = Transform::from_translate(-left, -top);
+    let white = paint([1.0; 4]);
+    pixmap.fill_path(&path, &white, FillRule::Winding, ts, None);
+    if faux_bold {
+        let stroke = Stroke {
+            color: [1.0; 4],
+            width: stroke_width,
+            dash: Vec::new(),
+            dash_offset: 0.0,
+            cap: LineCap::Round,
+            join: LineJoin::Round,
+        };
+        pixmap.stroke_path(&path, &white, &sk_stroke(&stroke), ts, None);
+    }
+    Some(GlyphBitmap {
+        left: left as i32,
+        top: top as i32,
+        width,
+        height,
+        coverage: pixmap.data().chunks_exact(4).map(|px| px[3]).collect(),
     })
 }
 
@@ -1784,5 +1919,48 @@ mod tests {
         assert!(s.glyphs.is_empty() && s.width == 0.0);
         let cjk = shape("\u{4E2D}", 14.0, false, false);
         assert_eq!(cjk.glyphs.len(), 1);
+    }
+
+    fn bitmap(font: FontId, c: char) -> Option<GlyphBitmap> {
+        let face = font_for(font)?;
+        let gid = face.glyph_index(c)?.0;
+        rasterize_glyph(font, gid, 40.0, false, (0.0, 0.0))
+    }
+
+    #[test]
+    fn the_serif_family_draws_its_own_face_and_sans_does_not() {
+        let serif = char_fonts("Hg", false, Family::Serif);
+        assert_eq!(serif, vec![FontId::Serif, FontId::Serif]);
+        let bold = char_fonts("Hg", true, Family::Serif);
+        assert_eq!(bold, vec![FontId::SerifBold, FontId::SerifBold]);
+        assert_eq!(
+            char_fonts("Hg", false, Family::Sans),
+            vec![FontId::Latin, FontId::Latin],
+            "control: sans stays in the sans face"
+        );
+        let (a, b) = (bitmap(FontId::Serif, 'H'), bitmap(FontId::Latin, 'H'));
+        let (a, b) = (a.expect("serif H"), b.expect("sans H"));
+        assert!(
+            (a.width, a.height, &a.coverage) != (b.width, b.height, &b.coverage),
+            "serif and sans H paint different shapes"
+        );
+        let again = bitmap(FontId::Serif, 'H').expect("serif H");
+        assert_eq!(
+            (a.width, a.coverage),
+            (again.width, again.coverage),
+            "control: one face twice is the same"
+        );
+    }
+
+    #[test]
+    fn serif_arabic_joins_in_the_serif_face() {
+        let shaped = shape_in("بيت", 30.0, false, Family::Serif);
+        assert!(shaped.glyphs.iter().all(|g| g.font == FontId::Serif));
+        let nominal: Vec<u16> = "بيت"
+            .chars()
+            .filter_map(|c| font_for(FontId::Serif)?.glyph_index(c).map(|g| g.0))
+            .collect();
+        let gids: Vec<u16> = shaped.glyphs.iter().rev().map(|g| g.gid).collect();
+        assert_ne!(gids, nominal, "cursive forms, not the isolated letters");
     }
 }

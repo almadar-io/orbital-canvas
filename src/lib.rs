@@ -82,6 +82,35 @@ pub struct Canvas {
     pub(crate) host: SceneHost,
 }
 
+/// Modifier keys held with a key press.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyMods {
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+    pub meta: bool,
+}
+
+/// What an assistive technology asks of a semantic node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessAction {
+    Focus,
+    Activate,
+    Increment,
+    Decrement,
+}
+
+impl AccessAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Focus => "focus",
+            Self::Activate => "activate",
+            Self::Increment => "increment",
+            Self::Decrement => "decrement",
+        }
+    }
+}
+
 /// A scene host: the mapped canvas scene, its tappable/draggable regions, layout memory, clock and
 /// pointer state. [`Canvas`] wraps one for the mobile surfaces; the desktop clients use it directly
 /// and paint [`SceneHost::frame_packet`] on their own device.
@@ -138,6 +167,9 @@ pub struct SceneHost {
     /// The sizes of the measured texts at the latest layout, and the list last sent as `measureEvent`.
     pub(crate) measured: Vec<mappers::scene::Measured>,
     pub(crate) measure_reported: Vec<(String, f32, f32, u32)>,
+    /// The semantic tree of the latest layout, and the size last sent as `resizeEvent`.
+    pub(crate) semantic: Vec<mappers::scene::SemanticNode>,
+    pub(crate) resize_reported: Option<(f32, f32)>,
     /// The region under the pointer, the region holding a press, and the last pointer position.
     pub(crate) hovered: Option<String>,
     pub(crate) captured: Option<String>,
@@ -292,6 +324,8 @@ impl SceneHost {
             pointer_regions: Vec::new(),
             measured: Vec::new(),
             measure_reported: Vec::new(),
+            semantic: Vec::new(),
+            resize_reported: None,
             hovered: None,
             captured: None,
             pointer: None,
@@ -419,7 +453,76 @@ impl SceneHost {
         self.pannable = mapped.pannable;
         self.pointer_regions = mapped.pointer_regions;
         self.measured = mapped.measured;
+        self.semantic = mapped.semantic_nodes;
         self.report_measured();
+        self.report_resize();
+    }
+
+    /// The prop `name` of the current canvas node, when it declares it.
+    fn canvas_event(&self, name: &str) -> Option<String> {
+        self.scene.as_ref().and_then(|node| {
+            node.get("props")
+                .unwrap_or(node)
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+    }
+
+    fn queue_canvas_event(&mut self, name: &str, payload: serde_json::Value) {
+        if let Some(event) = self.canvas_event(name) {
+            self.scene_events.push(mappers::scene::Emit {
+                event,
+                arg: String::new(),
+                payload,
+            });
+        }
+    }
+
+    /// Queue one `resizeEvent` (CSS pixels) when the size differs from the one last sent.
+    fn report_resize(&mut self) {
+        let Some((w, h)) = self.viewport else { return };
+        let size = (w as f32 / self.density, h as f32 / self.density);
+        if self.resize_reported == Some(size) || self.canvas_event("resizeEvent").is_none() {
+            return;
+        }
+        self.queue_canvas_event(
+            "resizeEvent",
+            serde_json::json!({ "width": size.0, "height": size.1 }),
+        );
+        self.resize_reported = Some(size);
+    }
+
+    /// The semantic tree of the current scene, in reading order.
+    pub fn semantic_tree(&self) -> &[mappers::scene::SemanticNode] {
+        &self.semantic
+    }
+
+    /// Text for the focused text field (`composing`: the input method's preedit).
+    pub fn text_input(&mut self, target: &str, text: &str, composing: bool) {
+        self.queue_canvas_event(
+            "textInputEvent",
+            serde_json::json!({ "target": target, "text": text, "composing": composing }),
+        );
+    }
+
+    /// An editing key for the focused text field.
+    pub fn key_input(&mut self, target: &str, key: &str, mods: KeyMods) {
+        self.queue_canvas_event(
+            "keyEvent",
+            serde_json::json!({
+                "target": target, "key": key,
+                "shift": mods.shift, "alt": mods.alt, "ctrl": mods.ctrl, "meta": mods.meta,
+            }),
+        );
+    }
+
+    /// An assistive technology acted on a node of the semantic tree.
+    pub fn access_action(&mut self, target: &str, action: AccessAction) {
+        self.queue_canvas_event(
+            "accessEvent",
+            serde_json::json!({ "target": target, "action": action.as_str() }),
+        );
     }
 
     /// Queue one `measureEvent` when the measured sizes differ from the list last reported.
@@ -1401,6 +1504,92 @@ mod tests {
         r.measured = vec![measured("t", 80.0)];
         r.report_measured();
         assert!(events(&mut r).is_empty());
+    }
+
+    fn host_with(props: serde_json::Value) -> SceneHost {
+        let mut r = SceneHost::new();
+        let mut node = serde_json::json!({"type": "canvas", "mode": "2d", "projection": "free", "scale": 1.0, "drawables": []});
+        for (k, v) in props.as_object().unwrap() {
+            node[k] = v.clone();
+        }
+        r.set_scene(node).unwrap();
+        r
+    }
+
+    fn sem_scene(ids: &[&str]) -> serde_json::Value {
+        let drawables: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| serde_json::json!({"type": "draw-shape", "id": id, "shape": "rect",
+                "position": {"x": 0, "y": 0}, "width": 10, "height": 10, "fill": "#ff0000",
+                "semantic": {"role": "button", "name": id}}))
+            .collect();
+        serde_json::json!({"type": "canvas", "mode": "2d", "projection": "free", "scale": 1.0, "drawables": drawables})
+    }
+
+    #[test]
+    fn declared_input_events_are_queued_with_their_payload() {
+        let mut r = host_with(serde_json::json!({
+            "textInputEvent": "TXT", "keyEvent": "KEY", "accessEvent": "ACC"}));
+        r.text_input("f", "hi", true);
+        r.key_input("f", "Backspace", KeyMods { shift: true, ..KeyMods::default() });
+        r.access_action("b", AccessAction::Increment);
+        let sent = r.take_scene_events();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[0].event, "TXT");
+        assert_eq!(sent[0].payload, serde_json::json!({"target": "f", "text": "hi", "composing": true}));
+        assert_eq!(sent[1].event, "KEY");
+        assert_eq!(
+            sent[1].payload,
+            serde_json::json!({"target": "f", "key": "Backspace", "shift": true, "alt": false, "ctrl": false, "meta": false})
+        );
+        assert_eq!(sent[2].event, "ACC");
+        assert_eq!(sent[2].payload, serde_json::json!({"target": "b", "action": "increment"}));
+    }
+
+    #[test]
+    fn undeclared_input_events_send_nothing() {
+        let mut r = host_with(serde_json::json!({"keyEvent": "KEY"}));
+        r.text_input("f", "hi", false);
+        r.access_action("b", AccessAction::Focus);
+        assert!(events(&mut r).is_empty());
+        r.key_input("f", "a", KeyMods::default());
+        assert_eq!(events(&mut r), vec!["KEY"], "only the declared one");
+    }
+
+    #[test]
+    fn resize_is_sent_once_per_size_in_css_pixels() {
+        let mut r = host_with(serde_json::json!({"resizeEvent": "RESIZED"}));
+        r.set_scale(2.0).unwrap();
+        r.take_scene_events();
+        r.set_viewport(800, 600);
+        let sent = r.take_scene_events();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].event, "RESIZED");
+        assert_eq!(sent[0].payload, serde_json::json!({"width": 400.0, "height": 300.0}));
+        r.set_viewport(800, 600);
+        assert!(events(&mut r).is_empty(), "same size: nothing");
+        r.set_viewport(1000, 600);
+        assert_eq!(events(&mut r), vec!["RESIZED"], "new size: sent again");
+    }
+
+    #[test]
+    fn resize_without_a_resize_event_sends_nothing() {
+        let mut r = host_with(serde_json::json!({}));
+        r.set_viewport(800, 600);
+        assert!(events(&mut r).is_empty());
+    }
+
+    #[test]
+    fn the_semantic_tree_follows_relayouts() {
+        let mut r = SceneHost::new();
+        r.set_scene(sem_scene(&["a", "b"])).unwrap();
+        let ids: Vec<&str> = r.semantic_tree().iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+        r.set_scene(sem_scene(&["b", "c"])).unwrap();
+        let ids: Vec<&str> = r.semantic_tree().iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "c"]);
+        r.set_scene(sem_scene(&[])).unwrap();
+        assert!(r.semantic_tree().is_empty());
     }
 
     fn sprung(width: f64, stiffness: f64) -> serde_json::Value {

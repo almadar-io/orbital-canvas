@@ -3,7 +3,7 @@
 //! taps, drags and pan/zoom exactly as native shells keep them.
 
 use crate::web3d::open_canvas;
-use crate::{SceneHost, SharedDeviceRenderer};
+use crate::{AccessAction, KeyMods, SceneHost, SharedDeviceRenderer};
 use std::sync::Arc;
 
 pub struct WebSceneCanvas {
@@ -62,10 +62,12 @@ impl WebSceneCanvas {
         self.host.set_motion(enabled);
     }
 
-    /// Advances the scene clock to `now_ms`; true while the host should keep drawing (an animated scene or
-    /// assets still landing).
-    pub fn frame(&mut self, now_ms: f64) -> bool {
+    /// Advances the scene clock to `now_ms` (`performance.now()`) with the page's `epoch_ms`
+    /// (`performance.timeOrigin + now`); true while the host should keep drawing (an animated scene or assets
+    /// still landing).
+    pub fn frame(&mut self, now_ms: f64, epoch_ms: f64) -> bool {
         self.host.set_clock(now_ms);
+        self.host.set_epoch_clock(epoch_ms);
         self.host.refresh_assets();
         self.host.wants_frames()
     }
@@ -96,6 +98,80 @@ impl WebSceneCanvas {
 
     pub fn double_tap(&mut self, x: f32, y: f32) {
         self.host.double_tap(x, y);
+    }
+
+    /// The semantic tree as a JSON array in reading order, each node's rect in CSS pixels.
+    pub fn semantic_tree(&self) -> String {
+        let nodes: Vec<serde_json::Value> = self
+            .host
+            .semantic_tree()
+            .iter()
+            .map(|n| {
+                let mut o = serde_json::Map::new();
+                o.insert("id".into(), n.id.clone().into());
+                o.insert("role".into(), n.role.clone().into());
+                o.insert("name".into(), n.name.clone().into());
+                if let Some(v) = &n.value {
+                    o.insert("value".into(), v.clone().into());
+                }
+                if let Some(c) = n.checked {
+                    o.insert("checked".into(), c.into());
+                }
+                o.insert("disabled".into(), n.disabled.into());
+                o.insert("focused".into(), n.focused.into());
+                if let Some(c) = n.caret {
+                    o.insert("caret".into(), c.into());
+                }
+                if let Some(c) = n.selection_start {
+                    o.insert("selectionStart".into(), c.into());
+                }
+                if let Some(c) = n.selection_end {
+                    o.insert("selectionEnd".into(), c.into());
+                }
+                o.insert("multiline".into(), n.multiline.into());
+                o.insert("order".into(), serde_json::json!(n.order));
+                o.insert(
+                    "rect".into(),
+                    serde_json::json!({
+                        "x": n.rect.x, "y": n.rect.y, "w": n.rect.w, "h": n.rect.h
+                    }),
+                );
+                serde_json::Value::Object(o)
+            })
+            .collect();
+        serde_json::Value::Array(nodes).to_string()
+    }
+
+    /// Text for the focused text field: committed (`composing` false) or the input method's preedit.
+    pub fn text_input(&mut self, target: &str, text: &str, composing: bool) {
+        self.host.text_input(target, text, composing);
+    }
+
+    /// An editing key (a DOM `KeyboardEvent.key`) for the focused text field.
+    pub fn key_input(
+        &mut self,
+        target: &str,
+        key: &str,
+        shift: bool,
+        alt: bool,
+        ctrl: bool,
+        meta: bool,
+    ) {
+        self.host
+            .key_input(target, key, KeyMods { shift, alt, ctrl, meta });
+    }
+
+    /// An assistive technology acted on a node: `focus`, `activate`, `increment` or `decrement`.
+    pub fn access_action(&mut self, target: &str, action: &str) -> Result<(), String> {
+        let action = match action {
+            "focus" => AccessAction::Focus,
+            "activate" => AccessAction::Activate,
+            "increment" => AccessAction::Increment,
+            "decrement" => AccessAction::Decrement,
+            other => return Err(format!("unknown access action `{other}`")),
+        };
+        self.host.access_action(target, action);
+        Ok(())
     }
 
     /// The scene events taps and drags queued, each `{ event, payload }`.
