@@ -2134,7 +2134,8 @@ mod integration_tests {
         }
     }
 
-    const PAINT_A: &str = "fn shade(px: Pixel) -> vec4<f32> { return vec4<f32>(px.a.rgb, px.a.a); }";
+    const PAINT_A: &str =
+        "fn shade(px: Pixel) -> vec4<f32> { return vec4<f32>(px.a.rgb, px.a.a); }";
 
     #[test]
     fn a_shader_material_colours_its_surface_with_the_programs_wgsl() {
@@ -2143,7 +2144,11 @@ mod integration_tests {
         let plane = instance(geometry::plane(2.0, 2.0).unwrap(), Mat4::IDENTITY, red);
         let rgba = draw(&mut r, &scene(vec![plane]));
         assert_eq!(pixel(&rgba, SIZE / 2, SIZE / 2), [255, 0, 0, 255]);
-        assert_eq!(pixel(&rgba, 2, 2), [0, 0, 0, 255], "control: nothing outside the plane");
+        assert_eq!(
+            pixel(&rgba, 2, 2),
+            [0, 0, 0, 255],
+            "control: nothing outside the plane"
+        );
     }
 
     #[test]
@@ -2186,7 +2191,11 @@ mod integration_tests {
         let later = draw(&mut r, &at(1.0));
         assert_eq!(pixel(&start, SIZE / 2 + 5, SIZE / 2), [0, 255, 0, 255]);
         assert_eq!(pixel(&later, SIZE / 2 + 5, SIZE / 2), [255, 255, 0, 255]);
-        assert_eq!(pixel(&later, SIZE / 2 - 5, SIZE / 2), [255, 0, 0, 255], "the mesh's left half");
+        assert_eq!(
+            pixel(&later, SIZE / 2 - 5, SIZE / 2),
+            [255, 0, 0, 255],
+            "the mesh's left half"
+        );
     }
 
     #[test]
@@ -2204,10 +2213,17 @@ mod integration_tests {
                 shaded(PAINT_A, [0.0, 0.0, 1.0, 1.0], blend),
             )
         };
-        let added = draw(&mut r, &scene(vec![behind.clone(), glow(ShaderBlend::Additive)]));
+        let added = draw(
+            &mut r,
+            &scene(vec![behind.clone(), glow(ShaderBlend::Additive)]),
+        );
         let over = draw(&mut r, &scene(vec![behind, glow(ShaderBlend::Opaque)]));
         assert_eq!(pixel(&added, SIZE / 2, SIZE / 2), [255, 0, 255, 255]);
-        assert_eq!(pixel(&over, SIZE / 2, SIZE / 2), [0, 0, 255, 255], "control: opaque covers");
+        assert_eq!(
+            pixel(&over, SIZE / 2, SIZE / 2),
+            [0, 0, 255, 255],
+            "control: opaque covers"
+        );
     }
 
     #[test]

@@ -74,6 +74,7 @@ pub fn from_props(props: &serde_json::Value) -> GameRenderPacket {
         draw_event: None,
         fps: None,
         animations: Vec::new(),
+        ..Default::default()
     }
 }
 

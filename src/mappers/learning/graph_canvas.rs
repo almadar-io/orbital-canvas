@@ -1468,6 +1468,7 @@ pub fn map_with(
         drags,
         double_hits,
         pannable: interactive,
+        ..MappedScene::default()
     })
 }
 

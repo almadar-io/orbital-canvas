@@ -90,10 +90,12 @@ pub struct PlotAxes {
 
 impl Projector {
     pub fn new(scale: f32, base_offset_x: f32, layout: Projection) -> Projector {
+        // `free` is world-pixel-direct: a cell is one pixel, as the web projector has it.
+        let free = layout == Projection::Free;
         Projector {
-            tile_width: TILE_WIDTH * scale,
-            floor_height: FLOOR_HEIGHT * scale,
-            diamond_top_y: DIAMOND_TOP_Y * scale,
+            tile_width: if free { 1.0 } else { TILE_WIDTH * scale },
+            floor_height: if free { 1.0 } else { FLOOR_HEIGHT * scale },
+            diamond_top_y: if free { 0.0 } else { DIAMOND_TOP_Y * scale },
             scale,
             base_offset_x,
             layout,
@@ -250,6 +252,16 @@ mod tests {
         let (x, y) = p.project(ScenePos { x: 1.0, y: 1.0 });
         close(x, 256.0 + 128.0);
         close(y, 96.0);
+    }
+
+    #[test]
+    fn a_free_cell_is_one_pixel_as_on_the_web_and_a_flat_cell_stays_a_scaled_tile() {
+        let free = Projector::new(0.4, 0.0, Projection::Free);
+        close(free.tile_width, 1.0);
+        close(free.floor_height, 1.0);
+        close(free.diamond_top_y, 0.0);
+        let flat = Projector::new(0.4, 0.0, Projection::Flat);
+        close(flat.tile_width, TILE_WIDTH * 0.4);
     }
 
     #[test]

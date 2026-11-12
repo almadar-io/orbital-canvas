@@ -39,6 +39,12 @@ pub struct GameRenderPacket {
     /// rest frame. [`GameRenderPacket::resolved`] plays them at a host clock time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub animations: Vec<Animation>,
+    /// The canvas clock at this frame in milliseconds; 2D materials read it as `Pixel.time`.
+    #[serde(default)]
+    pub time_ms: f64,
+    /// The pointer in packet coordinates, absent when it is not over the canvas; 2D materials read it as `Pixel.pointer`.
+    #[serde(default)]
+    pub pointer: Option<Vec2>,
 }
 
 /// CSS timing function between two keyframes.
@@ -103,7 +109,7 @@ pub struct Camera {
 }
 
 /// Axis-aligned rectangle.
-#[derive(Debug, Copy, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,
@@ -112,7 +118,7 @@ pub struct Rect {
 }
 
 /// 2D vector.
-#[derive(Debug, Copy, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Vec2 {
     pub x: f32,
     pub y: f32,
@@ -227,6 +233,55 @@ pub enum FillPattern {
     },
 }
 
+/// Which signed-distance shape an [`DrawCommand::Sdf`] paints inside its `rect`.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SdfKind {
+    /// A rectangle with per-corner radii (`corners`, `corner_kind`).
+    #[default]
+    Rect,
+    /// A stadium: radius is half the shorter side.
+    Capsule,
+    /// A ring segment centred in the rect, radius half the shorter side (`arc`).
+    Arc,
+    /// A regular polygon or star inscribed in the rect (`polygon`).
+    Polygon,
+    Ellipse,
+}
+
+/// Centred stroke of an [`DrawCommand::Sdf`], optionally dashed along the outline.
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SdfStroke {
+    pub color: [f32; 4],
+    pub width: f32,
+    /// On and off lengths; zeros are a solid line.
+    #[serde(default)]
+    pub dash: [f32; 2],
+    #[serde(default)]
+    pub dash_offset: f32,
+}
+
+/// Analytic drop shadow of an [`DrawCommand::Sdf`]: its coverage blurred by `sigma` painter pixels, moved by `offset`.
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SdfShadow {
+    pub color: [f32; 4],
+    pub sigma: f32,
+    #[serde(default)]
+    pub offset: Vec2,
+}
+
+/// A 2D material: the program's WGSL (declares `fn shade(px: Pixel) -> vec4<f32>`) and its parameters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SdfMaterial {
+    pub wgsl: String,
+    /// At most 8; `Pixel.a` holds the first four, `Pixel.b` the next four, zero-filled.
+    #[serde(default)]
+    pub params: Vec<f32>,
+    /// The material reads `Pixel.time`: the host asks for a frame every tick.
+    #[serde(default)]
+    pub live: bool,
+}
+
 /// One path operation. Angles are radians in screen convention (0 = +x,
 /// increasing clockwise because y points down); an `Arc` sweeps from `start`
 /// to `end` in the direction of the difference, a full ellipse when it spans
@@ -333,6 +388,35 @@ pub enum DrawCommand {
         /// Draw in the monospace face (the theme's `mono` label font).
         #[serde(default)]
         mono: bool,
+    },
+    /// One signed-distance shape drawn by the SDF pass in z-order with the other commands: anti-aliased by the
+    /// distance's screen derivative, stroke centred on the edge, shadow blurred analytically. `corners` run top-left,
+    /// top-right, bottom-right, bottom-left in px; `corner_kind` is 0 round, 1 bevel, 2 notch, 3 scoop; `arc` is
+    /// start and sweep in radians and thickness in px; `polygon` is the side count and the star ratio. `rotation`
+    /// turns the shape about the centre of `rect`. With a `material`, its `shade` provides the fill.
+    Sdf {
+        /// Serialized as `shape`: the enum's own tag already names this object `kind`.
+        #[serde(rename = "shape")]
+        kind: SdfKind,
+        rect: Rect,
+        #[serde(default)]
+        corners: [f32; 4],
+        #[serde(default)]
+        corner_kind: u32,
+        #[serde(default)]
+        arc: [f32; 3],
+        #[serde(default)]
+        polygon: [f32; 2],
+        fill: [f32; 4],
+        #[serde(default)]
+        stroke: Option<SdfStroke>,
+        #[serde(default)]
+        shadow: Option<SdfShadow>,
+        #[serde(default)]
+        rotation: f32,
+        opacity: f32,
+        #[serde(default)]
+        material: Option<SdfMaterial>,
     },
     /// Draw a vector path: filled, stroked, or both (fill first). Rasterized
     /// anti-aliased in the vector layer.

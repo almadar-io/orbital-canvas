@@ -148,7 +148,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_surface_is_created_on_the_open_slot_instance_and_opens_a_fresh_one_only_when_the_slot_is_empty() {
+    fn a_surface_is_created_on_the_open_slot_instance_and_opens_a_fresh_one_only_when_the_slot_is_empty(
+    ) {
         let Ok(opened) = shared_device() else {
             eprintln!("no GPU adapter on this host; the slot cannot open");
             return;

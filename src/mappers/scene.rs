@@ -98,6 +98,35 @@ pub struct Drag {
     pub pin: bool,
 }
 
+/// The events a pointer region sends, each naming the trait event it dispatches (the canvas's `pointer*Event` props).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PointerEvents {
+    pub down: Option<String>,
+    pub up: Option<String>,
+    pub enter: Option<String>,
+    pub leave: Option<String>,
+    pub moved: Option<String>,
+}
+
+/// A drawable with `id` and `hit: true`: its painted bounds in packet coordinates and its rotation in radians about
+/// their centre.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PointerRegion {
+    pub id: String,
+    pub rect: Rect,
+    pub rotation: f32,
+    pub events: PointerEvents,
+}
+
+/// The size of a `draw-text` with `measure: true`, in packet units.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Measured {
+    pub id: String,
+    pub width: f32,
+    pub height: f32,
+    pub lines: u32,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MappedScene {
     pub packet: GameRenderPacket,
@@ -109,6 +138,10 @@ pub struct MappedScene {
     pub double_hits: Vec<Hit>,
     /// A one-finger drag that starts off every drag region pans the view, and a pinch zooms it.
     pub pannable: bool,
+    /// Pointer regions in paint order; the topmost (last) region containing a point wins.
+    pub pointer_regions: Vec<PointerRegion>,
+    /// Every `draw-text` with `measure: true` and an `id`, in paint order.
+    pub measured: Vec<Measured>,
 }
 
 impl MappedScene {
@@ -204,11 +237,32 @@ pub fn map_scene(
     if let Some(pattern) = pattern.filter(|p| diagram::handles(p)) {
         return diagram::map(pattern, &Value::Object(fields.clone()), viewport);
     }
-    let packet = match viewport {
-        Some((w, h)) => game_canvas_2d::from_canvas_node_in_viewport(node, w, h)?,
-        None => game_canvas_2d::from_canvas_node(node)?,
+    let (packet, gathered) = match viewport {
+        Some((w, h)) => game_canvas_2d::from_canvas_node_in_viewport_mapped(node, w, h, 0.0)?,
+        None => game_canvas_2d::from_canvas_node_mapped(node, 0.0)?,
     };
-    Ok(MappedScene::drawn(packet))
+    let event = |key: &str| fields.get(key).and_then(Value::as_str).map(str::to_string);
+    let events = PointerEvents {
+        down: event("pointerDownEvent"),
+        up: event("pointerUpEvent"),
+        enter: event("pointerEnterEvent"),
+        leave: event("pointerLeaveEvent"),
+        moved: event("pointerMoveEvent"),
+    };
+    Ok(MappedScene {
+        pointer_regions: gathered
+            .regions
+            .into_iter()
+            .map(|region| PointerRegion {
+                id: region.id,
+                rect: region.rect,
+                rotation: region.rotation,
+                events: events.clone(),
+            })
+            .collect(),
+        measured: gathered.measured,
+        ..MappedScene::drawn(packet)
+    })
 }
 
 /// A 3D canvas as one [`DrawCommand::Scene3D`](crate::packet::DrawCommand::Scene3D) across the viewport.
@@ -445,5 +499,38 @@ mod tests {
             map_scene(&json!(3), None).unwrap_err(),
             CanvasSceneError::NotAnObject
         );
+    }
+
+    #[test]
+    fn a_canvas_scene_carries_pointer_regions_with_the_canvas_events() {
+        let node = json!({"type": "canvas", "projection": "free", "scale": 1.0,
+        "pointerDownEvent": "DOWN", "pointerMoveEvent": "MOVE",
+        "drawables": [
+            {"type": "draw-shape", "shape": "rect", "id": "r", "hit": true,
+             "position": {"x": 4, "y": 6}, "width": 64, "height": 32, "fill": "#ff0000"},
+            {"type": "draw-shape", "shape": "rect", "id": "plain",
+             "position": {"x": 4, "y": 6}, "width": 64, "height": 32, "fill": "#ff0000"}
+        ]});
+        let mapped = map_scene(&node, Some((200.0, 100.0))).unwrap();
+        assert_eq!(mapped.pointer_regions.len(), 1, "only the hit drawable");
+        let region = &mapped.pointer_regions[0];
+        assert_eq!(region.id, "r");
+        assert_eq!(
+            region.rect,
+            Rect {
+                x: 4.0,
+                y: 6.0,
+                w: 64.0,
+                h: 32.0
+            }
+        );
+        assert_eq!(region.events.down.as_deref(), Some("DOWN"));
+        assert_eq!(region.events.moved.as_deref(), Some("MOVE"));
+        assert_eq!(
+            region.events.enter, None,
+            "control: an unset event stays unset"
+        );
+        let learning = map_scene(&json!({"type": "learning-canvas"}), None).unwrap();
+        assert!(learning.pointer_regions.is_empty() && learning.measured.is_empty());
     }
 }

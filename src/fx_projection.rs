@@ -432,10 +432,20 @@ mod tests {
     #[test]
     fn g_orbital_game_renderer_006_host_defaults_fill_only_what_the_layer_leaves_out() {
         let bare = with_host_defaults(json!({ "items": [] }).as_object().unwrap());
-        assert_eq!((bare["tickMs"].clone(), bare["textColor"].clone()), (json!(500.0), json!("#ffe066")));
+        assert_eq!(
+            (bare["tickMs"].clone(), bare["textColor"].clone()),
+            (json!(500.0), json!("#ffe066"))
+        );
         assert_eq!(bare["fontFamily"], "system-ui, sans-serif");
-        let set = with_host_defaults(json!({ "tickMs": 250, "textColor": "#fff" }).as_object().unwrap());
-        assert_eq!((set["tickMs"].clone(), set["textColor"].clone()), (json!(250), json!("#fff")));
+        let set = with_host_defaults(
+            json!({ "tickMs": 250, "textColor": "#fff" })
+                .as_object()
+                .unwrap(),
+        );
+        assert_eq!(
+            (set["tickMs"].clone(), set["textColor"].clone()),
+            (json!(250), json!("#fff"))
+        );
     }
 
     #[test]

@@ -2,9 +2,7 @@
 //! `Lighting3D`) builds today, rebuilt as a retained scene. Anything the pattern declares that this slice does not draw
 //! is a typed error naming the field, never a silent drop.
 
-use super::game_canvas_2d::{
-    parse_css_color, to_drawable_nodes, CanvasSceneError,
-};
+use super::game_canvas_2d::{parse_css_color, to_drawable_nodes, CanvasSceneError};
 use super::learning::shape::parse_path_data;
 use super::learning::Xf;
 use super::skinned_mesh_2d;
@@ -566,10 +564,10 @@ fn check_canvas_keys(fields: &Fields) -> Result<(), CanvasSceneError> {
             | "pixelsPerUnit" | "showGrid" | "shadows" | "lighting" | "post" => {}
             // Interaction and DOM-wrapper props: they change no pixel of the scene.
             "tileClickEvent" | "unitClickEvent" | "tileHoverEvent" | "tileLeaveEvent"
-            | "featureClickEvent" | "keyMap" | "keyUpMap" | "gestureMap" | "selectedId" | "onSelect"
-            | "onMove" | "selectEvent" | "moveEvent" | "className" | "enter" | "enterDelay"
-            | "skeleton" | "aria-label" | "aria-labelledby" | "aria-describedby" | "aria-live"
-            | "aria-current" | "aria-pressed" | "aria-expanded" | "aria-selected"
+            | "featureClickEvent" | "keyMap" | "keyUpMap" | "gestureMap" | "selectedId"
+            | "onSelect" | "onMove" | "selectEvent" | "moveEvent" | "className" | "enter"
+            | "enterDelay" | "skeleton" | "aria-label" | "aria-labelledby" | "aria-describedby"
+            | "aria-live" | "aria-current" | "aria-pressed" | "aria-expanded" | "aria-selected"
             | "aria-hidden" | "aria-busy" | "role" | "lang" | "dir" | "tabIndex" => {}
             // given their 3D meaning by canvas3d_props (owner ruling 2026-11-06), which validates them
             "isLoading" | "editable" | "showMinimap" | "showCoordinates" | "showTileInfo"
@@ -2770,12 +2768,13 @@ impl Walk<'_> {
         let (em, bold, mono) = match opt_str(f, "font", path)? {
             None => (LABEL_EM, false, false),
             Some(font) => {
-                let (px, weight, mono) = super::game_canvas_2d::parse_text_font(Some(font)).ok_or_else(|| {
-                    bad(
-                        &join(path, "font"),
-                        format!("`{font}` is not a font the bundled faces draw"),
-                    )
-                })?;
+                let (px, weight, mono) = super::game_canvas_2d::parse_text_font(Some(font))
+                    .ok_or_else(|| {
+                        bad(
+                            &join(path, "font"),
+                            format!("`{font}` is not a font the bundled faces draw"),
+                        )
+                    })?;
                 (
                     (f64::from(px) * place.cell / f64::from(TILE_WIDTH)) as f32,
                     weight >= 600,
@@ -3235,12 +3234,10 @@ fn material(
     let shader = if matches!(kind, MaterialKind::Shader) {
         let wgsl = match opt_str(m, "wgsl", path)? {
             Some(code) if !code.trim().is_empty() => code,
-            _ => {
-                return Err(bad(
-                    &join(path, "wgsl"),
-                    "a shader material needs its WGSL, declaring `fn shade(px: Pixel) -> vec4<f32>`",
-                ))
-            }
+            _ => return Err(bad(
+                &join(path, "wgsl"),
+                "a shader material needs its WGSL, declaring `fn shade(px: Pixel) -> vec4<f32>`",
+            )),
         };
         crate::scene3d::render::check_surface(wgsl).map_err(|e| bad(&join(path, "wgsl"), e))?;
         let uniforms = opt_object(m, "uniforms", path)?;
@@ -3266,7 +3263,12 @@ fn material(
             None | Some("opaque") => ShaderBlend::Opaque,
             Some("alpha") => ShaderBlend::Alpha,
             Some("additive") => ShaderBlend::Additive,
-            Some(_) => return Err(bad(&join(path, "blend"), "must be opaque, alpha or additive")),
+            Some(_) => {
+                return Err(bad(
+                    &join(path, "blend"),
+                    "must be opaque, alpha or additive",
+                ))
+            }
         };
         Some(SurfaceShader {
             wgsl: wgsl.to_owned(),
@@ -3879,33 +3881,57 @@ mod tests {
                 blend: ShaderBlend::Additive,
             })
         );
-        assert!(mapped.animated, "a shader may read the clock, so the canvas keeps drawing");
+        assert!(
+            mapped.animated,
+            "a shader may read the clock, so the canvas keeps drawing"
+        );
     }
 
     #[test]
     fn a_shader_material_reads_the_canvas_clock_in_seconds() {
-        let at = scene_at(shader_mesh(json!({"kind": "shader", "wgsl": SHADE})), 2500.0).expect("a scene");
+        let at = scene_at(
+            shader_mesh(json!({"kind": "shader", "wgsl": SHADE})),
+            2500.0,
+        )
+        .expect("a scene");
         assert_eq!(at.time, 2.5);
         let plain = scene_at(shader_mesh(json!({"kind": "standard"})), 2500.0).expect("a scene");
-        assert_eq!(plain.time, 0.0, "control: without a shader the scene does not carry the clock");
+        assert_eq!(
+            plain.time, 0.0,
+            "control: without a shader the scene does not carry the clock"
+        );
     }
 
     #[test]
-    fn a_shader_material_is_refused_without_wgsl_with_wgsl_that_does_not_check_or_with_a_bad_vector() {
-        assert!(message(scene(shader_mesh(json!({"kind": "shader"})))).starts_with("drawables[0].material.wgsl: "));
-        assert!(message(scene(shader_mesh(json!({"kind": "shader", "wgsl": "fn shade(px: Pixel) -> vec4<f32> { return 1.0; }"}))))
+    fn a_shader_material_is_refused_without_wgsl_with_wgsl_that_does_not_check_or_with_a_bad_vector(
+    ) {
+        assert!(message(scene(shader_mesh(json!({"kind": "shader"}))))
             .starts_with("drawables[0].material.wgsl: "));
-        assert!(message(scene(shader_mesh(json!({"kind": "shader", "wgsl": SHADE, "uniforms": {"a": [1, 2, 3]}}))))
-            .starts_with("drawables[0].material.uniforms.a: "));
-        assert!(message(scene(shader_mesh(json!({"kind": "shader", "wgsl": SHADE, "blend": "screen"}))))
-            .starts_with("drawables[0].material.blend: "));
+        assert!(message(scene(shader_mesh(
+            json!({"kind": "shader", "wgsl": "fn shade(px: Pixel) -> vec4<f32> { return 1.0; }"})
+        )))
+        .starts_with("drawables[0].material.wgsl: "));
+        assert!(message(scene(shader_mesh(
+            json!({"kind": "shader", "wgsl": SHADE, "uniforms": {"a": [1, 2, 3]}})
+        )))
+        .starts_with("drawables[0].material.uniforms.a: "));
+        assert!(message(scene(shader_mesh(
+            json!({"kind": "shader", "wgsl": SHADE, "blend": "screen"})
+        )))
+        .starts_with("drawables[0].material.blend: "));
     }
 
     #[test]
     fn control_another_material_kind_does_not_take_wgsl() {
-        assert!(message(scene(shader_mesh(json!({"kind": "standard", "wgsl": SHADE}))))
-            .starts_with("drawables[0].material.wgsl: "));
-        assert!(!scene(shader_mesh(json!({"kind": "standard"}))).expect("a scene").animated);
+        assert!(message(scene(shader_mesh(
+            json!({"kind": "standard", "wgsl": SHADE})
+        )))
+        .starts_with("drawables[0].material.wgsl: "));
+        assert!(
+            !scene(shader_mesh(json!({"kind": "standard"})))
+                .expect("a scene")
+                .animated
+        );
     }
 
     #[test]
@@ -3917,7 +3943,10 @@ mod tests {
 
     #[test]
     fn control_an_undeclared_prop_is_still_refused_by_name() {
-        assert!(message(scene(json!({"gestureMaps": {"WheelDown": "NEXT"}}))).starts_with("canvas.gestureMaps"));
+        assert!(
+            message(scene(json!({"gestureMaps": {"WheelDown": "NEXT"}})))
+                .starts_with("canvas.gestureMaps")
+        );
     }
 
     fn pulsing_box(animation: Value) -> Value {

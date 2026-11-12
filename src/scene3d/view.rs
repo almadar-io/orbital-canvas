@@ -561,7 +561,8 @@ impl Scene3DView {
                 continue;
             };
             let model = Mat4::from_cols_array(&mesh.transform);
-            let billboard = matches!(mesh.material.kind, MaterialKind::Flat(flat) if flat.billboard);
+            let billboard =
+                matches!(mesh.material.kind, MaterialKind::Flat(flat) if flat.billboard);
             let (origin, sx, sy) = (
                 model.w_axis.truncate(),
                 model.x_axis.truncate().length(),
@@ -982,7 +983,11 @@ mod tests {
             v.pick(x, y, true, false)
         };
         assert!(matches!(pick_at_sign(true), Some(Pick::Unit { ref id, .. }) if id == "sign"));
-        assert_eq!(pick_at_sign(false), None, "control: an unturned quad is edge-on from the side");
+        assert_eq!(
+            pick_at_sign(false),
+            None,
+            "control: an unturned quad is edge-on from the side"
+        );
     }
 
     #[test]

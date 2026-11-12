@@ -18,7 +18,9 @@ pub mod platform;
 pub mod projector;
 pub mod renderer;
 pub mod scene3d;
+pub(crate) mod sdf;
 pub mod skinning_2d;
+pub mod spring;
 pub mod svg;
 #[cfg(feature = "system-fonts")]
 pub mod system_fonts;
@@ -129,10 +131,32 @@ pub struct SceneHost {
     pub(crate) view3d: Option<scene3d::Scene3DView>,
     /// Whether the 3D camera moved on the last clock tick (damping or follow easing still running).
     pub(crate) view3d_moving: bool,
+    /// Springs of the current scene's drawables; the host maps the scene as they display it.
+    pub(crate) springs: spring::SpringBank,
+    /// Pointer regions of the current scene (draw order), in logical points.
+    pub(crate) pointer_regions: Vec<mappers::scene::PointerRegion>,
+    /// The sizes of the measured texts at the latest layout, and the list last sent as `measureEvent`.
+    pub(crate) measured: Vec<mappers::scene::Measured>,
+    pub(crate) measure_reported: Vec<(String, f32, f32, u32)>,
+    /// The region under the pointer, the region holding a press, and the last pointer position.
+    pub(crate) hovered: Option<String>,
+    pub(crate) captured: Option<String>,
+    pub(crate) pointer: Option<(f32, f32)>,
+    /// Whether a drawable paints a material that reads the clock.
+    pub(crate) live_material: bool,
 }
 
 fn contains(r: &packet::Rect, x: f32, y: f32) -> bool {
     x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h
+}
+
+fn region_contains(region: &mappers::scene::PointerRegion, x: f32, y: f32) -> bool {
+    let r = &region.rect;
+    let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
+    let (sin, cos) = (-region.rotation).sin_cos();
+    let (dx, dy) = (x - cx, y - cy);
+    let (lx, ly) = (cx + dx * cos - dy * sin, cy + dx * sin + dy * cos);
+    contains(r, lx, ly)
 }
 
 /// A drag in progress: which region, where inside it the pointer grabbed, and whether it has moved.
@@ -264,6 +288,14 @@ impl SceneHost {
             motion: true,
             view3d: None,
             view3d_moving: false,
+            springs: spring::SpringBank::new(),
+            pointer_regions: Vec::new(),
+            measured: Vec::new(),
+            measure_reported: Vec::new(),
+            hovered: None,
+            captured: None,
+            pointer: None,
+            live_material: false,
         }
     }
 
@@ -297,6 +329,10 @@ impl SceneHost {
         self.scene = None;
         self.hits.clear();
         self.drags.clear();
+        self.springs.clear();
+        self.pointer_regions.clear();
+        self.measured.clear();
+        self.live_material = false;
         self.packet = Some(packet);
     }
 
@@ -308,10 +344,20 @@ impl SceneHost {
         node: serde_json::Value,
     ) -> std::result::Result<(), mappers::game_canvas_2d::CanvasSceneError> {
         let generation = asset::generation();
-        let mapped = self.map_scene(&node)?;
+        let mut bank = self.springs.clone();
+        bank.retarget(&node);
+        let previous = std::mem::replace(&mut self.springs, bank);
+        let mapped = match self.map_scene(&node) {
+            Ok(mapped) => mapped,
+            Err(err) => {
+                self.springs = previous;
+                return Err(err);
+            }
+        };
         self.asset_generation = generation;
-        self.install(mapped);
+        self.live_material = spring::has_live_material(&node);
         self.scene = Some(node);
+        self.install(mapped);
         Ok(())
     }
 
@@ -321,8 +367,9 @@ impl SceneHost {
     ) -> std::result::Result<mappers::scene::MappedScene, mappers::game_canvas_2d::CanvasSceneError>
     {
         let density = self.density;
+        let shown = (!self.springs.is_empty()).then(|| self.springs.apply(node));
         mappers::scene::map_scene_with(
-            node,
+            shown.as_ref().unwrap_or(node),
             self.viewport
                 .map(|(w, h)| (w as f32 / density, h as f32 / density)),
             &mut self.memory,
@@ -370,14 +417,55 @@ impl SceneHost {
         self.drags = mapped.drags;
         self.double_hits = mapped.double_hits;
         self.pannable = mapped.pannable;
+        self.pointer_regions = mapped.pointer_regions;
+        self.measured = mapped.measured;
+        self.report_measured();
+    }
+
+    /// Queue one `measureEvent` when the measured sizes differ from the list last reported.
+    fn report_measured(&mut self) {
+        let current: Vec<(String, f32, f32, u32)> = self
+            .measured
+            .iter()
+            .map(|m| (m.id.clone(), m.width, m.height, m.lines))
+            .collect();
+        if current == self.measure_reported {
+            return;
+        }
+        let event = self.scene.as_ref().and_then(|node| {
+            node.get("props")
+                .unwrap_or(node)
+                .get("measureEvent")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+        if let Some(event) = event {
+            let items: Vec<serde_json::Value> = current
+                .iter()
+                .map(|(id, width, height, lines)| {
+                    serde_json::json!({ "id": id, "width": width, "height": height, "lines": lines })
+                })
+                .collect();
+            self.scene_events.push(mappers::scene::Emit {
+                event,
+                arg: String::new(),
+                payload: serde_json::json!({ "items": items }),
+            });
+        }
+        self.measure_reported = current;
     }
 
     /// Hand the renderer the host's frame clock (ms, any monotonic origin) before a `render`. The
     /// first value is scene time zero.
     pub fn set_clock(&mut self, ms: f64) {
+        let first = self.clock_epoch.is_none();
         self.clock_epoch.get_or_insert(ms);
-        let dt = ((ms - self.clock_ms) / 1000.0).max(0.0) as f32;
+        let elapsed = ((ms - self.clock_ms) / 1000.0).max(0.0);
+        let dt = elapsed as f32;
         self.clock_ms = ms;
+        if !first && self.springs.step(elapsed) {
+            self.relayout();
+        }
         if let Some(view) = self.view3d.as_mut() {
             self.view3d_moving = view.advance(dt);
         }
@@ -392,6 +480,11 @@ impl SceneHost {
     /// Whether the host allows motion. Off, every animated scene draws its rest frame.
     pub fn set_motion(&mut self, enabled: bool) {
         self.motion = enabled;
+        let was_settled = self.springs.settled();
+        self.springs.set_motion(enabled);
+        if !was_settled && self.springs.settled() {
+            self.relayout();
+        }
     }
 
     fn scene_time(&self) -> f64 {
@@ -412,6 +505,7 @@ impl SceneHost {
     pub fn wants_frames(&self) -> bool {
         self.view3d_moving
             || self.is_animated()
+            || (self.motion && (!self.springs.settled() || self.live_material))
             || (self.motion
                 && self.epoch_clock_ms > 0.0
                 && self
@@ -447,7 +541,10 @@ impl SceneHost {
                     }
                 };
                 if let Ok(packet) = remapped {
-                    return Some(packet.resolved(self.scene_time(), self.motion).into_owned());
+                    let mut packet = packet.resolved(self.scene_time(), self.motion).into_owned();
+                    packet.time_ms = self.scene_time();
+                    packet.pointer = self.pointer.map(|(x, y)| packet::Vec2 { x, y });
+                    return Some(packet);
                 }
             }
         }
@@ -455,6 +552,8 @@ impl SceneHost {
             .packet
             .as_ref()
             .map(|p| p.resolved(self.scene_time(), self.motion).into_owned())?;
+        packet.time_ms = self.scene_time();
+        packet.pointer = self.pointer.map(|(x, y)| packet::Vec2 { x, y });
         if let Some(camera) = self.view3d.as_ref().and_then(scene3d::Scene3DView::camera) {
             for command in &mut packet.draw_commands {
                 if let DrawCommand::Scene3D { scene } = command {
@@ -557,6 +656,11 @@ impl SceneHost {
         if self.view3d.is_some() {
             return self.input_3d(event_type, x, y, button);
         }
+        if matches!(event_type, "hover" | "leave") {
+            self.pointer_input(event_type, x, y);
+            return true;
+        }
+        self.pointer_input(event_type, x, y);
         match event_type {
             "touch-down" => {
                 self.touch_down = Some((x, y));
@@ -619,6 +723,103 @@ impl SceneHost {
             key: key.map(str::to_owned),
         });
         true
+    }
+
+    fn region_at(&self, x: f32, y: f32) -> Option<&mappers::scene::PointerRegion> {
+        self.pointer_regions
+            .iter()
+            .rev()
+            .find(|r| region_contains(r, x, y))
+    }
+
+    fn emit_pointer(
+        &mut self,
+        id: &str,
+        x: f32,
+        y: f32,
+        pick: fn(&mappers::scene::PointerEvents) -> &Option<String>,
+    ) {
+        let event = self
+            .pointer_regions
+            .iter()
+            .rev()
+            .find(|r| r.id == id)
+            .and_then(|r| pick(&r.events).clone());
+        if let Some(event) = event {
+            self.scene_events.push(mappers::scene::Emit {
+                event,
+                arg: String::new(),
+                // `target`, not `id`: a control payload's `id` seeds the dispatch on that row (client_core extract_entity_id)
+                payload: serde_json::json!({ "target": id, "x": x, "y": y }),
+            });
+        }
+    }
+
+    fn hover_to(&mut self, x: f32, y: f32) {
+        let under = self.region_at(x, y).map(|r| r.id.clone());
+        if under == self.hovered {
+            return;
+        }
+        if let Some(old) = self.hovered.take() {
+            self.emit_pointer(&old, x, y, |e| &e.leave);
+        }
+        if let Some(new) = under {
+            self.emit_pointer(&new, x, y, |e| &e.enter);
+            self.hovered = Some(new);
+        }
+    }
+
+    fn pointer_moved(&mut self, x: f32, y: f32) {
+        self.hover_to(x, y);
+        // `pointerMoves: "captured"` (declared on the canvas) sends a move only while a press holds capture.
+        let captured_only = self.scene.as_ref().is_some_and(|node| {
+            node.get("props")
+                .unwrap_or(node)
+                .get("pointerMoves")
+                .and_then(serde_json::Value::as_str)
+                == Some("captured")
+        });
+        let target = if captured_only {
+            self.captured.clone()
+        } else {
+            self.captured.clone().or_else(|| self.hovered.clone())
+        };
+        if let Some(id) = target {
+            self.emit_pointer(&id, x, y, |e| &e.moved);
+        }
+    }
+
+    /// The pointer-region events (enter, leave, down, up, move) of one input event.
+    fn pointer_input(&mut self, event_type: &str, x: f32, y: f32) {
+        match event_type {
+            "hover" | "touch-move" => {
+                self.pointer = Some((x, y));
+                self.pointer_moved(x, y);
+            }
+            "leave" => {
+                self.pointer = None;
+                if let Some(old) = self.hovered.take() {
+                    self.emit_pointer(&old, x, y, |e| &e.leave);
+                }
+            }
+            "touch-down" => {
+                self.pointer = Some((x, y));
+                self.hover_to(x, y);
+                if let Some(id) = self.region_at(x, y).map(|r| r.id.clone()) {
+                    self.emit_pointer(&id, x, y, |e| &e.down);
+                    self.captured = Some(id);
+                }
+            }
+            "touch-up" => {
+                self.pointer = Some((x, y));
+                if let Some(id) = self.captured.take() {
+                    self.emit_pointer(&id, x, y, |e| &e.up);
+                }
+                self.hover_to(x, y);
+            }
+            "touch-cancel" => self.captured = None,
+            _ => {}
+        }
     }
 
     /// Move the active drag to the pointer: queue each of its move events with the new top-left in
@@ -949,6 +1150,371 @@ mod tests {
         let (x, y) = center_of(&r, "b");
         r.input("long-press", x, y, 0, None);
         assert_eq!(drawn_texts(&r), before);
+    }
+
+    fn region(
+        id: &str,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        rotation: f32,
+    ) -> mappers::scene::PointerRegion {
+        let name = |kind: &str| Some(format!("{kind}_{id}"));
+        mappers::scene::PointerRegion {
+            id: id.to_owned(),
+            rect: packet::Rect { x, y, w, h },
+            rotation,
+            events: mappers::scene::PointerEvents {
+                down: name("DOWN"),
+                up: name("UP"),
+                enter: name("ENTER"),
+                leave: name("LEAVE"),
+                moved: name("MOVE"),
+            },
+        }
+    }
+
+    fn events(r: &mut SceneHost) -> Vec<String> {
+        r.take_scene_events().into_iter().map(|e| e.event).collect()
+    }
+
+    fn pointer_host(regions: Vec<mappers::scene::PointerRegion>) -> SceneHost {
+        let mut r = SceneHost::new();
+        r.pointer_regions = regions;
+        r
+    }
+
+    fn moves_scene(moves: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "canvas", "mode": "2d", "projection": "free", "camera": {"zoom": 1},
+            "pointerMoves": moves, "pointerMoveEvent": "MOVE", "pointerEnterEvent": "ENTER",
+            "pointerDownEvent": "DOWN", "pointerUpEvent": "UP",
+            "drawables": [{"type": "draw-shape", "id": "b", "shape": "rect", "anchor": "top-left",
+                "position": {"x": 0, "y": 0}, "width": 100, "height": 40, "fill": "#000000", "hit": true}]
+        })
+    }
+
+    #[test]
+    fn a_captured_moves_canvas_sends_moves_only_while_a_press_holds_capture() {
+        let mut r = SceneHost::new();
+        r.set_scene(moves_scene("captured")).unwrap();
+        r.input("hover", 10.0, 10.0, 0, None);
+        assert_eq!(events(&mut r), vec!["ENTER"], "hover enters but sends no move");
+        r.input("hover", 20.0, 10.0, 0, None);
+        assert!(events(&mut r).is_empty(), "a hover move is not sent");
+        r.input("touch-down", 20.0, 10.0, 0, None);
+        r.input("touch-move", 30.0, 10.0, 0, None);
+        assert_eq!(events(&mut r), vec!["DOWN", "MOVE"], "a drag sends its moves");
+    }
+
+    #[test]
+    fn control_an_all_moves_canvas_sends_hover_moves_too() {
+        let mut r = SceneHost::new();
+        r.set_scene(moves_scene("all")).unwrap();
+        r.input("hover", 10.0, 10.0, 0, None);
+        r.input("hover", 20.0, 10.0, 0, None);
+        assert_eq!(events(&mut r), vec!["ENTER", "MOVE", "MOVE"]);
+    }
+
+    #[test]
+    fn a_hit_drawable_in_a_free_scene_on_a_retina_surface_answers_css_pixel_input() {
+        let mut r = SceneHost::new();
+        r.set_viewport(1600, 1200);
+        r.set_scale(2.0).unwrap();
+        r.set_scene(serde_json::json!({
+            "type": "canvas", "mode": "2d", "projection": "free", "camera": {"zoom": 1},
+            "pointerEnterEvent": "ENTER", "pointerDownEvent": "DOWN",
+            "drawables": [{"type": "draw-shape", "id": "begin", "shape": "rect", "anchor": "top-left",
+                "position": {"x": 170, "y": 250}, "width": 128, "height": 46, "fill": "#7a4a1c", "hit": true}]
+        }))
+        .unwrap();
+        r.input("hover", 30.0, 30.0, 0, None);
+        assert!(events(&mut r).is_empty(), "control: away from the button");
+        r.input("hover", 234.0, 273.0, 0, None);
+        assert_eq!(events(&mut r), vec!["ENTER"]);
+    }
+
+    #[test]
+    fn hovering_into_a_region_enters_it_and_leaving_the_canvas_leaves_it() {
+        let mut r = pointer_host(vec![region("a", 10.0, 10.0, 100.0, 50.0, 0.0)]);
+        r.input("hover", 500.0, 500.0, 0, None);
+        assert!(events(&mut r).is_empty(), "control: outside any region");
+        r.input("hover", 20.0, 20.0, 0, None);
+        assert_eq!(events(&mut r), vec!["ENTER_a", "MOVE_a"]);
+        r.input("hover", 30.0, 30.0, 0, None);
+        assert_eq!(
+            events(&mut r),
+            vec!["MOVE_a"],
+            "still inside: no second enter"
+        );
+        r.input("leave", 0.0, 0.0, 0, None);
+        assert_eq!(events(&mut r), vec!["LEAVE_a"]);
+        assert!(r.frame_packet().is_none() && r.pointer.is_none());
+    }
+
+    #[test]
+    fn the_topmost_region_takes_enter_and_a_move_to_another_leaves_the_first() {
+        let mut r = pointer_host(vec![
+            region("under", 0.0, 0.0, 100.0, 100.0, 0.0),
+            region("over", 50.0, 50.0, 100.0, 100.0, 0.0),
+        ]);
+        r.input("hover", 10.0, 10.0, 0, None);
+        assert_eq!(events(&mut r), vec!["ENTER_under", "MOVE_under"]);
+        r.input("hover", 60.0, 60.0, 0, None);
+        assert_eq!(
+            events(&mut r),
+            vec!["LEAVE_under", "ENTER_over", "MOVE_over"]
+        );
+    }
+
+    #[test]
+    fn a_region_without_events_produces_none() {
+        let mut bare = region("a", 0.0, 0.0, 100.0, 100.0, 0.0);
+        bare.events = mappers::scene::PointerEvents {
+            down: None,
+            up: None,
+            enter: None,
+            leave: None,
+            moved: None,
+        };
+        let mut r = pointer_host(vec![bare]);
+        r.input("hover", 10.0, 10.0, 0, None);
+        r.input("touch-down", 10.0, 10.0, 0, None);
+        r.input("touch-up", 10.0, 10.0, 0, None);
+        assert!(events(&mut r).is_empty());
+    }
+
+    #[test]
+    fn a_press_captures_the_region_and_its_up_arrives_from_outside() {
+        let mut r = pointer_host(vec![region("a", 0.0, 0.0, 100.0, 100.0, 0.0)]);
+        r.input("touch-down", 10.0, 10.0, 0, None);
+        assert_eq!(events(&mut r), vec!["ENTER_a", "DOWN_a"]);
+        r.input("touch-move", 400.0, 400.0, 0, None);
+        assert_eq!(
+            events(&mut r),
+            vec!["LEAVE_a", "MOVE_a"],
+            "captured: moves follow"
+        );
+        r.input("touch-up", 400.0, 400.0, 0, None);
+        let up = r.take_scene_events();
+        assert_eq!(up.len(), 1);
+        assert_eq!(up[0].event, "UP_a");
+        assert_eq!(
+            up[0].payload,
+            serde_json::json!({ "target": "a", "x": 400.0, "y": 400.0 })
+        );
+        r.input("touch-move", 500.0, 500.0, 0, None);
+        assert!(events(&mut r).is_empty(), "released and outside: no move");
+        r.input("touch-up", 500.0, 500.0, 0, None);
+        assert!(
+            events(&mut r).is_empty(),
+            "control: an up with no capture sends nothing"
+        );
+    }
+
+    #[test]
+    fn a_press_outside_every_region_captures_nothing() {
+        let mut r = pointer_host(vec![region("a", 0.0, 0.0, 100.0, 100.0, 0.0)]);
+        r.input("touch-down", 300.0, 300.0, 0, None);
+        r.input("touch-up", 50.0, 50.0, 0, None);
+        assert_eq!(
+            events(&mut r),
+            vec!["ENTER_a"],
+            "only the hover on the way in"
+        );
+    }
+
+    #[test]
+    fn a_rotated_region_is_hit_by_its_rotated_bounds() {
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let mut r = pointer_host(vec![region("bar", 0.0, 40.0, 100.0, 20.0, quarter)]);
+        r.input("hover", 50.0, 5.0, 0, None);
+        assert_eq!(
+            events(&mut r),
+            vec!["ENTER_bar", "MOVE_bar"],
+            "turned upright: top reached"
+        );
+        r.input("hover", 5.0, 50.0, 0, None);
+        assert_eq!(
+            events(&mut r),
+            vec!["LEAVE_bar"],
+            "its old horizontal extent is empty now"
+        );
+        let mut flat = pointer_host(vec![region("bar", 0.0, 40.0, 100.0, 20.0, 0.0)]);
+        flat.input("hover", 50.0, 5.0, 0, None);
+        assert!(
+            events(&mut flat).is_empty(),
+            "control: unrotated misses the top"
+        );
+    }
+
+    #[test]
+    fn the_frame_carries_the_pointer_and_the_clock() {
+        let mut r = SceneHost::new();
+        r.set_scene(serde_json::json!({"type": "svg-ring", "r": 30}))
+            .unwrap();
+        r.set_clock(100.0);
+        r.set_clock(350.0);
+        r.input("hover", 12.0, 34.0, 0, None);
+        let p = r.frame_packet().unwrap();
+        assert_eq!(p.time_ms, 250.0);
+        let at = p.pointer.unwrap();
+        assert_eq!((at.x, at.y), (12.0, 34.0));
+        r.input("leave", 0.0, 0.0, 0, None);
+        assert!(r.frame_packet().unwrap().pointer.is_none());
+    }
+
+    fn measured(id: &str, width: f32) -> mappers::scene::Measured {
+        mappers::scene::Measured {
+            id: id.to_owned(),
+            width,
+            height: 20.0,
+            lines: 1,
+        }
+    }
+
+    #[test]
+    fn a_changed_measurement_is_reported_once_and_an_unchanged_one_is_not_repeated() {
+        let mut r = SceneHost::new();
+        r.scene = Some(serde_json::json!({"type": "canvas", "measureEvent": "MEASURED"}));
+        r.measured = vec![measured("t", 80.0)];
+        r.report_measured();
+        let sent = r.take_scene_events();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].event, "MEASURED");
+        assert_eq!(
+            sent[0].payload,
+            serde_json::json!({ "items": [{ "id": "t", "width": 80.0, "height": 20.0, "lines": 1 }] })
+        );
+        r.report_measured();
+        assert!(events(&mut r).is_empty(), "unchanged: nothing");
+        r.measured = vec![measured("t", 95.0)];
+        r.report_measured();
+        assert_eq!(events(&mut r), vec!["MEASURED"], "changed: reported again");
+    }
+
+    #[test]
+    fn measurements_without_a_measure_event_send_nothing() {
+        let mut r = SceneHost::new();
+        r.scene = Some(serde_json::json!({"type": "canvas"}));
+        r.measured = vec![measured("t", 80.0)];
+        r.report_measured();
+        assert!(events(&mut r).is_empty());
+    }
+
+    fn sprung(width: f64, stiffness: f64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "canvas", "mode": "2d", "projection": "free", "scale": 1.0,
+            "drawables": [{"type": "draw-shape", "id": "bar", "shape": "rect",
+                "position": {"x": 0, "y": 0}, "width": width, "height": 10, "fill": "#ff0000",
+                "spring": {"stiffness": stiffness, "damping": 26}}]
+        })
+    }
+
+    fn shown_width(r: &SceneHost) -> f64 {
+        r.springs.apply(r.scene().unwrap())["drawables"][0]["width"]
+            .as_f64()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_spring_moves_to_the_new_width_and_settles() {
+        let mut r = SceneHost::new();
+        r.set_scene(sprung(100.0, 170.0)).unwrap();
+        assert!(
+            r.springs.settled() && shown_width(&r) == 100.0,
+            "first scene: no motion"
+        );
+        r.set_scene(sprung(200.0, 170.0)).unwrap();
+        assert!(!r.springs.settled() && r.wants_frames());
+        assert_eq!(shown_width(&r), 100.0, "starts from what was displayed");
+        r.set_clock(0.0);
+        let mut ms = 0.0;
+        while r.wants_frames() && ms < 10_000.0 {
+            ms += 16.0;
+            r.set_clock(ms);
+        }
+        assert!(r.springs.settled());
+        assert_eq!(shown_width(&r), 200.0);
+        // wants_frames also reads the process-wide asset counters other tests move
+        assert!(!r.is_animated() && !r.live_material);
+    }
+
+    #[test]
+    fn a_drawable_without_a_spring_jumps() {
+        let mut r = SceneHost::new();
+        let mut a = sprung(100.0, 170.0);
+        a["drawables"][0].as_object_mut().unwrap().remove("spring");
+        let mut b = sprung(200.0, 170.0);
+        b["drawables"][0].as_object_mut().unwrap().remove("spring");
+        r.set_scene(a).unwrap();
+        r.set_scene(b).unwrap();
+        assert!(r.springs.is_empty() && r.springs.settled() && !r.is_animated());
+    }
+
+    #[test]
+    fn reduced_motion_snaps_a_spring_to_its_target() {
+        let mut r = SceneHost::new();
+        r.set_scene(sprung(100.0, 170.0)).unwrap();
+        r.set_motion(false);
+        r.set_scene(sprung(200.0, 170.0)).unwrap();
+        assert!(r.springs.settled() && shown_width(&r) == 200.0);
+        let mut moving = SceneHost::new();
+        moving.set_scene(sprung(100.0, 170.0)).unwrap();
+        moving.set_scene(sprung(200.0, 170.0)).unwrap();
+        assert!(
+            shown_width(&moving) == 100.0,
+            "control: with motion it lags"
+        );
+        moving.set_motion(false);
+        assert_eq!(
+            shown_width(&moving),
+            200.0,
+            "turning motion off snaps what was in flight"
+        );
+    }
+
+    #[test]
+    fn a_colour_springs_through_rgba() {
+        let mut bank = spring::SpringBank::new();
+        let a = sprung(10.0, 170.0);
+        let mut b = sprung(10.0, 170.0);
+        b["drawables"][0]["fill"] = serde_json::json!("#0000ff");
+        bank.retarget(&a);
+        bank.retarget(&b);
+        bank.step(0.05);
+        let fill = bank.apply(&b)["drawables"][0]["fill"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            fill.starts_with("rgba(") && fill != "rgba(255,0,0,1.000)",
+            "{fill}"
+        );
+        bank.step(30.0);
+        assert_eq!(
+            bank.apply(&b)["drawables"][0]["fill"],
+            "rgba(0,0,255,1.000)"
+        );
+    }
+
+    #[test]
+    fn a_live_material_asks_for_frames_and_a_static_one_does_not() {
+        let scene = |live: bool| {
+            serde_json::json!({
+                "type": "canvas", "mode": "2d", "projection": "free", "scale": 1.0,
+                "drawables": [{"type": "draw-shape", "id": "m", "shape": "rect",
+                    "position": {"x": 0, "y": 0}, "width": 10, "height": 10,
+                    "material": {"wgsl": "fn shade(px: Pixel) -> vec4<f32> { return px.color; }", "params": [], "live": live}}]
+            })
+        };
+        let mut r = SceneHost::new();
+        r.set_scene(scene(true)).unwrap();
+        assert!(r.wants_frames());
+        let mut still = SceneHost::new();
+        still.set_scene(scene(false)).unwrap();
+        assert!(!still.live_material && still.springs.settled(), "control: not live");
     }
 
     #[test]

@@ -16,13 +16,14 @@
 //! whole-image backgrounds (cover-scale used instead). Unknown drawable types
 //! skip silently — React parity (`paintDispatch`).
 
+use super::scene::Measured;
 use crate::asset;
 use crate::atlas;
 use crate::mappers::learning::shape::parse_path_data;
 use crate::mappers::learning::Xf;
 use crate::packet::{
     DrawCommand, FillPattern, GameRenderPacket, Gradient, GradientStop, LineCap, LineJoin,
-    PathSegment, Rect, Stroke, TextAlign, Vec2,
+    PathSegment, Rect, SdfKind, SdfMaterial, SdfShadow, SdfStroke, Stroke, TextAlign, Vec2,
 };
 use crate::projector::{Anchor, Projection, Projector, ScenePos, TILE_WIDTH};
 use serde_json::Value;
@@ -63,6 +64,37 @@ fn fit_zoom(projection: Projection, w: f32, h: f32, vw: f32, vh: f32) -> f32 {
     (vw * 0.85 / board_w).min(vh * 0.85 / board_h)
 }
 
+/// A drawable with `id` and `hit: true`, as a pointer region in packet coordinates: its painted bounds and the
+/// rotation (radians) about their centre.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Region {
+    pub id: String,
+    pub rect: Rect,
+    pub rotation: f32,
+}
+
+/// What the drawable walk gathers besides display commands: regions and measured texts, both in paint order.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Gathered {
+    pub regions: Vec<Region>,
+    pub measured: Vec<Measured>,
+}
+
+fn invalid(field: &str, detail: impl Into<String>) -> CanvasSceneError {
+    CanvasSceneError::InvalidProp {
+        field: field.into(),
+        detail: detail.into(),
+    }
+}
+
+/// The `id` of a drawable that is a pointer region (`hit: true`).
+fn hit_id(node: &Value) -> Option<&str> {
+    node.get("hit")
+        .and_then(Value::as_bool)
+        .filter(|hit| *hit)?;
+    node.get("id").and_then(Value::as_str)
+}
+
 /// Build a display-list packet from `canvas-2d` props (kernel-resolved).
 pub fn from_props(props: &Value) -> Result<GameRenderPacket, CanvasSceneError> {
     from_props_at(props, 0.0)
@@ -74,6 +106,15 @@ pub fn from_props_at(
     props: &Value,
     epoch_now_ms: f64,
 ) -> Result<GameRenderPacket, CanvasSceneError> {
+    from_props_mapped(props, epoch_now_ms).map(|(packet, _)| packet)
+}
+
+/// [`from_props_at`] with the pointer regions and measured texts the walk gathered.
+pub fn from_props_mapped(
+    props: &Value,
+    epoch_now_ms: f64,
+) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
+    let mut gathered = Gathered::default();
     let width = get_f32(props, "width", 800.0);
     let height = get_f32(props, "height", 600.0);
     let scale = get_f32(props, "scale", 0.4);
@@ -177,11 +218,12 @@ pub fn from_props_at(
             &to_screen,
             zoom,
             epoch_now_ms,
+            &mut gathered,
             &mut draw_commands,
         )?;
     }
 
-    Ok(GameRenderPacket {
+    let packet = GameRenderPacket {
         pattern: "canvas-2d".into(),
         width,
         height,
@@ -197,7 +239,10 @@ pub fn from_props_at(
         draw_event: get_string(props, "drawEvent"),
         fps: props.get("fps").and_then(Value::as_u64).map(|f| f as u32),
         animations: Vec::new(),
-    })
+        time_ms: 0.0,
+        pointer: None,
+    };
+    Ok((packet, gathered))
 }
 
 /// Why a `canvas` render-ui node cannot become a 2D display-list packet.
@@ -242,7 +287,15 @@ pub fn from_canvas_node_at(
     node: &Value,
     epoch_now_ms: f64,
 ) -> Result<GameRenderPacket, CanvasSceneError> {
-    canvas_node_props(node).and_then(|props| from_props_at(&Value::Object(props), epoch_now_ms))
+    from_canvas_node_mapped(node, epoch_now_ms).map(|(packet, _)| packet)
+}
+
+/// [`from_canvas_node_at`] with the pointer regions and measured texts.
+pub fn from_canvas_node_mapped(
+    node: &Value,
+    epoch_now_ms: f64,
+) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
+    canvas_node_props(node).and_then(|props| from_props_mapped(&Value::Object(props), epoch_now_ms))
 }
 
 /// [`from_canvas_node`] laid out in the host's own viewport. `Canvas2D.tsx`
@@ -263,10 +316,20 @@ pub fn from_canvas_node_in_viewport_at(
     height: f32,
     epoch_now_ms: f64,
 ) -> Result<GameRenderPacket, CanvasSceneError> {
+    from_canvas_node_in_viewport_mapped(node, width, height, epoch_now_ms).map(|(packet, _)| packet)
+}
+
+/// [`from_canvas_node_in_viewport_at`] with the pointer regions and measured texts.
+pub fn from_canvas_node_in_viewport_mapped(
+    node: &Value,
+    width: f32,
+    height: f32,
+    epoch_now_ms: f64,
+) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
     let mut props = canvas_node_props(node)?;
     props.insert("width".into(), Value::from(width.max(1.0)));
     props.insert("height".into(), Value::from(height.max(1.0)));
-    from_props_at(&Value::Object(props), epoch_now_ms)
+    from_props_mapped(&Value::Object(props), epoch_now_ms)
 }
 
 fn canvas_node_props(node: &Value) -> Result<serde_json::Map<String, Value>, CanvasSceneError> {
@@ -342,12 +405,37 @@ fn walk(
     to_screen: &dyn Fn(f32, f32) -> (f32, f32),
     zoom: f32,
     epoch_now_ms: f64,
+    gathered: &mut Gathered,
     out: &mut Vec<DrawCommand>,
 ) -> Result<(), CanvasSceneError> {
     match node.get("type").and_then(Value::as_str) {
-        Some("draw-sprite") => paint_sprite(node, projector, to_screen, zoom, epoch_now_ms, out)?,
-        Some("draw-shape") => paint_shape(node, projector, to_screen, zoom, epoch_now_ms, out),
-        Some("draw-text") => paint_text(node, projector, to_screen, zoom, out),
+        Some("draw-sprite") => paint_sprite_gathering(
+            node,
+            projector,
+            to_screen,
+            zoom,
+            epoch_now_ms,
+            gathered,
+            out,
+        )?,
+        Some("draw-shape") => paint_shape(
+            node,
+            projector,
+            to_screen,
+            zoom,
+            epoch_now_ms,
+            gathered,
+            out,
+        )?,
+        Some("draw-text") => paint_text(
+            node,
+            projector,
+            to_screen,
+            zoom,
+            epoch_now_ms,
+            gathered,
+            out,
+        )?,
         Some("draw-skinned-mesh") => {
             use super::skinned_mesh_2d::SkinMeshError;
             match super::skinned_mesh_2d::paint(node, projector, to_screen) {
@@ -359,20 +447,52 @@ fn walk(
         }
         Some("draw-sprite-layer") => {
             for item in items(node) {
-                paint_sprite(item, projector, to_screen, zoom, epoch_now_ms, out)?;
+                paint_sprite_gathering(
+                    item,
+                    projector,
+                    to_screen,
+                    zoom,
+                    epoch_now_ms,
+                    gathered,
+                    out,
+                )?;
             }
         }
         Some("draw-shape-layer") => {
             for item in items(node) {
-                paint_shape(item, projector, to_screen, zoom, epoch_now_ms, out);
+                paint_shape(
+                    item,
+                    projector,
+                    to_screen,
+                    zoom,
+                    epoch_now_ms,
+                    gathered,
+                    out,
+                )?;
             }
         }
         Some("draw-text-layer") => {
             for item in items(node) {
-                paint_text(item, projector, to_screen, zoom, out);
+                paint_text(
+                    item,
+                    projector,
+                    to_screen,
+                    zoom,
+                    epoch_now_ms,
+                    gathered,
+                    out,
+                )?;
             }
         }
-        Some("draw-group") => paint_group(node, projector, to_screen, zoom, epoch_now_ms, out)?,
+        Some("draw-group") => paint_group(
+            node,
+            projector,
+            to_screen,
+            zoom,
+            epoch_now_ms,
+            gathered,
+            out,
+        )?,
         Some("draw-fx-layer") => {
             for drawable in crate::fx_projection::expand_layer(
                 node,
@@ -380,7 +500,15 @@ fn walk(
                 "2d",
                 f64::from(projector.tile_width),
             )? {
-                walk(&drawable, projector, to_screen, zoom, epoch_now_ms, out)?;
+                walk(
+                    &drawable,
+                    projector,
+                    to_screen,
+                    zoom,
+                    epoch_now_ms,
+                    gathered,
+                    out,
+                )?;
             }
         }
         _ => {} // unknown types skipped silently — React parity
@@ -399,11 +527,20 @@ pub fn paint_drawables(
     zoom: f32,
 ) -> Result<Vec<DrawCommand>, CanvasSceneError> {
     let mut out = Vec::new();
+    let mut gathered = Gathered::default();
     for node in drawables
         .iter()
         .map(|n| resolve_drawable_colors(n, resolve))
     {
-        walk(&node, projector, to_screen, zoom, 0.0, &mut out)?;
+        walk(
+            &node,
+            projector,
+            to_screen,
+            zoom,
+            0.0,
+            &mut gathered,
+            &mut out,
+        )?;
     }
     Ok(out)
 }
@@ -479,7 +616,7 @@ pub fn has_active_fx(node: &Value) -> bool {
     }
     if matches!(
         node.get("type").and_then(Value::as_str),
-        Some("draw-shape" | "draw-group")
+        Some("draw-shape" | "draw-group" | "draw-text")
     ) && node.get("animation").is_some_and(|animation| {
         animation
             .get("durationMs")
@@ -508,6 +645,7 @@ fn paint_group(
     to_screen: &dyn Fn(f32, f32) -> (f32, f32),
     zoom: f32,
     epoch_now_ms: f64,
+    gathered: &mut Gathered,
     out: &mut Vec<DrawCommand>,
 ) -> Result<(), CanvasSceneError> {
     let Some(position) = node.get("position").and_then(parse_scene_pos) else {
@@ -538,8 +676,30 @@ fn paint_group(
         .unwrap_or(0.0) as f32;
     let radians = get_f32(node, "rotate", 0.0) + rotation_z + animated_number("rotateZ", 0.0);
     let start = out.len();
+    let (region_start, measured_start) = (gathered.regions.len(), gathered.measured.len());
     for child in items(node) {
-        walk(child, projector, to_screen, zoom, epoch_now_ms, out)?;
+        walk(
+            child,
+            projector,
+            to_screen,
+            zoom,
+            epoch_now_ms,
+            gathered,
+            out,
+        )?;
+    }
+    if out[start..]
+        .iter()
+        .any(|cmd| matches!(cmd, DrawCommand::Sdf { .. }))
+    {
+        out.truncate(start);
+        gathered.regions.truncate(region_start);
+        gathered.measured.truncate(measured_start);
+        gap_once(
+            "group-sdf",
+            "draw-group transforming an SDF shape needs the group transform to carry Sdf commands",
+        );
+        return Ok(());
     }
     if radians != 0.0
         && out[start..]
@@ -547,6 +707,8 @@ fn paint_group(
             .any(|cmd| matches!(cmd, DrawCommand::Text { .. }))
     {
         out.truncate(start);
+        gathered.regions.truncate(region_start);
+        gathered.measured.truncate(measured_start);
         gap_once(
             "group-rotated-text",
             "draw-group rotating text needs a vector glyph path",
@@ -576,40 +738,190 @@ fn paint_group(
             commands,
         });
     }
+    let origin = Vec2 {
+        x: zero_x,
+        y: zero_y,
+    };
+    let translation = Vec2 {
+        x: group_x - zero_x,
+        y: group_y - zero_y,
+    };
+    let scale = get_f32(node, "scale", 1.0) * animated_number("scale", 1.0);
+    let opacity = get_f32(node, "opacity", 1.0) * animated_number("opacity", 1.0);
     crate::animate::transform_group_commands(
         &mut out[start..],
-        Vec2 {
-            x: zero_x,
-            y: zero_y,
-        },
-        Vec2 {
-            x: group_x - zero_x,
-            y: group_y - zero_y,
-        },
-        get_f32(node, "scale", 1.0) * animated_number("scale", 1.0),
+        origin,
+        translation,
+        scale,
         radians,
-        get_f32(node, "opacity", 1.0) * animated_number("opacity", 1.0),
+        opacity,
     );
+    // regions ride the group transform as sprites, which turn about their own centre like the group's marks
+    let mut carriers: Vec<DrawCommand> = gathered.regions[region_start..]
+        .iter()
+        .map(|region| DrawCommand::Sprite {
+            texture: String::new(),
+            src: Rect::default(),
+            dst: region.rect,
+            rotation: region.rotation,
+            opacity: 1.0,
+            flip_x: false,
+            flip_y: false,
+        })
+        .collect();
+    crate::animate::transform_group_commands(
+        &mut carriers,
+        origin,
+        translation,
+        scale,
+        radians,
+        1.0,
+    );
+    for (region, carrier) in gathered.regions[region_start..].iter_mut().zip(&carriers) {
+        if let DrawCommand::Sprite { dst, rotation, .. } = carrier {
+            region.rect = *dst;
+            region.rotation = *rotation;
+        }
+    }
+    for entry in &mut gathered.measured[measured_start..] {
+        entry.width *= scale.abs();
+        entry.height *= scale.abs();
+    }
     Ok(())
+}
+
+fn paint_sprite_gathering(
+    node: &Value,
+    projector: &Projector,
+    to_screen: &dyn Fn(f32, f32) -> (f32, f32),
+    zoom: f32,
+    epoch_now_ms: f64,
+    gathered: &mut Gathered,
+    out: &mut Vec<DrawCommand>,
+) -> Result<(), CanvasSceneError> {
+    let start = out.len();
+    paint_sprite(node, projector, to_screen, zoom, epoch_now_ms, out)?;
+    if let Some(id) = hit_id(node) {
+        let placed = out[start..].iter().find_map(|command| match command {
+            DrawCommand::Sprite { dst, rotation, .. } => Some((*dst, *rotation)),
+            _ => None,
+        });
+        if let Some((rect, rotation)) = placed {
+            gathered.regions.push(Region {
+                id: id.to_string(),
+                rect,
+                rotation,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Axis-aligned bounds of the marks a shape painted, in packet coordinates.
+fn commands_bounds(commands: &[DrawCommand]) -> Option<Rect> {
+    let mut bounds: Option<(f32, f32, f32, f32)> = None;
+    let mut add = |x0: f32, y0: f32, x1: f32, y1: f32| {
+        bounds = Some(match bounds {
+            None => (x0, y0, x1, y1),
+            Some((a, b, c, d)) => (a.min(x0), b.min(y0), c.max(x1), d.max(y1)),
+        });
+    };
+    fn walk_commands(commands: &[DrawCommand], add: &mut dyn FnMut(f32, f32, f32, f32)) {
+        for command in commands {
+            match command {
+                DrawCommand::Quad { rect, .. } => {
+                    add(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h)
+                }
+                DrawCommand::Sdf { rect, .. } => {
+                    add(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h)
+                }
+                DrawCommand::Poly { points, .. } => {
+                    for p in points {
+                        add(p.x, p.y, p.x, p.y);
+                    }
+                }
+                DrawCommand::Path { segments, .. }
+                | DrawCommand::GradientPath { segments, .. }
+                | DrawCommand::PatternPath { segments, .. } => {
+                    for segment in segments {
+                        match segment {
+                            PathSegment::MoveTo { x, y } | PathSegment::LineTo { x, y } => {
+                                add(*x, *y, *x, *y)
+                            }
+                            PathSegment::Arc { cx, cy, rx, ry, .. } => {
+                                add(cx - rx, cy - ry, cx + rx, cy + ry)
+                            }
+                            PathSegment::CubicTo {
+                                x1,
+                                y1,
+                                x2,
+                                y2,
+                                x,
+                                y,
+                            } => {
+                                add(*x1, *y1, *x1, *y1);
+                                add(*x2, *y2, *x2, *y2);
+                                add(*x, *y, *x, *y);
+                            }
+                            PathSegment::Close => {}
+                        }
+                    }
+                }
+                DrawCommand::Blurred { command, .. } => {
+                    walk_commands(std::slice::from_ref(command.as_ref()), add)
+                }
+                DrawCommand::AdditiveGroup { commands } => walk_commands(commands, add),
+                _ => {}
+            }
+        }
+    }
+    walk_commands(commands, &mut add);
+    bounds.map(|(x0, y0, x1, y1)| Rect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    })
+}
+
+/// The text with its keyframe `animation` resolved at the paint clock: `opacity`, `offsetX` and `offsetY`.
+fn animated_text(node: &Value, epoch_now_ms: f64) -> Option<Value> {
+    if epoch_now_ms <= 0.0 {
+        return None;
+    }
+    let animation = node.get("animation")?;
+    let mut animated = node.clone();
+    let object = animated.as_object_mut()?;
+    for key in ["opacity", "offsetX", "offsetY"] {
+        if let Some(value) = crate::animate::drawable_track(animation, epoch_now_ms, key) {
+            object.insert(key.to_owned(), value);
+        }
+    }
+    Some(animated)
 }
 
 /// The canvas's 2D text painter maps through the same vector font pipeline as
 /// other Canvas labels. Unsupported CSS fonts/baselines are reported rather
-/// than silently given a different face or anchor.
+/// than silently given a different face or anchor. With a `width` the text is a
+/// paragraph laid out from the top-left of `position` (see [`layout_paragraph`]).
 fn paint_text(
     node: &Value,
     projector: &Projector,
     to_screen: &dyn Fn(f32, f32) -> (f32, f32),
     zoom: f32,
+    epoch_now_ms: f64,
+    gathered: &mut Gathered,
     out: &mut Vec<DrawCommand>,
-) {
+) -> Result<(), CanvasSceneError> {
+    let animated = animated_text(node, epoch_now_ms);
+    let node = animated.as_ref().unwrap_or(node);
     let Some(position) = node.get("position").and_then(parse_scene_pos) else {
         gap_once("text-position", "draw-text without position");
-        return;
+        return Ok(());
     };
     let Some(text) = node.get("text").and_then(Value::as_str) else {
         gap_once("text-value", "draw-text without text");
-        return;
+        return Ok(());
     };
     let Some(mut color) = node
         .get("color")
@@ -617,7 +929,7 @@ fn paint_text(
         .and_then(parse_css_color)
     else {
         gap_once("text-color", "draw-text color is not a supported CSS color");
-        return;
+        return Ok(());
     };
     let (size, weight, mono) = match parse_text_font(node.get("font").and_then(Value::as_str)) {
         Some(font) => font,
@@ -626,7 +938,7 @@ fn paint_text(
                 "text-font",
                 "draw-text CSS font is not carried by the native font pack",
             );
-            return;
+            return Ok(());
         }
     };
     let align = match node.get("align").and_then(Value::as_str).unwrap_or("left") {
@@ -635,9 +947,110 @@ fn paint_text(
         "right" | "end" => TextAlign::Right,
         _ => {
             gap_once("text-align", "draw-text alignment is not supported");
-            return;
+            return Ok(());
         }
     };
+    let size = size * zoom;
+    color[3] *= get_f32(node, "opacity", 1.0);
+    let line_height = match node.get("lineHeight") {
+        None | Some(Value::Null) => 1.3,
+        Some(value) => match value.as_f64() {
+            Some(v) if v.is_finite() && v > 0.0 => v as f32,
+            _ => return Err(invalid("lineHeight", "must be a number above zero")),
+        },
+    };
+    let bold = weight >= 600;
+    let id = node.get("id").and_then(Value::as_str);
+    let measure = node
+        .get("measure")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if let Some(width) = node.get("width").filter(|w| !w.is_null()) {
+        let width = match width.as_f64() {
+            Some(w) if w.is_finite() && w > 0.0 => w as f32 * zoom,
+            _ => return Err(invalid("width", "must be a number above zero")),
+        };
+        let max_lines = match node.get("maxLines") {
+            None | Some(Value::Null) => None,
+            Some(value) => match value.as_u64() {
+                Some(n) if n >= 1 => Some(n as usize),
+                _ => return Err(invalid("maxLines", "must be a whole number of one or more")),
+            },
+        };
+        let wrap = node.get("wrap").and_then(Value::as_bool).unwrap_or(true);
+        let truncate = node
+            .get("truncate")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let (x, y) = projector.anchor_point(position, Anchor::TopLeft);
+        let (sx, sy) = to_screen(
+            x + get_f32(node, "offsetX", 0.0),
+            y + get_f32(node, "offsetY", 0.0),
+        );
+        let paragraph = layout_paragraph(
+            text,
+            size,
+            bold,
+            mono,
+            ParagraphBox {
+                width: width,
+                wrap: wrap,
+                max_lines: max_lines,
+                truncate: truncate,
+            },
+        );
+        let line_px = size * line_height;
+        for (i, line) in paragraph.lines.iter().enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let x = match align {
+                TextAlign::Left => sx,
+                TextAlign::Center => sx + width / 2.0,
+                TextAlign::Right => sx + width,
+            };
+            out.push(DrawCommand::Text {
+                text: line.clone(),
+                pos: Vec2 {
+                    x,
+                    y: sy + (i as f32 + 0.5) * line_px,
+                },
+                size,
+                color,
+                align,
+                weight,
+                halo: None,
+                mono,
+            });
+        }
+        let lines = paragraph.lines.len();
+        let height = lines as f32 * line_px;
+        if let Some(id) = id {
+            if hit_id(node).is_some() {
+                gathered.regions.push(Region {
+                    id: id.to_string(),
+                    rect: Rect {
+                        x: sx,
+                        y: sy,
+                        w: width,
+                        h: height,
+                    },
+                    rotation: 0.0,
+                });
+            }
+            if measure {
+                gathered.measured.push(Measured {
+                    id: id.to_string(),
+                    width: paragraph.widths.iter().copied().fold(0.0, f32::max),
+                    height,
+                    lines: lines as u32,
+                });
+            }
+        }
+        return Ok(());
+    }
+
     let anchor = node
         .get("anchor")
         .and_then(Value::as_str)
@@ -647,10 +1060,9 @@ fn paint_text(
     let x = x + get_f32(node, "offsetX", 0.0);
     let y = y + get_f32(node, "offsetY", 0.0);
     let (sx, sy) = to_screen(x, y);
-    let size = size * zoom;
     let Some((asc, desc)) = crate::vector::text_font_metrics(size) else {
         gap_once("text-face", "native text face is unavailable");
-        return;
+        return Ok(());
     };
     let mid = (asc + desc) / 2.0;
     let sy = match node
@@ -667,10 +1079,41 @@ fn paint_text(
                 "text-baseline",
                 "draw-text baseline is not carried by the native font pack",
             );
-            return;
+            return Ok(());
         }
     };
-    color[3] *= get_f32(node, "opacity", 1.0);
+    if let Some(id) = id {
+        let tracked = hit_id(node).is_some();
+        if tracked || measure {
+            let w = crate::vector::shape(text, size, bold, mono).width;
+            let h = size * line_height;
+            let left = match align {
+                TextAlign::Left => sx,
+                TextAlign::Center => sx - w / 2.0,
+                TextAlign::Right => sx - w,
+            };
+            if tracked {
+                gathered.regions.push(Region {
+                    id: id.to_string(),
+                    rect: Rect {
+                        x: left,
+                        y: sy - h / 2.0,
+                        w,
+                        h,
+                    },
+                    rotation: 0.0,
+                });
+            }
+            if measure {
+                gathered.measured.push(Measured {
+                    id: id.to_string(),
+                    width: w,
+                    height: h,
+                    lines: 1,
+                });
+            }
+        }
+    }
     out.push(DrawCommand::Text {
         text: text.to_owned(),
         pos: Vec2 { x: sx, y: sy },
@@ -681,6 +1124,133 @@ fn paint_text(
         halo: None,
         mono,
     });
+    Ok(())
+}
+
+/// The lines of a paragraph and each line's advance width, in the units of `size`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Paragraph {
+    pub lines: Vec<String>,
+    pub widths: Vec<f32>,
+}
+
+/// Lay `text` out in lines of at most `width`. Line breaks fall at the opportunities of [`break_segments`]; a
+/// segment wider than the line overflows it (or is cut with an ellipsis when `truncate`). `max_lines` keeps the
+/// first lines, the last ending in an ellipsis when `truncate`. Widths come from the shaper's advances.
+/// How a paragraph breaks: its line width and the wrap, line-cap and ellipsis rules.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParagraphBox {
+    pub width: f32,
+    pub wrap: bool,
+    pub max_lines: Option<usize>,
+    pub truncate: bool,
+}
+
+pub(crate) fn layout_paragraph(
+    text: &str,
+    size: f32,
+    bold: bool,
+    mono: bool,
+    frame: ParagraphBox,
+) -> Paragraph {
+    let ParagraphBox {
+        width,
+        wrap,
+        max_lines,
+        truncate,
+    } = frame;
+    let measure = |s: &str| crate::vector::shape(s, size, bold, mono).width;
+    let mut lines: Vec<String> = Vec::new();
+    for hard in text.split('\n') {
+        if !wrap {
+            lines.push(hard.trim_end().to_string());
+            continue;
+        }
+        let mut line = String::new();
+        for segment in break_segments(hard) {
+            let candidate = format!("{line}{segment}");
+            if line.is_empty() || measure(candidate.trim_end()) <= width {
+                line = candidate;
+            } else {
+                lines.push(line.trim_end().to_string());
+                line = segment.to_string();
+            }
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    let mut cut = false;
+    if let Some(max) = max_lines {
+        if lines.len() > max {
+            lines.truncate(max);
+            cut = true;
+        }
+    }
+    if truncate {
+        let last = lines.len().saturating_sub(1);
+        for (i, line) in lines.iter_mut().enumerate() {
+            if (i == last && cut) || measure(line.as_str()) > width {
+                *line = ellipsize(line, width, &measure);
+            }
+        }
+    }
+    let widths = lines.iter().map(|line| measure(line.as_str())).collect();
+    Paragraph { lines, widths }
+}
+
+/// `line` with its tail replaced by an ellipsis so that it fits `width`.
+fn ellipsize(line: &str, width: f32, measure: &dyn Fn(&str) -> f32) -> String {
+    let mut kept: Vec<char> = line.trim_end().chars().collect();
+    loop {
+        let mut candidate: String = kept.iter().collect();
+        candidate.push('\u{2026}');
+        if kept.is_empty() || measure(&candidate) <= width {
+            return candidate;
+        }
+        kept.pop();
+        while kept.last().is_some_and(|c| c.is_whitespace()) {
+            kept.pop();
+        }
+    }
+}
+
+/// Split one hard line into pieces a line may break between: after spaces (UAX 14 LB18, none before a space or
+/// around a no-break space), after a hyphen unless a digit follows (LB21, LB25) or a zero-width space, and between
+/// ideographs, kana and Hangul syllables (LB31).
+fn break_segments(text: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut previous: Option<char> = None;
+    for (i, c) in text.char_indices() {
+        if let Some(p) = previous {
+            if breaks_between(p, c) {
+                segments.push(&text[start..i]);
+                start = i;
+            }
+        }
+        previous = Some(c);
+    }
+    if start < text.len() {
+        segments.push(&text[start..]);
+    }
+    segments
+}
+
+fn is_ideographic(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0x20000..=0x2FFFF)
+}
+
+fn breaks_between(previous: char, next: char) -> bool {
+    if previous == '\u{00A0}' || next == '\u{00A0}' || next.is_whitespace() {
+        return false;
+    }
+    if previous.is_whitespace() || previous == '\u{200B}' {
+        return true;
+    }
+    if matches!(previous, '-' | '\u{2010}' | '\u{2013}') {
+        return !next.is_ascii_digit();
+    }
+    is_ideographic(previous) || is_ideographic(next)
 }
 
 pub(crate) fn parse_text_font(font: Option<&str>) -> Option<(f32, u16, bool)> {
@@ -689,10 +1259,17 @@ pub(crate) fn parse_text_font(font: Option<&str>) -> Option<(f32, u16, bool)> {
     };
     let mut tokens = font.split_whitespace();
     let first = tokens.next()?;
-    let (weight, size) = if first == "bold" {
-        (700, tokens.next()?)
-    } else {
-        (400, first)
+    let (weight, size) = match first {
+        "bold" => (700, tokens.next()?),
+        "normal" => (400, tokens.next()?),
+        numeric if numeric.bytes().all(|b| b.is_ascii_digit()) => {
+            let weight = numeric
+                .parse::<u16>()
+                .ok()
+                .filter(|w| (1..=1000).contains(w))?;
+            (weight, tokens.next()?)
+        }
+        _ => (400, first),
     };
     let size = size.strip_suffix("px")?.parse::<f32>().ok()?;
     if !size.is_finite() || size <= 0.0 {
@@ -1103,13 +1680,358 @@ fn push_styled_path(
     }
 }
 
-/// Project one world shape through the shared Canvas vector commands.
+/// Whether a draw-shape is drawn by the SDF pass: a shape only it draws, or `corners` or a `material`.
+fn is_sdf_shape(node: &Value, shape: &str) -> bool {
+    matches!(shape, "capsule" | "arc" | "polygon")
+        || ["corners", "material"]
+            .iter()
+            .any(|key| node.get(*key).is_some_and(|v| !v.is_null()))
+}
+
+fn number_array(value: &Value, field: &str) -> Result<Vec<f32>, CanvasSceneError> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| invalid(field, "must be an array of numbers"))?;
+    items
+        .iter()
+        .map(|v| {
+            v.as_f64()
+                .filter(|f| f.is_finite())
+                .map(|f| f as f32)
+                .ok_or_else(|| invalid(field, "entries must be finite numbers"))
+        })
+        .collect()
+}
+
+/// Project one draw-shape: the SDF pass takes the shapes that need it, every other shape keeps the vector path.
 fn paint_shape(
     node: &Value,
     projector: &Projector,
     to_screen: &dyn Fn(f32, f32) -> (f32, f32),
     zoom: f32,
     epoch_now_ms: f64,
+    gathered: &mut Gathered,
+    out: &mut Vec<DrawCommand>,
+) -> Result<(), CanvasSceneError> {
+    let sdf = node
+        .get("shape")
+        .and_then(Value::as_str)
+        .is_some_and(|shape| is_sdf_shape(node, shape));
+    if !sdf {
+        paint_vector_shape(
+            node,
+            projector,
+            to_screen,
+            zoom,
+            epoch_now_ms,
+            gathered,
+            out,
+        );
+        return Ok(());
+    }
+    let animated = animated_shape(node, epoch_now_ms);
+    paint_sdf_shape(
+        animated.as_ref().unwrap_or(node),
+        projector,
+        to_screen,
+        zoom,
+        gathered,
+        out,
+    )
+}
+
+fn paint_sdf_shape(
+    node: &Value,
+    projector: &Projector,
+    to_screen: &dyn Fn(f32, f32) -> (f32, f32),
+    zoom: f32,
+    gathered: &mut Gathered,
+    out: &mut Vec<DrawCommand>,
+) -> Result<(), CanvasSceneError> {
+    let shape = node
+        .get("shape")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Some(position) = node.get("position").and_then(parse_scene_pos) else {
+        gap_once("shape-position", "draw-shape without position");
+        return Ok(());
+    };
+    if ["gradient", "strokeGradient", "fillPattern"]
+        .iter()
+        .any(|key| node.get(*key).is_some_and(|v| !v.is_null()))
+        || get_f32(node, "blur", 0.0) > 0.0
+        || node
+            .get("blendMode")
+            .and_then(Value::as_str)
+            .is_some_and(|mode| mode != "source-over")
+    {
+        gap_once(
+            "sdf-style",
+            "an SDF draw-shape carries no gradient, fillPattern, blur or blendMode",
+        );
+        return Ok(());
+    }
+    let kind = match shape {
+        "rect" => SdfKind::Rect,
+        "capsule" => SdfKind::Capsule,
+        "arc" => SdfKind::Arc,
+        "polygon" => SdfKind::Polygon,
+        "ellipse" => SdfKind::Ellipse,
+        other => {
+            return Err(invalid(
+                "shape",
+                format!("`{other}` has no SDF form (rect, capsule, arc, polygon, ellipse)"),
+            ))
+        }
+    };
+    let tw = projector.tile_width;
+    let opacity = get_f32(node, "opacity", 1.0);
+    let mut rect = if kind == SdfKind::Ellipse {
+        let anchor = node
+            .get("anchor")
+            .and_then(Value::as_str)
+            .and_then(Anchor::from_str)
+            .unwrap_or(Anchor::Ground);
+        let (px, py) = projector.anchor_point(position, anchor);
+        let cx = px + get_f32(node, "offsetX", 0.0) * tw;
+        let cy = py + get_f32(node, "offsetY", 0.0) * tw;
+        let rx = get_f32(node, "radiusX", 0.0) * tw;
+        let ry = node
+            .get("radiusY")
+            .and_then(Value::as_f64)
+            .map(|v| v as f32 * tw)
+            .unwrap_or(rx);
+        let (cx, cy) = to_screen(cx, cy);
+        Rect {
+            x: cx - rx * zoom,
+            y: cy - ry * zoom,
+            w: 2.0 * rx * zoom,
+            h: 2.0 * ry * zoom,
+        }
+    } else {
+        let anchor = node
+            .get("anchor")
+            .and_then(Value::as_str)
+            .and_then(Anchor::from_str)
+            .unwrap_or(Anchor::TopLeft);
+        let (px, py) = projector.anchor_point(position, anchor);
+        let x = px + get_f32(node, "offsetX", 0.0) * tw;
+        let y = py + get_f32(node, "offsetY", 0.0) * tw;
+        let (sx, sy) = to_screen(x, y);
+        Rect {
+            x: sx,
+            y: sy,
+            w: get_f32(node, "width", 0.0) * tw * zoom,
+            h: get_f32(node, "height", 0.0) * tw * zoom,
+        }
+    };
+
+    let (corners, corner_kind) = match node.get("corners").filter(|c| !c.is_null()) {
+        None => ([0.0; 4], 0),
+        Some(spec) => {
+            if kind != SdfKind::Rect {
+                return Err(invalid("corners", "corners apply to rect shapes only"));
+            }
+            let radius = number_array(
+                spec.get("radius")
+                    .ok_or_else(|| invalid("corners.radius", "needs four radii"))?,
+                "corners.radius",
+            )?;
+            if radius.len() != 4 || radius.iter().any(|r| *r < 0.0) {
+                return Err(invalid(
+                    "corners.radius",
+                    "needs four radii of zero or more (top-left, top-right, bottom-right, bottom-left)",
+                ));
+            }
+            let corner_kind = match spec.get("kind").and_then(Value::as_str).unwrap_or("round") {
+                "round" => 0,
+                "bevel" => 1,
+                "notch" => 2,
+                "scoop" => 3,
+                other => {
+                    return Err(invalid(
+                        "corners.kind",
+                        format!("`{other}` is not round, bevel, notch or scoop"),
+                    ))
+                }
+            };
+            (
+                [
+                    radius[0] * zoom,
+                    radius[1] * zoom,
+                    radius[2] * zoom,
+                    radius[3] * zoom,
+                ],
+                corner_kind,
+            )
+        }
+    };
+    let arc = if kind == SdfKind::Arc {
+        let thickness = node
+            .get("thickness")
+            .and_then(Value::as_f64)
+            .filter(|t| t.is_finite() && *t > 0.0)
+            .ok_or_else(|| invalid("thickness", "an arc needs a thickness in px above zero"))?;
+        [
+            get_f32(node, "startAngle", 0.0),
+            get_f32(node, "sweep", std::f32::consts::TAU),
+            thickness as f32 * zoom,
+        ]
+    } else {
+        [0.0; 3]
+    };
+    let polygon = if kind == SdfKind::Polygon {
+        let sides = node
+            .get("sides")
+            .and_then(Value::as_f64)
+            .filter(|s| s.fract() == 0.0 && (3.0..=64.0).contains(s))
+            .ok_or_else(|| invalid("sides", "a polygon needs a whole number of 3 to 64 sides"))?;
+        let ratio = get_f32(node, "starRatio", 1.0);
+        if !(ratio > 0.0 && ratio <= 1.0) {
+            return Err(invalid("starRatio", "must be above 0 and at most 1"));
+        }
+        [sides as f32, ratio]
+    } else {
+        [0.0; 2]
+    };
+
+    let material = match node.get("material").filter(|m| !m.is_null()) {
+        None => None,
+        Some(spec) => {
+            let wgsl = spec
+                .get("wgsl")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("material.wgsl", "needs the program's WGSL text"))?;
+            let params = match spec.get("params").filter(|p| !p.is_null()) {
+                None => Vec::new(),
+                Some(params) => number_array(params, "material.params")?,
+            };
+            if params.len() > 8 {
+                return Err(invalid("material.params", "at most 8 parameters"));
+            }
+            crate::sdf::check_material(wgsl).map_err(|detail| invalid("material.wgsl", detail))?;
+            Some(SdfMaterial {
+                wgsl: wgsl.to_owned(),
+                params,
+                live: spec.get("live").and_then(Value::as_bool).unwrap_or(false),
+            })
+        }
+    };
+
+    let fill = node
+        .get("fill")
+        .and_then(Value::as_str)
+        .and_then(parse_css_color);
+    let stroke = node
+        .get("stroke")
+        .and_then(Value::as_str)
+        .and_then(parse_css_color)
+        .map(|color| {
+            let dash = node
+                .get("strokeDash")
+                .and_then(Value::as_array)
+                .map(|dash| dash.iter().filter_map(Value::as_f64).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let dash = match dash.as_slice() {
+                [] => [0.0, 0.0],
+                [one] => [*one as f32 * zoom, *one as f32 * zoom],
+                [on, off, ..] => [*on as f32 * zoom, *off as f32 * zoom],
+            };
+            SdfStroke {
+                color,
+                width: get_f32(node, "strokeWidth", 1.0) * zoom,
+                dash,
+                dash_offset: get_f32(node, "strokeDashOffset", 0.0) * zoom,
+            }
+        });
+    let shadow = match node.get("shadow").filter(|s| !s.is_null()) {
+        None => None,
+        Some(spec) => {
+            let color = spec
+                .get("color")
+                .and_then(Value::as_str)
+                .and_then(parse_css_color);
+            match (color, spec.get("blur").and_then(Value::as_f64)) {
+                (Some(color), Some(blur)) if blur.is_finite() && blur >= 0.0 => {
+                    (blur > 0.0 && color[3] > 0.0).then(|| SdfShadow {
+                        color,
+                        sigma: blur as f32 * tw * zoom / 2.0,
+                        offset: Vec2::default(),
+                    })
+                }
+                _ => {
+                    return Err(invalid(
+                        "shadow",
+                        "needs a css `color` and a finite `blur` of zero or more",
+                    ))
+                }
+            }
+        }
+    };
+    if fill.is_none() && stroke.is_none() && material.is_none() {
+        return Ok(());
+    }
+
+    let rotation = get_f32(node, "rotate", 0.0);
+    if rotation != 0.0 {
+        let pivot = node.get("pivot");
+        let (origin_x, origin_y) = projector.project(position);
+        let (pivot_x, pivot_y) = to_screen(
+            origin_x
+                + pivot
+                    .and_then(|p| p.get("x"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.5) as f32
+                    * tw,
+            origin_y
+                + pivot
+                    .and_then(|p| p.get("y"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.5) as f32
+                    * tw,
+        );
+        let (dx, dy) = (
+            rect.x + rect.w / 2.0 - pivot_x,
+            rect.y + rect.h / 2.0 - pivot_y,
+        );
+        let (cs, sn) = (rotation.cos(), rotation.sin());
+        let (cx, cy) = (pivot_x + dx * cs - dy * sn, pivot_y + dx * sn + dy * cs);
+        rect.x = cx - rect.w / 2.0;
+        rect.y = cy - rect.h / 2.0;
+    }
+
+    if let Some(id) = hit_id(node) {
+        gathered.regions.push(Region {
+            id: id.to_string(),
+            rect,
+            rotation,
+        });
+    }
+    out.push(DrawCommand::Sdf {
+        kind,
+        rect,
+        corners,
+        corner_kind,
+        arc,
+        polygon,
+        fill: fill.unwrap_or([0.0; 4]),
+        stroke,
+        shadow,
+        rotation,
+        opacity,
+        material,
+    });
+    Ok(())
+}
+
+/// Project one world shape through the shared Canvas vector commands.
+fn paint_vector_shape(
+    node: &Value,
+    projector: &Projector,
+    to_screen: &dyn Fn(f32, f32) -> (f32, f32),
+    zoom: f32,
+    epoch_now_ms: f64,
+    gathered: &mut Gathered,
     out: &mut Vec<DrawCommand>,
 ) {
     let animated = animated_shape(node, epoch_now_ms);
@@ -1202,11 +2124,18 @@ fn paint_shape(
                 join: LineJoin::Miter,
             }
         });
-    if fill.is_none() && stroke.is_none() && fill_gradient.is_none() && pattern.is_none() {
+    if fill.is_none()
+        && stroke.is_none()
+        && fill_gradient.is_none()
+        && pattern.is_none()
+        && hit_id(node).is_none()
+    {
         return;
     }
 
     let start = out.len();
+    // A hit area may paint nothing (no fill, no stroke); its region is its geometry.
+    let mut geometry_bounds: Option<Rect> = None;
     let tw = projector.tile_width;
     match shape {
         "cell" => {
@@ -1258,6 +2187,7 @@ fn paint_shape(
                 w: w * zoom,
                 h: h * zoom,
             };
+            geometry_bounds = Some(rect);
             let points = [
                 Vec2 {
                     x: rect.x,
@@ -1491,6 +2421,15 @@ fn paint_shape(
     if additive && out.len() > start {
         let commands = out.drain(start..).collect();
         out.push(DrawCommand::AdditiveGroup { commands });
+    }
+    if let Some(id) = hit_id(node) {
+        if let Some(rect) = commands_bounds(&out[start..]).or(geometry_bounds) {
+            gathered.regions.push(Region {
+                id: id.to_string(),
+                rect,
+                rotation: 0.0,
+            });
+        }
     }
 }
 
@@ -1726,16 +2665,16 @@ mod tests {
     #[test]
     fn shape_gradients_use_shared_vector_commands_and_world_coordinates() {
         let gradient = json!({
-            "kind": "linear", "from": {"x": 0, "y": 0}, "to": {"x": 1, "y": 0},
+            "kind": "linear", "from": {"x": 0, "y": 0}, "to": {"x": 256, "y": 0},
             "stops": [{"offset": 0, "color": "#ff0000"}, {"offset": 1, "color": "#0000ff"}]
         });
         let p = packet_for(json!({
             "projection": "free", "scale": 1.0,
             "drawables": [
-                {"type": "draw-shape", "shape": "rect", "position": {"x": 1, "y": 1}, "width": 1, "height": 1, "gradient": gradient},
-                {"type": "draw-shape", "shape": "ellipse", "position": {"x": 2, "y": 1}, "radiusX": 0.5, "radiusY": 0.5, "gradient": gradient},
-                {"type": "draw-shape", "shape": "poly", "position": {"x": 3, "y": 1}, "points": [{"x": 0, "y": 0}, {"x": 1, "y": 0}, {"x": 0, "y": 1}], "gradient": gradient},
-                {"type": "draw-shape", "shape": "path", "position": {"x": 4, "y": 1}, "d": "M0 0 L1 0 L1 1 Z", "gradient": gradient}
+                {"type": "draw-shape", "shape": "rect", "position": {"x": 1, "y": 1}, "width": 256, "height": 256, "gradient": gradient},
+                {"type": "draw-shape", "shape": "ellipse", "position": {"x": 2, "y": 1}, "radiusX": 128, "radiusY": 128, "gradient": gradient},
+                {"type": "draw-shape", "shape": "poly", "position": {"x": 3, "y": 1}, "points": [{"x": 0, "y": 0}, {"x": 256, "y": 0}, {"x": 0, "y": 256}], "gradient": gradient},
+                {"type": "draw-shape", "shape": "path", "position": {"x": 4, "y": 1}, "d": "M0 0 L256 0 L256 256 Z", "gradient": gradient}
             ]
         }));
         let gradients: Vec<_> = p
@@ -1834,7 +2773,7 @@ mod tests {
             "projection": "free", "scale": 1.0,
             "drawables": [
                 {"type": "draw-shape", "shape": "ellipse", "position": {"x": 1, "y": 1},
-                    "anchor": "center", "radiusX": 0.5, "fill": "#ffffff",
+                    "anchor": "center", "radiusX": 128, "fill": "#ffffff",
                     "shadow": {"color": "#00ff00", "blur": blur}}
             ]
         }))
@@ -1842,7 +2781,7 @@ mod tests {
 
     #[test]
     fn a_shape_shadow_draws_its_coverage_blurred_under_the_shape() {
-        let packet = shadowed_disc(0.25);
+        let packet = shadowed_disc(64.0);
         let [DrawCommand::Clear { .. }, DrawCommand::Shadow {
             commands,
             color,
@@ -1927,6 +2866,24 @@ mod tests {
     }
 
     #[test]
+    fn a_css_numeric_weight_is_read_like_bold_and_an_out_of_range_one_is_refused() {
+        assert_eq!(
+            parse_text_font(Some("600 26px sans-serif")),
+            Some((26.0, 600, false))
+        );
+        assert_eq!(
+            parse_text_font(Some("400 15px monospace")),
+            Some((15.0, 400, true))
+        );
+        assert_eq!(
+            parse_text_font(Some("bold 12px sans-serif")),
+            Some((12.0, 700, false))
+        );
+        assert_eq!(parse_text_font(Some("1200 12px sans-serif")), None);
+        assert_eq!(parse_text_font(Some("600 12px Custom")), None);
+    }
+
+    #[test]
     fn unsupported_text_font_and_baseline_do_not_silently_change_contract() {
         let p = packet_for(json!({
             "projection": "free",
@@ -1986,9 +2943,9 @@ mod tests {
         let p = packet_for(json!({
             "projection": "free", "scale": 1.0,
             "drawables": [{"type": "draw-shape", "shape": "rect",
-                "position": {"x": 0, "y": 0}, "width": 1, "height": 1,
+                "position": {"x": 0, "y": 0}, "width": 256, "height": 256,
                 "fill": "#ff0000", "rotate": std::f32::consts::FRAC_PI_2,
-                "pivot": {"x": 0.5, "y": 0.5}}]
+                "pivot": {"x": 128, "y": 128}}]
         }));
         let points = p
             .draw_commands
@@ -2003,13 +2960,13 @@ mod tests {
     }
 
     #[test]
-    fn draw_poly_offsets_are_world_units_like_path_offsets() {
+    fn draw_poly_offsets_are_pixels_in_a_free_scene_like_path_offsets() {
         let p = packet_for(json!({
             "projection": "free", "scale": 1.0,
             "drawables": [{"type": "draw-shape", "shape": "poly",
                 "position": {"x": 0, "y": 0},
-                "points": [{"x": 0, "y": 0}, {"x": 1, "y": 0}, {"x": 0, "y": 1}],
-                "offsetX": 0.25, "offsetY": -0.5, "fill": "#ff0000"}]
+                "points": [{"x": 0, "y": 0}, {"x": 256, "y": 0}, {"x": 0, "y": 256}],
+                "offsetX": 64, "offsetY": -128, "fill": "#ff0000"}]
         }));
         let points = p
             .draw_commands
@@ -2028,12 +2985,12 @@ mod tests {
         let scene = json!({
             "projection": "free", "scale": 1.0,
             "drawables": [{"type": "draw-shape", "shape": "rect",
-                "position": {"x": 0, "y": 0}, "height": 1,
+                "position": {"x": 0, "y": 0}, "height": 256,
                 "width": 0, "fill": "#ff0000",
                 "animation": {"durationMs": 1000, "loop": false,
                     "keyframes": [
                         {"at": 0, "width": 0, "fill": "#ff0000"},
-                        {"at": 1, "width": 2, "fill": "#0000ff"}
+                        {"at": 1, "width": 512, "fill": "#0000ff"}
                     ]}}]
         });
         assert!(has_active_fx(&scene));
@@ -2183,10 +3140,10 @@ mod tests {
                 "animation": {"durationMs": 1000, "loop": false,
                     "keyframes": [
                         {"at": 0, "offsetX": 0, "opacity": 1},
-                        {"at": 1, "offsetX": 1, "opacity": 0.5}
+                        {"at": 1, "offsetX": 256, "opacity": 0.5}
                     ]},
                 "items": [{"type": "draw-shape", "shape": "rect",
-                    "position": {"x": 0, "y": 0}, "width": 1, "height": 1,
+                    "position": {"x": 0, "y": 0}, "width": 256, "height": 256,
                     "fill": "#ff0000"}]}]
         });
         assert!(has_active_fx(&scene));
@@ -2656,6 +3613,396 @@ mod tests {
         assert!(
             (dst.w - 64.0 * 0.5).abs() < 1e-3 && (dst.h - 64.0 * 0.5).abs() < 1e-3,
             "{dst:?}"
+        );
+    }
+
+    fn free_props(drawables: Value) -> Value {
+        json!({"width": 200, "height": 100, "scale": 1.0, "projection": "free",
+            "bgColor": "#00000000", "drawables": drawables})
+    }
+
+    fn rect_shape(extra: Value) -> Value {
+        let mut shape = json!({"type": "draw-shape", "shape": "rect",
+            "position": {"x": 10, "y": 20}, "width": 64, "height": 32, "fill": "#ff0000"});
+        for (key, value) in extra.as_object().unwrap() {
+            shape[key] = value.clone();
+        }
+        shape
+    }
+
+    fn sdf_commands(packet: &GameRenderPacket) -> Vec<&DrawCommand> {
+        packet
+            .draw_commands
+            .iter()
+            .filter(|c| matches!(c, DrawCommand::Sdf { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn corners_a_material_and_the_new_kinds_map_to_sdf_and_a_plain_rect_keeps_its_quad() {
+        let plain = packet_for(free_props(json!([rect_shape(json!({}))])));
+        assert!(plain
+            .draw_commands
+            .iter()
+            .any(|c| matches!(c, DrawCommand::Quad { .. })));
+        assert!(
+            sdf_commands(&plain).is_empty(),
+            "control: no new field, no Sdf"
+        );
+
+        let cornered = packet_for(free_props(json!([rect_shape(
+            json!({"corners": {"radius": [4, 4, 4, 4], "kind": "bevel"}})
+        )])));
+        assert!(!cornered
+            .draw_commands
+            .iter()
+            .any(|c| matches!(c, DrawCommand::Quad { .. })));
+        match sdf_commands(&cornered).as_slice() {
+            [DrawCommand::Sdf {
+                kind,
+                rect,
+                corners,
+                corner_kind,
+                fill,
+                ..
+            }] => {
+                assert_eq!(*kind, SdfKind::Rect);
+                assert_eq!(
+                    *rect,
+                    Rect {
+                        x: 10.0,
+                        y: 20.0,
+                        w: 64.0,
+                        h: 32.0
+                    }
+                );
+                assert_eq!((*corners, *corner_kind), ([4.0; 4], 1));
+                assert_eq!(*fill, [1.0, 0.0, 0.0, 1.0]);
+            }
+            other => panic!("one Sdf: {other:?}"),
+        }
+        for (shape, extra, expected) in [
+            ("capsule", json!({}), SdfKind::Capsule),
+            ("arc", json!({"sweep": 3.0, "thickness": 4}), SdfKind::Arc),
+            (
+                "polygon",
+                json!({"sides": 8, "starRatio": 0.7}),
+                SdfKind::Polygon,
+            ),
+        ] {
+            let mut node = rect_shape(extra);
+            node["shape"] = json!(shape);
+            let packet = packet_for(free_props(json!([node])));
+            assert!(
+                matches!(sdf_commands(&packet).as_slice(), [DrawCommand::Sdf { kind, .. }] if *kind == expected),
+                "{shape}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_sdf_fields_are_scene_errors_and_a_bad_wgsl_names_material_wgsl() {
+        let bad = from_props(&free_props(json!([rect_shape(
+            json!({"material": {"wgsl": "fn nope() {}", "params": [], "live": false}})
+        )])))
+        .unwrap_err();
+        assert!(
+            matches!(&bad, CanvasSceneError::InvalidProp { field, .. } if field == "material.wgsl"),
+            "{bad:?}"
+        );
+        let good = packet_for(free_props(json!([rect_shape(json!({"material": {
+            "wgsl": "fn shade(px: Pixel) -> vec4<f32> { return px.color; }",
+            "params": [1, 2], "live": true}}))])));
+        assert!(matches!(
+            sdf_commands(&good).as_slice(),
+            [DrawCommand::Sdf { material: Some(m), .. }] if m.params == vec![1.0, 2.0] && m.live
+        ));
+        let kind = from_props(&free_props(json!([rect_shape(
+            json!({"corners": {"radius": [1, 1, 1, 1], "kind": "wavy"}})
+        )])))
+        .unwrap_err();
+        assert!(
+            matches!(&kind, CanvasSceneError::InvalidProp { field, .. } if field == "corners.kind"),
+            "{kind:?}"
+        );
+    }
+
+    #[test]
+    fn an_unpainted_hit_rect_is_still_a_region_and_an_unpainted_plain_rect_is_not() {
+        let hit_area = |id: &str, hit: bool| {
+            json!({"type": "draw-shape", "shape": "rect", "id": id, "hit": hit, "anchor": "top-left",
+                "position": {"x": 10, "y": 20}, "width": 64, "height": 32})
+        };
+        let (_, gathered) = from_props_mapped(
+            &free_props(json!([hit_area("area", true), hit_area("plain", false)])),
+            0.0,
+        )
+        .unwrap();
+        let ids: Vec<&str> = gathered.regions.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["area"]);
+        assert_eq!(gathered.regions[0].rect.w, 64.0);
+        assert_eq!(gathered.regions[0].rect.h, 32.0);
+    }
+
+    #[test]
+    fn a_region_per_hit_drawable_with_the_right_rect_and_topmost_last() {
+        let (packet, gathered) = from_props_mapped(
+            &free_props(json!([
+                rect_shape(json!({"id": "a", "hit": true, "corners": {"radius": [2, 2, 2, 2]}})),
+                rect_shape(json!({"id": "b", "hit": true, "position": {"x": 30, "y": 30}})),
+                rect_shape(json!({"id": "c", "hit": false})),
+                rect_shape(json!({"hit": true})),
+            ])),
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(packet.draw_commands.len(), 5, "clear and four shapes");
+        let ids: Vec<&str> = gathered.regions.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["a", "b"],
+            "no region without hit and id; later is topmost"
+        );
+        assert_eq!(
+            gathered.regions[0].rect,
+            Rect {
+                x: 10.0,
+                y: 20.0,
+                w: 64.0,
+                h: 32.0
+            }
+        );
+        assert_eq!(
+            gathered.regions[1].rect,
+            Rect {
+                x: 30.0,
+                y: 30.0,
+                w: 64.0,
+                h: 32.0
+            }
+        );
+    }
+
+    #[test]
+    fn a_measured_text_reports_its_size_and_control_without_measure_reports_none() {
+        let text = |measure: bool| {
+            json!({"type": "draw-text", "id": "t", "text": "hello", "color": "#000000",
+                "font": "12px sans-serif", "position": {"x": 5, "y": 5}, "measure": measure})
+        };
+        let (_, gathered) = from_props_mapped(&free_props(json!([text(true)])), 0.0).unwrap();
+        match gathered.measured.as_slice() {
+            [m] => {
+                assert_eq!(m.id, "t");
+                assert_eq!(m.lines, 1);
+                assert!((m.width - crate::vector::text_width("hello", 12.0)).abs() < 1e-3);
+                assert!((m.height - 12.0 * 1.3).abs() < 1e-3);
+            }
+            other => panic!("one entry: {other:?}"),
+        }
+        let (_, none) = from_props_mapped(&free_props(json!([text(false)])), 0.0).unwrap();
+        assert!(none.measured.is_empty());
+    }
+
+    #[test]
+    fn a_paragraph_wraps_into_lines_within_its_width_and_control_without_width_is_one_line() {
+        let width = crate::vector::text_width("alpha beta", 12.0) + 0.5;
+        let node = |extra: Value| {
+            let mut n = json!({"type": "draw-text", "id": "p", "text": "alpha beta go on",
+                "color": "#000000", "font": "12px sans-serif", "position": {"x": 5, "y": 5},
+                "measure": true});
+            for (key, value) in extra.as_object().unwrap() {
+                n[key] = value.clone();
+            }
+            n
+        };
+        let (packet, gathered) =
+            from_props_mapped(&free_props(json!([node(json!({"width": width}))])), 0.0).unwrap();
+        let lines: Vec<&str> = packet
+            .draw_commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines, ["alpha beta", "go on"]);
+        assert_eq!(gathered.measured[0].lines, 2);
+        assert!(gathered.measured[0].width <= width);
+        let (single, _) = from_props_mapped(&free_props(json!([node(json!({}))])), 0.0).unwrap();
+        assert_eq!(
+            single
+                .draw_commands
+                .iter()
+                .filter(|c| matches!(c, DrawCommand::Text { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn layout_wraps_within_width_truncates_with_an_ellipsis_and_overflows_without_truncate() {
+        let text = "alpha beta go on";
+        let width = crate::vector::text_width("alpha beta", 12.0) + 0.5;
+        let wrapped = layout_paragraph(
+            text,
+            12.0,
+            false,
+            false,
+            ParagraphBox {
+                width: width,
+                wrap: true,
+                max_lines: None,
+                truncate: false,
+            },
+        );
+        assert_eq!(wrapped.lines, ["alpha beta", "go on"]);
+        assert!(wrapped.widths.iter().all(|w| *w <= width));
+        let flat = layout_paragraph(
+            text,
+            12.0,
+            false,
+            false,
+            ParagraphBox {
+                width: width,
+                wrap: false,
+                max_lines: None,
+                truncate: false,
+            },
+        );
+        assert_eq!(flat.lines, [text], "control: wrap off keeps one line");
+
+        let cut = layout_paragraph(
+            text,
+            12.0,
+            false,
+            false,
+            ParagraphBox {
+                width: width,
+                wrap: true,
+                max_lines: Some(1),
+                truncate: true,
+            },
+        );
+        assert_eq!(cut.lines.len(), 1);
+        assert!(cut.lines[0].ends_with('\u{2026}'), "{:?}", cut.lines);
+        assert!(cut.widths[0] <= width);
+        let capped = layout_paragraph(
+            text,
+            12.0,
+            false,
+            false,
+            ParagraphBox {
+                width: width,
+                wrap: true,
+                max_lines: Some(1),
+                truncate: false,
+            },
+        );
+        assert_eq!(
+            capped.lines,
+            ["alpha beta"],
+            "control: no truncate, no ellipsis"
+        );
+
+        let narrow = crate::vector::text_width("alpha", 12.0) * 0.6;
+        let one_line = layout_paragraph(
+            "alphabet",
+            12.0,
+            false,
+            false,
+            ParagraphBox {
+                width: narrow,
+                wrap: true,
+                max_lines: None,
+                truncate: true,
+            },
+        );
+        assert!(one_line.lines[0].ends_with('\u{2026}') && one_line.widths[0] <= narrow);
+        let overflow = layout_paragraph(
+            "alphabet",
+            12.0,
+            false,
+            false,
+            ParagraphBox {
+                width: narrow,
+                wrap: true,
+                max_lines: None,
+                truncate: false,
+            },
+        );
+        assert_eq!(
+            overflow.lines,
+            ["alphabet"],
+            "control: overflows without truncate"
+        );
+
+        let hard = layout_paragraph(
+            "a\nb",
+            12.0,
+            false,
+            false,
+            ParagraphBox {
+                width: 1000.0,
+                wrap: true,
+                max_lines: None,
+                truncate: false,
+            },
+        );
+        assert_eq!(hard.lines, ["a", "b"]);
+    }
+
+    fn animated_text_props(animation: Value) -> Value {
+        free_props(
+            json!([{"type": "draw-text", "text": "hi", "color": "#000000",
+            "font": "12px sans-serif", "position": {"x": 5, "y": 5}, "animation": animation}]),
+        )
+    }
+
+    fn text_alpha_and_x(packet: &GameRenderPacket) -> (f32, f32) {
+        packet
+            .draw_commands
+            .iter()
+            .find_map(|c| match c {
+                DrawCommand::Text { color, pos, .. } => Some((color[3], pos.x)),
+                _ => None,
+            })
+            .expect("a text")
+    }
+
+    #[test]
+    fn a_text_opacity_animation_paints_at_half_opacity_halfway() {
+        let props = animated_text_props(json!({"durationMs": 1000, "keyframes": [
+            {"at": 0, "opacity": 0, "offsetX": 0}, {"at": 1, "opacity": 1, "offsetX": 10}]}));
+        let (alpha, x) = text_alpha_and_x(&from_props_at(&props, 500.0).unwrap());
+        let (rest_alpha, rest_x) = text_alpha_and_x(&from_props_at(&props, 0.0).unwrap());
+        assert!((alpha - 0.5).abs() < 1e-3, "{alpha}");
+        assert!((x - rest_x - 5.0).abs() < 1e-3, "offsetX is halfway");
+        assert_eq!(rest_alpha, 1.0, "control: no clock, no animation");
+        assert!(has_active_fx(&props), "the canvas asks for frames");
+    }
+
+    #[test]
+    fn a_non_looping_text_animation_holds_its_final_values_and_a_plain_text_is_unchanged() {
+        let props = animated_text_props(json!({"durationMs": 1000, "loop": false, "keyframes": [
+            {"at": 0, "opacity": 0}, {"at": 1, "opacity": 0.25}]}));
+        let (held, _) = text_alpha_and_x(&from_props_at(&props, 5000.0).unwrap());
+        assert!((held - 0.25).abs() < 1e-3, "{held}");
+        let looping = animated_text_props(json!({"durationMs": 1000, "keyframes": [
+            {"at": 0, "opacity": 0}, {"at": 1, "opacity": 0.25}]}));
+        let (wrapped, _) = text_alpha_and_x(&from_props_at(&looping, 5500.0).unwrap());
+        assert!(
+            (wrapped - 0.125).abs() < 1e-3,
+            "control: a looping one wraps: {wrapped}"
+        );
+        let plain = free_props(
+            json!([{"type": "draw-text", "text": "hi", "color": "#000000",
+            "font": "12px sans-serif", "position": {"x": 5, "y": 5}}]),
+        );
+        let (alpha, _) = text_alpha_and_x(&from_props_at(&plain, 500.0).unwrap());
+        assert_eq!(alpha, 1.0);
+        assert!(
+            !has_active_fx(&plain),
+            "control: a plain text needs no frames"
         );
     }
 }

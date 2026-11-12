@@ -371,6 +371,17 @@ enum Draw {
         bind_group: wgpu::BindGroup,
         verts: [SpriteVertex; 6],
     },
+    /// Shapes of one SDF pipeline in order, before adjacent runs are merged into uniform-sized batches.
+    SdfRun {
+        key: u64,
+        wgsl: Option<String>,
+        instances: Vec<crate::sdf::SdfInstance>,
+    },
+    Sdf {
+        key: u64,
+        bind_group: wgpu::BindGroup,
+        count: u32,
+    },
 }
 
 /// Cache-key prefix of vector layer textures (never a fetchable URL).
@@ -415,6 +426,7 @@ pub struct SharedDeviceRenderer {
     scene3d_error: Option<String>,
     format: wgpu::TextureFormat,
     particles: Option<crate::particles::ParticlePass>,
+    sdf: Option<crate::sdf::SdfPass>,
 }
 
 impl SharedDeviceRenderer {
@@ -472,6 +484,7 @@ impl SharedDeviceRenderer {
             scene3d: None,
             format,
             particles: None,
+            sdf: None,
         }
     }
 
@@ -890,6 +903,8 @@ impl SharedDeviceRenderer {
             width: packet.width,
             height: packet.height,
             draw_commands: commands.to_vec(),
+            time_ms: packet.time_ms,
+            pointer: packet.pointer,
             ..GameRenderPacket::default()
         };
         if !self.render_packet_to_texture(&child, &layer) {
@@ -932,6 +947,86 @@ impl SharedDeviceRenderer {
         };
         let verts = sprite_vertices(&rect, &dst, tw, th, 0.0, 1.0, false, false, width, height);
         Some(Draw::MaskedSprite { bind_group, verts })
+    }
+
+    /// Merge adjacent SDF runs of one pipeline (nothing is drawn between them, so z-order holds), compile each
+    /// pipeline once, and bind each batch of up to [`crate::sdf::MAX_INSTANCES`] shapes.
+    fn finalize_sdf(&mut self, draws: Vec<Draw>, packet: &GameRenderPacket) -> Vec<Draw> {
+        let mut out: Vec<Draw> = Vec::with_capacity(draws.len());
+        let mut pending: Option<(u64, Option<String>, Vec<crate::sdf::SdfInstance>)> = None;
+        let mut draws = draws.into_iter();
+        loop {
+            let next = draws.next();
+            match (next, pending.take()) {
+                (
+                    Some(Draw::SdfRun {
+                        key,
+                        wgsl,
+                        mut instances,
+                    }),
+                    Some((pkey, pwgsl, mut pinst)),
+                ) => {
+                    if pkey == key {
+                        pinst.append(&mut instances);
+                        pending = Some((pkey, pwgsl, pinst));
+                    } else {
+                        self.bind_sdf(pkey, pwgsl, pinst, packet, &mut out);
+                        pending = Some((key, wgsl, instances));
+                    }
+                }
+                (
+                    Some(Draw::SdfRun {
+                        key,
+                        wgsl,
+                        instances,
+                    }),
+                    None,
+                ) => pending = Some((key, wgsl, instances)),
+                (Some(other), Some((pkey, pwgsl, pinst))) => {
+                    self.bind_sdf(pkey, pwgsl, pinst, packet, &mut out);
+                    out.push(other);
+                }
+                (Some(other), None) => out.push(other),
+                (None, Some((pkey, pwgsl, pinst))) => {
+                    self.bind_sdf(pkey, pwgsl, pinst, packet, &mut out);
+                    break;
+                }
+                (None, None) => break,
+            }
+        }
+        out
+    }
+
+    fn bind_sdf(
+        &mut self,
+        key: u64,
+        wgsl: Option<String>,
+        instances: Vec<crate::sdf::SdfInstance>,
+        packet: &GameRenderPacket,
+        out: &mut Vec<Draw>,
+    ) {
+        let (device, format) = (self.device.clone(), self.format);
+        let pass = self
+            .sdf
+            .get_or_insert_with(|| crate::sdf::SdfPass::new(&device, format));
+        if let Err(error) = pass.ensure(&device, key, wgsl.as_deref()) {
+            tracing::error!(target: "almadar::game_renderer", %error, "sdf material not drawn");
+            return;
+        }
+        for chunk in instances.chunks(crate::sdf::MAX_INSTANCES) {
+            let bind_group = pass.bind_group(
+                &device,
+                chunk,
+                (packet.width, packet.height),
+                packet.time_ms,
+                packet.pointer,
+            );
+            out.push(Draw::Sdf {
+                key,
+                bind_group,
+                count: chunk.len() as u32,
+            });
+        }
     }
 
     /// The error that kept the last packet's 3D scene from drawing, once.
@@ -1037,6 +1132,22 @@ impl SharedDeviceRenderer {
                 DrawCommand::Poly { points, color } => {
                     self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
                     push_poly_fan(&mut quad_batch, points, color, width, height);
+                }
+                DrawCommand::Sdf { .. } => {
+                    self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
+                    if !quad_batch.is_empty() {
+                        draws.push(Draw::Quads(std::mem::take(&mut quad_batch)));
+                    }
+                    if let Some((instance, material)) =
+                        crate::sdf::SdfInstance::from_command(command)
+                    {
+                        let wgsl = material.map(|m| m.wgsl.clone());
+                        draws.push(Draw::SdfRun {
+                            key: crate::sdf::pipeline_key(wgsl.as_deref()),
+                            wgsl,
+                            instances: vec![instance],
+                        });
+                    }
                 }
                 DrawCommand::Path { .. }
                 | DrawCommand::PatternPath { .. }
@@ -1170,6 +1281,7 @@ impl SharedDeviceRenderer {
         if !quad_batch.is_empty() {
             draws.push(Draw::Quads(quad_batch));
         }
+        let draws = self.finalize_sdf(draws, packet);
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1243,6 +1355,21 @@ impl SharedDeviceRenderer {
                         pass.set_bind_group(0, &sprite.bind_group, &[]);
                         pass.set_vertex_buffer(0, buffer.slice(..));
                         pass.draw(0..verts.len() as u32, 0..1);
+                        drew = true;
+                    }
+                    Draw::SdfRun { .. } => {}
+                    Draw::Sdf {
+                        key,
+                        bind_group,
+                        count,
+                    } => {
+                        let Some(pipeline) = self.sdf.as_ref().and_then(|p| p.pipeline(*key))
+                        else {
+                            continue;
+                        };
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, bind_group, &[]);
+                        pass.draw(0..6, 0..*count);
                         drew = true;
                     }
                     Draw::MaskedSprite { bind_group, verts } => {
@@ -2115,7 +2242,7 @@ mod vector_layer_tests {
         let rotated = crate::mappers::game_canvas_2d::from_props(&serde_json::json!({
             "width": 64, "height": 64, "scale": 1.0, "projection": "free", "bgColor": "#00000000",
             "drawables": [{"type": "draw-shape", "shape": "rect",
-                "position": {"x": 16, "y": 16}, "width": 0.125, "height": 0.0625,
+                "position": {"x": 16, "y": 16}, "width": 32, "height": 16,
                 "fill": "#00ff00", "rotate": 1.5707963267948966,
                 "pivot": {"x": 0, "y": 0}}]
         }))
@@ -2135,7 +2262,7 @@ mod vector_layer_tests {
             "width": 64, "height": 64, "scale": 1.0, "projection": "free", "bgColor": "#00000000",
             "drawables": [{"type": "draw-group", "position": {"x": 0, "y": 0}, "scale": 2,
                 "items": [{"type": "draw-shape", "shape": "rect",
-                    "position": {"x": 8, "y": 8}, "width": 0.0625, "height": 0.0625,
+                    "position": {"x": 8, "y": 8}, "width": 16, "height": 16,
                     "stroke": "#ff0000", "strokeWidth": 2}]}]
         }))
         .unwrap();
@@ -2160,7 +2287,7 @@ mod vector_layer_tests {
             "width": 64, "height": 64, "scale": 1.0,
             "projection": "free", "bgColor": "#00000000",
             "drawables": [{"type": "draw-shape", "shape": "rect",
-                "position": {"x": 16, "y": 16}, "width": 0.0625, "height": 0.0625,
+                "position": {"x": 16, "y": 16}, "width": 16, "height": 16,
                 "fill": "#ff0000", "blur": 4}]
         }))
         .unwrap();
@@ -2183,7 +2310,7 @@ mod vector_layer_tests {
             return;
         };
         let shape = serde_json::json!({"type": "draw-shape", "shape": "rect",
-            "position": {"x": 16, "y": 16}, "width": 0.0625, "height": 0.0625,
+            "position": {"x": 16, "y": 16}, "width": 16, "height": 16,
             "fill": "#ff0000", "opacity": 0.5, "blendMode": "lighter"});
         let scene = |drawables| {
             crate::mappers::game_canvas_2d::from_props(&serde_json::json!({
@@ -2305,6 +2432,254 @@ mod vector_layer_tests {
         assert!(
             with_text.chunks_exact(4).any(|p| p[3] > 200 && p[0] > 200),
             "text ink is drawn"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sdf_tests {
+    use super::svg_sprite_tests::{draw, px, renderer};
+    use super::*;
+    use crate::packet::{SdfKind, SdfMaterial};
+
+    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+
+    fn shape(kind: SdfKind, rect: Rect) -> DrawCommand {
+        DrawCommand::Sdf {
+            kind,
+            rect,
+            corners: [0.0; 4],
+            corner_kind: 0,
+            arc: [0.0; 3],
+            polygon: [0.0; 2],
+            fill: RED,
+            stroke: None,
+            shadow: None,
+            rotation: 0.0,
+            opacity: 1.0,
+            material: None,
+        }
+    }
+
+    fn full() -> Rect {
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 64.0,
+            h: 64.0,
+        }
+    }
+
+    fn packet(commands: Vec<DrawCommand>, time_ms: f64, pointer: Option<Vec2>) -> GameRenderPacket {
+        GameRenderPacket {
+            pattern: "canvas-2d".into(),
+            width: 64.0,
+            height: 64.0,
+            draw_commands: commands,
+            time_ms,
+            pointer,
+            ..Default::default()
+        }
+    }
+
+    fn painted(rgba: &[u8], x: u32, y: u32) -> bool {
+        px(rgba, 64, x, y)[3] > 200
+    }
+
+    fn rounded(radius: f32, kind: u32) -> DrawCommand {
+        let mut command = shape(
+            SdfKind::Rect,
+            Rect {
+                x: 8.0,
+                y: 8.0,
+                w: 48.0,
+                h: 48.0,
+            },
+        );
+        if let DrawCommand::Sdf {
+            corners,
+            corner_kind,
+            ..
+        } = &mut command
+        {
+            *corners = [radius; 4];
+            *corner_kind = kind;
+        }
+        command
+    }
+
+    fn arc(sweep: f32) -> DrawCommand {
+        let mut command = shape(SdfKind::Arc, full());
+        if let DrawCommand::Sdf { arc, .. } = &mut command {
+            *arc = [0.0, sweep, 8.0];
+        }
+        command
+    }
+
+    fn polygon(sides: f32, ratio: f32) -> DrawCommand {
+        let mut command = shape(SdfKind::Polygon, full());
+        if let DrawCommand::Sdf { polygon, .. } = &mut command {
+            *polygon = [sides, ratio];
+        }
+        command
+    }
+
+    fn with_material(wgsl: &str) -> DrawCommand {
+        let mut command = shape(SdfKind::Rect, full());
+        if let DrawCommand::Sdf { material, .. } = &mut command {
+            *material = Some(SdfMaterial {
+                wgsl: wgsl.into(),
+                params: vec![],
+                live: true,
+            });
+        }
+        command
+    }
+
+    #[test]
+    fn a_rounded_rect_paints_inside_and_not_outside_its_corners() {
+        let Some(mut r) = renderer() else { return };
+        let Some(rgba) = draw(&mut r, &packet(vec![rounded(16.0, 0)], 0.0, None), 64) else {
+            return;
+        };
+        assert!(painted(&rgba, 32, 32), "the middle");
+        assert!(painted(&rgba, 32, 9), "along an edge");
+        assert!(!painted(&rgba, 9, 9), "outside the rounded corner");
+        let Some(square) = draw(&mut r, &packet(vec![rounded(0.0, 0)], 0.0, None), 64) else {
+            return;
+        };
+        assert!(
+            painted(&square, 9, 9),
+            "control: no radius keeps the corner"
+        );
+    }
+
+    #[test]
+    fn a_bevel_corner_is_cut_straight_where_a_round_one_still_paints() {
+        let Some(mut r) = renderer() else { return };
+        let Some(bevel) = draw(&mut r, &packet(vec![rounded(16.0, 1)], 0.0, None), 64) else {
+            return;
+        };
+        let Some(round) = draw(&mut r, &packet(vec![rounded(16.0, 0)], 0.0, None), 64) else {
+            return;
+        };
+        assert!(!painted(&bevel, 13, 13), "the chamfer cuts it off");
+        assert!(
+            painted(&round, 13, 13),
+            "control: the round corner keeps it"
+        );
+        assert!(painted(&bevel, 32, 32), "the middle");
+    }
+
+    #[test]
+    fn an_arc_of_sweep_pi_paints_half_a_ring() {
+        let Some(mut r) = renderer() else { return };
+        let Some(half) = draw(
+            &mut r,
+            &packet(vec![arc(std::f32::consts::PI)], 0.0, None),
+            64,
+        ) else {
+            return;
+        };
+        assert!(painted(&half, 32, 60), "the lower half of the ring");
+        assert!(!painted(&half, 32, 3), "not the upper half");
+        assert!(!painted(&half, 32, 32), "not the hole");
+        let Some(full_ring) = draw(
+            &mut r,
+            &packet(vec![arc(std::f32::consts::TAU)], 0.0, None),
+            64,
+        ) else {
+            return;
+        };
+        assert!(
+            painted(&full_ring, 32, 3),
+            "control: a full sweep has the top"
+        );
+    }
+
+    #[test]
+    fn an_eight_point_star_has_tips_and_notches_a_regular_polygon_does_not() {
+        let Some(mut r) = renderer() else { return };
+        let Some(star) = draw(&mut r, &packet(vec![polygon(8.0, 0.7)], 0.0, None), 64) else {
+            return;
+        };
+        assert!(painted(&star, 32, 32), "the middle");
+        assert!(painted(&star, 32, 6), "the upward tip");
+        assert!(!painted(&star, 43, 5), "between two tips");
+        let Some(octagon) = draw(&mut r, &packet(vec![polygon(8.0, 1.0)], 0.0, None), 64) else {
+            return;
+        };
+        assert!(
+            painted(&octagon, 43, 5),
+            "control: the regular octagon fills it"
+        );
+    }
+
+    #[test]
+    fn a_material_reading_time_changes_pixels_between_two_times() {
+        let Some(mut r) = renderer() else { return };
+        let wgsl =
+            "fn shade(px: Pixel) -> vec4<f32> { return vec4<f32>(fract(px.time), 0.0, 0.0, 1.0); }";
+        let at = |r: &mut SharedDeviceRenderer, ms: f64| {
+            draw(r, &packet(vec![with_material(wgsl)], ms, None), 64)
+        };
+        let (Some(start), Some(later)) = (at(&mut r, 0.0), at(&mut r, 500.0)) else {
+            return;
+        };
+        assert!(px(&start, 64, 32, 32)[0] < 5);
+        let red = px(&later, 64, 32, 32)[0];
+        assert!((100..160).contains(&red), "{red}");
+        let Some(again) = at(&mut r, 0.0) else { return };
+        assert_eq!(
+            px(&again, 64, 32, 32),
+            px(&start, 64, 32, 32),
+            "control: the same time paints the same pixel"
+        );
+    }
+
+    #[test]
+    fn a_material_reading_the_pointer_lights_only_when_it_is_over_the_shape() {
+        let Some(mut r) = renderer() else { return };
+        let wgsl = "fn shade(px: Pixel) -> vec4<f32> { let over = px.pointer.x > 0.0 && px.pointer.x < px.size.x; return vec4<f32>(select(0.0, 1.0, over), 0.0, 0.0, 1.0); }";
+        let at = |r: &mut SharedDeviceRenderer, pointer: Option<Vec2>| {
+            draw(r, &packet(vec![with_material(wgsl)], 0.0, pointer), 64)
+        };
+        let (Some(over), Some(away)) = (
+            at(&mut r, Some(Vec2 { x: 10.0, y: 10.0 })),
+            at(&mut r, None),
+        ) else {
+            return;
+        };
+        assert_eq!(px(&over, 64, 32, 32)[0], 255);
+        assert_eq!(px(&away, 64, 32, 32)[0], 0, "control: no pointer");
+    }
+
+    #[test]
+    fn sdf_shapes_keep_z_order_with_quads() {
+        let Some(mut r) = renderer() else { return };
+        let blue_quad = DrawCommand::Quad {
+            rect: full(),
+            color: [0.0, 0.0, 1.0, 1.0],
+        };
+        let Some(over) = draw(
+            &mut r,
+            &packet(vec![blue_quad.clone(), rounded(0.0, 0)], 0.0, None),
+            64,
+        ) else {
+            return;
+        };
+        assert_eq!(px(&over, 64, 32, 32), [255, 0, 0, 255], "the shape on top");
+        let Some(under) = draw(
+            &mut r,
+            &packet(vec![rounded(0.0, 0), blue_quad], 0.0, None),
+            64,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            px(&under, 64, 32, 32),
+            [0, 0, 255, 255],
+            "control: quad last"
         );
     }
 }

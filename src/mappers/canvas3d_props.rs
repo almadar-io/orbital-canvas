@@ -181,12 +181,9 @@ pub fn selection_ring(
         (position[1] as f32 - interaction.min_z) * cell,
     );
     let inner = SELECTION_RADIUS - RING_WIDTH;
-    let mesh = crate::scene3d::tessellate::ring(
-        [inner, inner],
-        [SELECTION_RADIUS; 2],
-        RING_SEGMENTS,
-    )
-    .map_err(|e| CanvasSceneError::Unsupported3DContract(format!("selection ring: {e}")))?;
+    let mesh =
+        crate::scene3d::tessellate::ring([inner, inner], [SELECTION_RADIUS; 2], RING_SEGMENTS)
+            .map_err(|e| CanvasSceneError::Unsupported3DContract(format!("selection ring: {e}")))?;
     Ok(MeshInstance {
         mesh,
         transform: (Mat4::from_translation(world)
