@@ -3,8 +3,10 @@
 
 use super::canvas::{self, CanvasSpec};
 use super::shape::parse_shapes;
-use crate::mappers::game_canvas_2d::CanvasSceneError;
+use super::theme::css_of;
+use crate::mappers::game_canvas_2d::{paint_drawables, CanvasSceneError};
 use crate::mappers::scene::MappedScene;
+use crate::projector::{Projection, Projector};
 use serde_json::Value;
 
 pub fn map(props: &Value, viewport: Option<(f32, f32)>) -> Result<MappedScene, CanvasSceneError> {
@@ -16,7 +18,48 @@ pub fn map(props: &Value, viewport: Option<(f32, f32)>) -> Result<MappedScene, C
         parse_shapes(props.get("shapes")),
     );
     spec.particles = canvas::parse_particles(props.get("particles"))?;
-    Ok(canvas::render(&spec, &canvas::theme_for(props), viewport))
+    let theme = canvas::theme_for(props);
+    let mut scene = canvas::render(&spec, &theme, viewport);
+    let drawables = props.get("drawables").and_then(Value::as_array);
+    if let (Some(drawables), Some(projector)) = (
+        drawables.filter(|d| !d.is_empty()),
+        props.get("projector").and_then(projector_of),
+    ) {
+        let (xf, _, _) = canvas::fit(spec.width, spec.height, viewport);
+        let resolve = |c: &str| css_of(theme.mark_color(Some(c), "ink"));
+        scene.packet.draw_commands.extend(paint_drawables(
+            drawables,
+            &projector,
+            &resolve,
+            &|x, y| xf.p(x, y),
+            xf.s,
+        )?);
+    }
+    Ok(scene)
+}
+
+fn projector_of(p: &Value) -> Option<Projector> {
+    let tile_width = p.get("tileWidth")?.as_f64()? as f32;
+    let floor_height = p.get("floorHeight")?.as_f64()? as f32;
+    let diamond_top_y = p.get("diamondTopY")?.as_f64()? as f32;
+    let square_grid = p.get("squareGrid")?.as_bool()?;
+    let layout = if p.get("worldPixelDirect")?.as_bool()? {
+        Projection::Free
+    } else if square_grid {
+        Projection::Flat
+    } else {
+        Projection::Isometric
+    };
+    Some(Projector {
+        tile_width,
+        floor_height,
+        diamond_top_y,
+        scale: 1.0,
+        base_offset_x: 0.0,
+        layout,
+        square_grid,
+        plot: None,
+    })
 }
 
 #[cfg(test)]
@@ -139,5 +182,82 @@ mod tests {
         props["readouts"] = json!([{"label": "score", "value": 3}]);
         props["traces"] = json!([{"series": [{"samples": [{"x": 0, "y": 0}, {"x": 1, "y": 1}]}]}]);
         assert!(map(&props, None).unwrap().packet.draw_commands.len() > base + 4);
+    }
+
+    fn flat_projector() -> Value {
+        json!({"tileWidth": 40, "floorHeight": 20, "diamondTopY": 0, "squareGrid": true, "worldPixelDirect": false})
+    }
+
+    fn cell_drawable() -> Value {
+        json!({"type": "draw-shape", "shape": "cell", "position": {"x": 2, "y": 1}, "fill": "series-1"})
+    }
+
+    #[test]
+    fn drawables_paint_through_the_projector_at_their_projected_cell() {
+        let mut props = hotspot_scene();
+        props["drawables"] = json!([cell_drawable()]);
+        props["projector"] = flat_projector();
+        let scene = map(&props, None).unwrap();
+        let Some(DrawCommand::Poly { points, .. }) = scene.packet.draw_commands.last() else {
+            panic!(
+                "the drawable paints last: {:?}",
+                scene.packet.draw_commands.last()
+            )
+        };
+        assert_eq!((points[0].x, points[0].y), (80.0, 40.0));
+        assert_eq!(points[1].x - points[0].x, 40.0);
+        let fitted = map(&props, Some((300.0, 190.0))).unwrap();
+        let Some(DrawCommand::Poly { points, .. }) = fitted.packet.draw_commands.last() else {
+            panic!()
+        };
+        assert_eq!(
+            (points[0].x, points[0].y),
+            (40.0, 20.0),
+            "half-scale viewport"
+        );
+    }
+
+    #[test]
+    fn control_drawables_without_a_projector_or_without_drawables_add_nothing() {
+        let base = map(&hotspot_scene(), None)
+            .unwrap()
+            .packet
+            .draw_commands
+            .len();
+        let mut no_projector = hotspot_scene();
+        no_projector["drawables"] = json!([cell_drawable()]);
+        assert_eq!(
+            map(&no_projector, None).unwrap().packet.draw_commands.len(),
+            base
+        );
+        let mut empty = hotspot_scene();
+        empty["drawables"] = json!([]);
+        empty["projector"] = flat_projector();
+        assert_eq!(map(&empty, None).unwrap().packet.draw_commands.len(), base);
+    }
+
+    #[test]
+    fn hovering_a_shape_emits_on_shape_hover_with_its_id_and_empty_space_emits_nothing() {
+        let mut props = hotspot_scene();
+        props.as_object_mut().unwrap().remove("onShapeClick");
+        props["onShapeHover"] = json!("HOVER_SHAPE");
+        let scene = map(&props, None).unwrap();
+        let hit = scene.emits_at(300.0, 170.0);
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].event, "HOVER_SHAPE");
+        assert_eq!(hit[0].arg, "payload");
+        assert_eq!(
+            hit[0].payload,
+            json!({"id": "nucleus", "type": "circle", "index": 0})
+        );
+        assert!(scene.emits_at(20.0, 20.0).is_empty());
+    }
+
+    #[test]
+    fn control_without_on_shape_hover_a_shape_emits_only_its_click() {
+        let scene = map(&hotspot_scene(), None).unwrap();
+        let hit = scene.emits_at(300.0, 170.0);
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].event, "TAP_SHAPE");
     }
 }

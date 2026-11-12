@@ -4,7 +4,7 @@
 
 use super::canvas::{self, CanvasSpec};
 use super::shape::{parse_shapes, Dash, Point, Shape, ShapeType};
-use super::theme::{DiagramTheme, Rgba};
+use super::theme::{css_of, DiagramTheme};
 use crate::mappers::game_canvas_2d::{get_f32, get_string, paint_drawables, CanvasSceneError};
 use crate::mappers::scene::MappedScene;
 use crate::projector::{PlotAxes, Projector};
@@ -614,17 +614,6 @@ pub fn map(props: &Value, viewport: Option<(f32, f32)>) -> Result<MappedScene, C
         )?);
     }
     Ok(scene)
-}
-
-fn css_of(c: Rgba) -> String {
-    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-    format!(
-        "rgba({}, {}, {}, {})",
-        byte(c[0]),
-        byte(c[1]),
-        byte(c[2]),
-        c[3]
-    )
 }
 
 #[cfg(test)]

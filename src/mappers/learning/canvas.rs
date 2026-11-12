@@ -49,6 +49,7 @@ pub struct CanvasSpec {
     pub traces: Vec<TracePanel>,
     pub interactive: bool,
     pub on_shape_click: Option<String>,
+    pub on_shape_hover: Option<String>,
     /// Packed particles drawn under the shapes (physics-canvas).
     pub particles: Option<Particles>,
 }
@@ -243,6 +244,7 @@ impl CanvasSpec {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             on_shape_click: get_string(props, "onShapeClick"),
+            on_shape_hover: get_string(props, "onShapeHover").filter(|e| !e.is_empty()),
             particles: None,
         }
     }
@@ -537,9 +539,9 @@ pub fn render(
                         w: b.w * xf.s,
                         h: b.h * xf.s,
                     },
-                    emits: spec
-                        .on_shape_click
-                        .iter()
+                    emits: [&spec.on_shape_hover, &spec.on_shape_click]
+                        .into_iter()
+                        .flatten()
                         .map(|event| Emit {
                             event: event.clone(),
                             arg: "payload".into(),
@@ -590,6 +592,7 @@ mod tests {
             traces: vec![],
             interactive: false,
             on_shape_click: None,
+            on_shape_hover: None,
             particles: None,
         }
     }
