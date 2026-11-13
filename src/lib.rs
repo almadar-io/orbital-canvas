@@ -19,6 +19,8 @@ pub mod platform;
 pub mod projector;
 pub mod renderer;
 pub mod scene3d;
+pub(crate) mod backdrop;
+pub(crate) mod render_target;
 pub(crate) mod sdf;
 pub mod skinning_2d;
 pub mod spring;
@@ -173,8 +175,8 @@ pub struct SceneHost {
     /// The semantic tree of the latest layout, and the size last sent as `resizeEvent`.
     pub(crate) semantic: Vec<mappers::scene::SemanticNode>,
     pub(crate) resize_reported: Option<(f32, f32)>,
-    /// The `embeds` ids already answered through `embedEvent`.
-    pub(crate) embeds_answered: Vec<String>,
+    /// The reading direction last sent as `directionEvent`.
+    pub(crate) direction_reported: Option<String>,
     /// The region under the pointer, the region holding a press, and the last pointer position.
     pub(crate) hovered: Option<String>,
     pub(crate) captured: Option<String>,
@@ -353,7 +355,7 @@ impl SceneHost {
             measure_reported: Vec::new(),
             semantic: Vec::new(),
             resize_reported: None,
-            embeds_answered: Vec::new(),
+            direction_reported: None,
             hovered: None,
             captured: None,
             pointer: None,
@@ -488,7 +490,7 @@ impl SceneHost {
         self.semantic = mapped.semantic_nodes;
         self.report_measured();
         self.report_resize();
-        self.report_embeds();
+        self.report_direction();
     }
 
     /// The prop `name` of the current canvas node, when it declares it.
@@ -512,32 +514,18 @@ impl SceneHost {
         }
     }
 
-    /// Answer each embed the canvas declares (`embeds: [{ id, kind, source }]`) once through `embedEvent`: this host
-    /// realizes no embedded view yet, so the answer is `unavailable` with reason `host` (contract 14). An embed that
-    /// leaves the list and returns is answered again.
-    fn report_embeds(&mut self) {
-        if self.canvas_event("embedEvent").is_none() {
+    /// Queue one `directionEvent` when the canvas's declared `direction` (the program renders it from the page
+    /// locale) differs from the one last sent.
+    fn report_direction(&mut self) {
+        if self.canvas_event("directionEvent").is_none() {
             return;
         }
-        let ids: Vec<String> = self
-            .scene
-            .as_ref()
-            .and_then(|node| node.get("props").unwrap_or(node).get("embeds").and_then(serde_json::Value::as_array).cloned())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|e| e.get("id").and_then(serde_json::Value::as_str).map(str::to_owned))
-            .collect();
-        self.embeds_answered.retain(|id| ids.contains(id));
-        for id in ids {
-            if self.embeds_answered.contains(&id) {
-                continue;
-            }
-            self.queue_canvas_event(
-                "embedEvent",
-                serde_json::json!({ "target": id, "status": "unavailable", "reason": "host" }),
-            );
-            self.embeds_answered.push(id);
+        let Some(direction) = self.canvas_event("direction") else { return };
+        if self.direction_reported.as_deref() == Some(direction.as_str()) {
+            return;
         }
+        self.queue_canvas_event("directionEvent", serde_json::json!({ "direction": direction }));
+        self.direction_reported = Some(direction);
     }
 
     /// Queue one `resizeEvent` (CSS pixels) when the size differs from the one last sent.
@@ -676,6 +664,11 @@ impl SceneHost {
                     .scene
                     .as_ref()
                     .is_some_and(mappers::game_canvas_2d::has_active_fx))
+            || (self.motion
+                && self.epoch_clock_ms > 0.0
+                && self.scene.as_ref().is_some_and(|scene| {
+                    mappers::emitter::any_live(scene, self.epoch_clock_ms)
+                }))
             || asset::pending() > 0
             || asset::generation() != self.asset_generation
     }
@@ -684,7 +677,7 @@ impl SceneHost {
     pub fn frame_packet(&self) -> Option<GameRenderPacket> {
         if self.motion && self.epoch_clock_ms > 0.0 {
             if let Some(scene) = self.scene.as_ref().filter(|scene| {
-                mappers::game_canvas_2d::has_active_fx(scene)
+                (mappers::game_canvas_2d::has_active_fx(scene) || mappers::emitter::has_emitter(scene))
                     && matches!(
                         scene.get("type").and_then(serde_json::Value::as_str),
                         Some("canvas" | "canvas-2d")
@@ -1830,30 +1823,26 @@ mod tests {
     }
 
     #[test]
-    fn each_declared_embed_is_answered_unavailable_once() {
-        let embeds = |ids: &[&str]| serde_json::Value::Array(ids.iter().map(|id| serde_json::json!({"id": id, "kind": "program", "source": "/x"})).collect());
-        let mut r = host_with(serde_json::json!({"embedEvent": "EMBED", "embeds": embeds(&["a"])}));
+    fn the_declared_direction_is_reported_once_and_on_change() {
+        let mut r = host_with(serde_json::json!({"directionEvent": "DIR", "direction": "rtl"}));
         let sent = r.take_scene_events();
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].event, "EMBED");
-        assert_eq!(sent[0].payload, serde_json::json!({"target": "a", "status": "unavailable", "reason": "host"}));
+        assert_eq!(sent[0].event, "DIR");
+        assert_eq!(sent[0].payload, serde_json::json!({"direction": "rtl"}));
         let mut node = r.scene.clone().unwrap();
-        node["embeds"] = embeds(&["a", "b"]);
         r.set_scene(node.clone()).unwrap();
-        let sent = r.take_scene_events();
-        assert_eq!(sent.iter().map(|e| e.payload["target"].clone()).collect::<Vec<_>>(), vec![serde_json::json!("b")], "an answered embed is not answered again");
-        node["embeds"] = embeds(&["b"]);
-        r.set_scene(node.clone()).unwrap();
-        assert!(r.take_scene_events().is_empty());
-        node["embeds"] = embeds(&["a", "b"]);
+        assert!(r.take_scene_events().is_empty(), "same direction: nothing");
+        node["direction"] = serde_json::json!("ltr");
         r.set_scene(node).unwrap();
-        assert_eq!(r.take_scene_events().len(), 1, "edge: an embed that left and came back is answered again");
+        assert_eq!(r.take_scene_events()[0].payload, serde_json::json!({"direction": "ltr"}));
     }
 
     #[test]
-    fn control_embeds_without_an_embed_event_send_nothing() {
-        let mut r = host_with(serde_json::json!({"embeds": [{"id": "a", "kind": "program", "source": "/x"}]}));
+    fn control_a_direction_without_a_direction_event_or_unset_sends_nothing() {
+        let mut r = host_with(serde_json::json!({"direction": "rtl"}));
         assert!(r.take_scene_events().is_empty());
+        let mut r = host_with(serde_json::json!({"directionEvent": "DIR"}));
+        assert!(r.take_scene_events().is_empty(), "edge: no direction yet (no locale)");
     }
 
     #[test]

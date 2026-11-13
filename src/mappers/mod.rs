@@ -3,8 +3,11 @@
 pub mod canvas3d_props;
 pub mod canvas_scene3d;
 pub mod diagram;
+pub(crate) mod edit_layout;
+pub mod emitter;
 pub mod game_canvas_2d;
 pub mod isometric_canvas;
+pub mod layer_props;
 pub mod learning;
 pub mod learning_overlay3d;
 pub mod learning_scene3d;

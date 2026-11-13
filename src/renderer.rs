@@ -187,6 +187,37 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+const TARGET_SPRITE_SHADER_SOURCE: &str = r#"
+struct VertexInput {
+    @location(0) position: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(in: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
+    out.uv = in.uv;
+    out.color = in.color;
+    return out;
+}
+
+@group(0) @binding(0) var t_target: texture_2d<f32>;
+@group(0) @binding(1) var s_target: sampler;
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(t_target, s_target, in.uv) * in.color.a;
+}
+"#;
+
 const MASKED_SPRITE_SHADER_SOURCE: &str = r#"
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -376,11 +407,20 @@ enum Draw {
         key: u64,
         wgsl: Option<String>,
         instances: Vec<crate::sdf::SdfInstance>,
+        target: Option<crate::render_target::TargetTexture>,
     },
     Sdf {
         key: u64,
         bind_group: wgpu::BindGroup,
+        aux: wgpu::BindGroup,
         count: u32,
+    },
+    /// A backdrop shape: ends the render pass, blurs the frame so far, then paints the shape over it.
+    Backdrop(Box<BackdropDraw>),
+    /// A render target painted as a sprite (premultiplied texture).
+    TargetSprite {
+        bind_group: wgpu::BindGroup,
+        verts: [SpriteVertex; 6],
     },
     /// Glyph quads of one atlas page, before adjacent runs of the page are merged.
     GlyphRun {
@@ -392,6 +432,22 @@ enum Draw {
         buffer: wgpu::Buffer,
         count: u32,
     },
+}
+
+/// One backdrop shape resolved for the pass: the blur job and the bind groups of its three draws.
+struct BackdropDraw {
+    job: crate::backdrop::BackdropJob,
+    key: u64,
+    bind_group: wgpu::BindGroup,
+    aux: wgpu::BindGroup,
+}
+
+/// A run of SDF shapes of one pipeline and one target, waiting to be cut into uniform-sized batches.
+struct PendingSdf {
+    key: u64,
+    wgsl: Option<String>,
+    instances: Vec<crate::sdf::SdfInstance>,
+    target: Option<crate::render_target::TargetTexture>,
 }
 
 /// Cache-key prefix of vector layer textures (never a fetchable URL).
@@ -438,6 +494,10 @@ pub struct SharedDeviceRenderer {
     particles: Option<crate::particles::ParticlePass>,
     sdf: Option<crate::sdf::SdfPass>,
     glyphs: Option<crate::glyph_atlas::GlyphPass>,
+    layers: crate::backdrop::LayerPool,
+    blur: Option<crate::backdrop::BlurPass>,
+    targets: crate::render_target::TargetStore,
+    target_sprite_pipeline: wgpu::RenderPipeline,
 }
 
 impl SharedDeviceRenderer {
@@ -470,6 +530,13 @@ impl SharedDeviceRenderer {
         );
         let (masked_sprite_pipeline, masked_sprite_layout) =
             build_masked_sprite_pipeline(&device, format);
+        let target_sprite_pipeline = textured_pipeline(
+            &device,
+            format,
+            &sprite_layout,
+            TARGET_SPRITE_SHADER_SOURCE,
+            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+        );
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("game sprite sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -497,6 +564,10 @@ impl SharedDeviceRenderer {
             particles: None,
             sdf: None,
             glyphs: None,
+            layers: Default::default(),
+            blur: None,
+            targets: Default::default(),
+            target_sprite_pipeline,
         }
     }
 
@@ -961,71 +1032,64 @@ impl SharedDeviceRenderer {
         Some(Draw::MaskedSprite { bind_group, verts })
     }
 
-    /// Merge adjacent SDF runs of one pipeline (nothing is drawn between them, so z-order holds), compile each
-    /// pipeline once, and bind each batch of up to [`crate::sdf::MAX_INSTANCES`] shapes.
+    /// Merge adjacent SDF runs of one pipeline and one target (nothing is drawn between them, so z-order holds),
+    /// compile each pipeline once, and bind each batch of up to [`crate::sdf::MAX_INSTANCES`] shapes.
     fn finalize_sdf(&mut self, draws: Vec<Draw>, packet: &GameRenderPacket) -> Vec<Draw> {
         let mut out: Vec<Draw> = Vec::with_capacity(draws.len());
-        let mut pending: Option<(u64, Option<String>, Vec<crate::sdf::SdfInstance>)> = None;
-        let mut draws = draws.into_iter();
-        loop {
-            let next = draws.next();
-            match (next, pending.take()) {
-                (
-                    Some(Draw::SdfRun {
-                        key,
-                        wgsl,
-                        mut instances,
-                    }),
-                    Some((pkey, pwgsl, mut pinst)),
-                ) => {
-                    if pkey == key {
-                        pinst.append(&mut instances);
-                        pending = Some((pkey, pwgsl, pinst));
-                    } else {
-                        self.bind_sdf(pkey, pwgsl, pinst, packet, &mut out);
-                        pending = Some((key, wgsl, instances));
+        let mut pending: Option<PendingSdf> = None;
+        for draw in draws {
+            match draw {
+                Draw::SdfRun {
+                    key,
+                    wgsl,
+                    mut instances,
+                    target,
+                } => match pending.take() {
+                    Some(mut run)
+                        if run.key == key
+                            && run.target.as_ref().map(|t| t.serial)
+                                == target.as_ref().map(|t| t.serial) =>
+                    {
+                        run.instances.append(&mut instances);
+                        pending = Some(run);
                     }
-                }
-                (
-                    Some(Draw::SdfRun {
-                        key,
-                        wgsl,
-                        instances,
-                    }),
-                    None,
-                ) => pending = Some((key, wgsl, instances)),
-                (Some(other), Some((pkey, pwgsl, pinst))) => {
-                    self.bind_sdf(pkey, pwgsl, pinst, packet, &mut out);
+                    other => {
+                        if let Some(run) = other {
+                            self.bind_sdf(run, packet, &mut out);
+                        }
+                        pending = Some(PendingSdf {
+                            key,
+                            wgsl,
+                            instances,
+                            target,
+                        });
+                    }
+                },
+                other => {
+                    if let Some(run) = pending.take() {
+                        self.bind_sdf(run, packet, &mut out);
+                    }
                     out.push(other);
                 }
-                (Some(other), None) => out.push(other),
-                (None, Some((pkey, pwgsl, pinst))) => {
-                    self.bind_sdf(pkey, pwgsl, pinst, packet, &mut out);
-                    break;
-                }
-                (None, None) => break,
             }
+        }
+        if let Some(run) = pending {
+            self.bind_sdf(run, packet, &mut out);
         }
         out
     }
 
-    fn bind_sdf(
-        &mut self,
-        key: u64,
-        wgsl: Option<String>,
-        instances: Vec<crate::sdf::SdfInstance>,
-        packet: &GameRenderPacket,
-        out: &mut Vec<Draw>,
-    ) {
+    fn bind_sdf(&mut self, run: PendingSdf, packet: &GameRenderPacket, out: &mut Vec<Draw>) {
         let (device, format) = (self.device.clone(), self.format);
         let pass = self
             .sdf
             .get_or_insert_with(|| crate::sdf::SdfPass::new(&device, format));
-        if let Err(error) = pass.ensure(&device, key, wgsl.as_deref()) {
+        if let Err(error) = pass.ensure(&device, run.key, run.wgsl.as_deref()) {
             tracing::error!(target: "almadar::game_renderer", %error, "sdf material not drawn");
             return;
         }
-        for chunk in crate::sdf::batches(&instances) {
+        let aux = pass.aux_group(&device, None, run.target.as_ref().map(|t| &t.view));
+        for chunk in crate::sdf::batches(&run.instances) {
             let bind_group = pass.bind_group(
                 &device,
                 chunk,
@@ -1034,11 +1098,164 @@ impl SharedDeviceRenderer {
                 packet.pointer,
             );
             out.push(Draw::Sdf {
-                key,
+                key: run.key,
                 bind_group,
+                aux: aux.clone(),
                 count: chunk.len() as u32,
             });
         }
+    }
+
+    /// The first render target a material names, as the reader resolving now sees it.
+    fn material_target(
+        &self,
+        material: Option<&crate::packet::SdfMaterial>,
+    ) -> Option<crate::render_target::TargetTexture> {
+        material
+            .and_then(|m| m.targets.first())
+            .and_then(|id| self.targets.read(id))
+    }
+
+    /// Resolve a backdrop shape into its draw; `None` when it is off the frame or its material does not compile.
+    fn backdrop_draw(
+        &mut self,
+        shape: &DrawCommand,
+        backdrop: &crate::packet::SdfBackdrop,
+        packet: &GameRenderPacket,
+        set: &crate::backdrop::LayerSet,
+    ) -> Option<Draw> {
+        let DrawCommand::Sdf {
+            rect, rotation, ..
+        } = shape
+        else {
+            return None;
+        };
+        let (instance, material) = crate::sdf::SdfInstance::from_command(shape)?;
+        let scale = (
+            set.frame.width() as f32 / packet.width.max(1.0),
+            set.frame.height() as f32 / packet.height.max(1.0),
+        );
+        let region = crate::backdrop::region(
+            *rect,
+            *rotation,
+            2.0,
+            scale,
+            (set.frame.width(), set.frame.height()),
+        )?;
+        let wgsl = material.map(|m| m.wgsl.clone());
+        let key = crate::sdf::pipeline_key(wgsl.as_deref());
+        let target = self.material_target(material);
+        let (device, format) = (self.device.clone(), self.format);
+        self.blur
+            .get_or_insert_with(|| crate::backdrop::BlurPass::new(&device, format));
+        let pass = self
+            .sdf
+            .get_or_insert_with(|| crate::sdf::SdfPass::new(&device, format));
+        if let Err(error) = pass.ensure(&device, key, wgsl.as_deref()) {
+            tracing::error!(target: "almadar::game_renderer", %error, "sdf material not drawn");
+            return None;
+        }
+        pass.ensure_backdrop(&device);
+        let bind_group = pass.bind_group(
+            &device,
+            &[instance],
+            (packet.width, packet.height),
+            packet.time_ms,
+            packet.pointer,
+        );
+        let behind = set.b.create_view(&wgpu::TextureViewDescriptor::default());
+        let aux = pass.aux_group(&device, Some(&behind), target.as_ref().map(|t| &t.view));
+        Some(Draw::Backdrop(Box::new(BackdropDraw {
+            job: crate::backdrop::BackdropJob {
+                frame: set.frame.clone(),
+                a: set.a.clone(),
+                b: set.b.clone(),
+                sigma: backdrop.blur * 0.5 * scale.0,
+                saturate: backdrop.saturate,
+                tint: backdrop.tint,
+                region,
+            },
+            key,
+            bind_group,
+            aux,
+        })))
+    }
+
+    /// Blur the frame under a backdrop shape, then clear the frame where it covers, add the blur there and paint
+    /// the shape over it.
+    fn encode_backdrop(&self, encoder: &mut wgpu::CommandEncoder, draw: &BackdropDraw) {
+        let Some(blur) = self.blur.as_ref() else {
+            return;
+        };
+        let Some(sdf) = self.sdf.as_ref() else {
+            return;
+        };
+        let (Some((cut, add)), Some(fill)) = (sdf.backdrop_pipelines(), sdf.pipeline(draw.key)) else {
+            return;
+        };
+        blur.encode(&self.device, encoder, &draw.job);
+        let view = draw
+            .job
+            .frame
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("backdrop shape pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+        for pipeline in [cut, add, fill] {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &draw.bind_group, &[]);
+            pass.set_bind_group(1, &draw.aux, &[]);
+            pass.draw(0..6, 0..1);
+        }
+    }
+
+    /// Paint a `Target` command's children into its texture unless they are what it already holds.
+    fn paint_target(
+        &mut self,
+        id: &str,
+        size: (u32, u32),
+        live: bool,
+        commands: &[DrawCommand],
+        packet: &GameRenderPacket,
+    ) {
+        let limit = self.device.limits().max_texture_dimension_2d;
+        if size.0 > limit || size.1 > limit {
+            tracing::warn!(target: "almadar::game_renderer", id, ?size, "render target exceeds the device texture limit; skipped");
+            return;
+        }
+        let versions = |read: &str| self.targets.version(read);
+        let Some(hash) =
+            crate::render_target::content_hash(size.0, size.1, live, commands, packet.time_ms, &versions)
+        else {
+            tracing::warn!(target: "almadar::game_renderer", id, "render target commands not serializable; skipped");
+            return;
+        };
+        if self.targets.keep(id, size, hash) {
+            return;
+        }
+        let slot = self.targets.writer(&self.device, self.format, id, size);
+        let child = GameRenderPacket {
+            pattern: packet.pattern.clone(),
+            width: size.0 as f32,
+            height: size.1 as f32,
+            draw_commands: commands.to_vec(),
+            time_ms: packet.time_ms,
+            ..GameRenderPacket::default()
+        };
+        self.render_packet_to_texture(&child, &slot.texture);
+        self.targets.painted(id, hash);
     }
 
     /// The atlas draws for a plain `Text`; `None` sends it to the CPU vector layer.
@@ -1119,8 +1336,20 @@ impl SharedDeviceRenderer {
             if let Some(glyphs) = self.glyphs.as_mut() {
                 glyphs.begin_frame();
             }
+            self.targets.begin_frame();
         }
         self.render_depth += 1;
+        let final_target = target;
+        let layer_set = packet
+            .draw_commands
+            .iter()
+            .any(|c| matches!(c, DrawCommand::SdfBackdrop { .. }))
+            .then(|| {
+                self.layers
+                    .get(&self.device, (target.width(), target.height()), self.format)
+            });
+        let frame_texture = layer_set.as_ref().map(|set| set.frame.clone());
+        let target = frame_texture.as_ref().unwrap_or(final_target);
         let width = packet.width.max(1.0) as u32;
         let height = packet.height.max(1.0) as u32;
         let density = target.width() as f32 / packet.width.max(1.0);
@@ -1224,6 +1453,7 @@ impl SharedDeviceRenderer {
                             key: crate::sdf::pipeline_key(wgsl.as_deref()),
                             wgsl,
                             instances: vec![instance],
+                            target: self.material_target(material),
                         });
                     }
                 }
@@ -1238,8 +1468,29 @@ impl SharedDeviceRenderer {
                             key: crate::sdf::pipeline_key(wgsl.as_deref()),
                             wgsl,
                             instances: pair.to_vec(),
+                            target: self.material_target(material),
                         });
                     }
+                }
+                DrawCommand::SdfBackdrop { shape, backdrop } => {
+                    self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
+                    if !quad_batch.is_empty() {
+                        draws.push(Draw::Quads(std::mem::take(&mut quad_batch)));
+                    }
+                    if let Some(set) = layer_set.as_ref() {
+                        if let Some(draw) = self.backdrop_draw(shape, backdrop, packet, set) {
+                            draws.push(draw);
+                        }
+                    }
+                }
+                DrawCommand::Target {
+                    id,
+                    width: target_w,
+                    height: target_h,
+                    live,
+                    commands,
+                } => {
+                    self.paint_target(id, (*target_w, *target_h), *live, commands, packet);
                 }
                 DrawCommand::Text { halo: None, .. } => {
                     self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
@@ -1347,6 +1598,41 @@ impl SharedDeviceRenderer {
                     flip_y,
                 } => {
                     self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
+                    if let Some(id) = texture.strip_prefix(crate::render_target::TARGET_PREFIX) {
+                        let Some(read) = self.targets.read(id) else {
+                            continue;
+                        };
+                        if !quad_batch.is_empty() {
+                            draws.push(Draw::Quads(std::mem::take(&mut quad_batch)));
+                        }
+                        let whole = Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            w: read.width as f32,
+                            h: read.height as f32,
+                        };
+                        let from = if src.w > 0.0 && src.h > 0.0 { *src } else { whole };
+                        let verts = sprite_vertices(
+                            &from, dst, read.width, read.height, *rotation, *opacity, *flip_x, *flip_y, width,
+                            height,
+                        );
+                        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("render target sprite bind group"),
+                            layout: &self.sprite_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(&read.view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                                },
+                            ],
+                        });
+                        draws.push(Draw::TargetSprite { bind_group, verts });
+                        continue;
+                    }
                     // Device pixels per sheet unit: the packet is laid out in
                     // logical units, the target is physical.
                     let target_scale = (dst.w / src.w.max(f32::EPSILON))
@@ -1386,7 +1672,14 @@ impl SharedDeviceRenderer {
         let draws = self.finalize_sdf(draws, packet);
         let draws = self.finalize_glyphs(draws);
 
-        {
+        let mut segment_start = 0;
+        let mut first_segment = true;
+        loop {
+            let segment_end = draws[segment_start..]
+                .iter()
+                .position(|d| matches!(d, Draw::Backdrop(_)))
+                .map_or(draws.len(), |at| segment_start + at);
+            {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("game shared-device pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1394,7 +1687,7 @@ impl SharedDeviceRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: if load_3d {
+                        load: if load_3d || !first_segment {
                             wgpu::LoadOp::Load
                         } else {
                             wgpu::LoadOp::Clear(clear_color)
@@ -1406,8 +1699,9 @@ impl SharedDeviceRenderer {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
+            first_segment = false;
 
-            for draw in &draws {
+            for draw in &draws[segment_start..segment_end] {
                 match draw {
                     Draw::Particles(particles) => {
                         if let Some(pipeline) = self
@@ -1460,7 +1754,21 @@ impl SharedDeviceRenderer {
                         pass.draw(0..verts.len() as u32, 0..1);
                         drew = true;
                     }
-                    Draw::SdfRun { .. } | Draw::GlyphRun { .. } => {}
+                    Draw::SdfRun { .. } | Draw::GlyphRun { .. } | Draw::Backdrop(_) => {}
+                    Draw::TargetSprite { bind_group, verts } => {
+                        let buffer =
+                            self.device
+                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: Some("render target sprite verts"),
+                                    contents: bytemuck::cast_slice(verts),
+                                    usage: wgpu::BufferUsages::VERTEX,
+                                });
+                        pass.set_pipeline(&self.target_sprite_pipeline);
+                        pass.set_bind_group(0, bind_group, &[]);
+                        pass.set_vertex_buffer(0, buffer.slice(..));
+                        pass.draw(0..6, 0..1);
+                        drew = true;
+                    }
                     Draw::Glyphs {
                         page,
                         buffer,
@@ -1481,6 +1789,7 @@ impl SharedDeviceRenderer {
                     Draw::Sdf {
                         key,
                         bind_group,
+                        aux,
                         count,
                     } => {
                         let Some(pipeline) = self.sdf.as_ref().and_then(|p| p.pipeline(*key))
@@ -1489,6 +1798,7 @@ impl SharedDeviceRenderer {
                         };
                         pass.set_pipeline(pipeline);
                         pass.set_bind_group(0, bind_group, &[]);
+                        pass.set_bind_group(1, aux, &[]);
                         pass.draw(0..6, 0..*count);
                         drew = true;
                     }
@@ -1508,6 +1818,19 @@ impl SharedDeviceRenderer {
                     }
                 }
             }
+            }
+            if segment_end == draws.len() {
+                break;
+            }
+            if let Draw::Backdrop(backdrop) = &draws[segment_end] {
+                self.encode_backdrop(&mut encoder, backdrop);
+                drew = true;
+            }
+            segment_start = segment_end + 1;
+        }
+        if let (Some(set), Some(blur)) = (layer_set.as_ref(), self.blur.as_ref()) {
+            let out = final_target.create_view(&wgpu::TextureViewDescriptor::default());
+            blur.blit(&self.device, &mut encoder, &set.frame, &out);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -2862,6 +3185,7 @@ mod sdf_tests {
                 params: vec![],
                 live: true,
                 since: 0.0,
+                targets: Vec::new(),
             });
         }
         command
@@ -3089,5 +3413,257 @@ mod sdf_tests {
         };
         assert!(!painted(&apart, 32, 32), "control: two separate circles leave the gap empty");
         assert!(painted(&apart, 16, 32) && painted(&apart, 48, 32));
+    }
+}
+
+#[cfg(test)]
+mod layer_tests {
+    use super::svg_sprite_tests::{px, renderer};
+    use super::*;
+    use crate::packet::{SdfBackdrop, SdfKind, SdfMaterial};
+
+    const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+    const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+    const CLEAR: [f32; 4] = [0.0; 4];
+
+    fn quad(x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) -> DrawCommand {
+        DrawCommand::Quad { rect: Rect { x, y, w, h }, color }
+    }
+
+    fn sdf(rect: Rect, fill: [f32; 4], material: Option<SdfMaterial>) -> DrawCommand {
+        DrawCommand::Sdf {
+            kind: SdfKind::Rect,
+            rect,
+            corners: [0.0; 4],
+            corner_kind: 0,
+            arc: [0.0; 3],
+            polygon: [0.0; 2],
+            fill,
+            stroke: None,
+            shadow: None,
+            rotation: 0.0,
+            opacity: 1.0,
+            material,
+        }
+    }
+
+    fn glass(blur: f32, tint: Option<[f32; 4]>, saturate: f32, material: Option<SdfMaterial>) -> DrawCommand {
+        DrawCommand::SdfBackdrop {
+            shape: Box::new(sdf(Rect { x: 16.0, y: 16.0, w: 32.0, h: 32.0 }, CLEAR, material)),
+            backdrop: SdfBackdrop { blur, tint, saturate },
+        }
+    }
+
+    fn frame(commands: Vec<DrawCommand>) -> GameRenderPacket {
+        GameRenderPacket {
+            pattern: "canvas-2d".into(),
+            width: 64.0,
+            height: 64.0,
+            draw_commands: commands,
+            ..Default::default()
+        }
+    }
+
+    fn halves() -> Vec<DrawCommand> {
+        vec![quad(0.0, 0.0, 32.0, 64.0, WHITE), quad(32.0, 0.0, 32.0, 64.0, BLACK)]
+    }
+
+    /// Render into a physical `px` x `px` target and read it back; a frame may paint nothing, so no draw is asserted.
+    fn draw(r: &mut SharedDeviceRenderer, packet: &GameRenderPacket, px: u32) -> Option<Vec<u8>> {
+        let target = r.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("layer test target"),
+            size: wgpu::Extent3d { width: px, height: px, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        r.render_packet_to_texture(packet, &target);
+        let encoder = r
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
+        copy_texture_to_rgba(r.device(), r.queue(), encoder, &target, px, px).ok()
+    }
+
+    fn at(rgba: &[u8], x: u32, y: u32) -> [u8; 4] {
+        px(rgba, 64, x, y)
+    }
+
+    fn material(wgsl: &str, targets: &[&str]) -> SdfMaterial {
+        SdfMaterial {
+            wgsl: wgsl.into(),
+            params: vec![],
+            live: false,
+            since: 0.0,
+            targets: targets.iter().map(|t| (*t).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_backdrop_blurs_what_is_behind_it_inside_the_shape_only() {
+        let Some(mut r) = renderer() else { return };
+        let mut commands = halves();
+        commands.push(glass(8.0, None, 1.0, None));
+        let Some(blurred) = draw(&mut r, &frame(commands), 64) else { return };
+        let edge = at(&blurred, 31, 32);
+        assert!(edge[0] > 60 && edge[0] < 200, "the hard edge is softened inside the glass: {edge:?}");
+        let inner = at(&blurred, 22, 32);
+        assert!(inner[0] > edge[0] + 30, "further from the edge it stays whiter: {inner:?} vs {edge:?}");
+        assert_eq!(at(&blurred, 8, 32), [255, 255, 255, 255], "outside the shape is untouched");
+        assert_eq!(at(&blurred, 56, 32), [0, 0, 0, 255], "outside the shape is untouched");
+        assert_eq!(at(&blurred, 31, 10)[0], 255, "above the glass is untouched");
+        let mut plain = halves();
+        plain.push(sdf(Rect { x: 16.0, y: 16.0, w: 32.0, h: 32.0 }, CLEAR, None));
+        let Some(sharp) = draw(&mut r, &frame(plain), 64) else { return };
+        assert_eq!(at(&sharp, 31, 32), [255, 255, 255, 255], "control: a plain shape leaves the edge sharp");
+        assert_eq!(at(&sharp, 32, 32), [0, 0, 0, 255], "control: a plain shape leaves the edge sharp");
+    }
+
+    #[test]
+    fn a_backdrop_only_blurs_what_was_painted_before_it() {
+        let Some(mut r) = renderer() else { return };
+        let mut commands = halves();
+        commands.push(glass(8.0, None, 1.0, None));
+        commands.push(quad(20.0, 20.0, 8.0, 8.0, RED));
+        let Some(pixels) = draw(&mut r, &frame(commands), 64) else { return };
+        assert_eq!(at(&pixels, 24, 24), [255, 0, 0, 255], "a mark painted after the glass stays sharp on top");
+        let mut before = halves();
+        before.push(quad(20.0, 20.0, 8.0, 8.0, RED));
+        before.push(glass(8.0, None, 1.0, None));
+        let Some(under) = draw(&mut r, &frame(before), 64) else { return };
+        let blurred = at(&under, 24, 24);
+        assert!(blurred[0] > 100 && blurred[1] > 100, "control: a mark painted before the glass is blurred into the white behind it: {blurred:?}");
+    }
+
+    #[test]
+    fn saturate_and_tint_shape_the_blurred_backdrop() {
+        let Some(mut r) = renderer() else { return };
+        let red = || vec![quad(0.0, 0.0, 64.0, 64.0, RED)];
+        let with = |blur: f32, tint, saturate| {
+            let mut commands = red();
+            commands.push(glass(blur, tint, saturate, None));
+            commands
+        };
+        let Some(gray) = draw(&mut r, &frame(with(0.0, None, 0.0)), 64) else { return };
+        let g = at(&gray, 32, 32);
+        assert!(g[0].abs_diff(g[1]) < 6 && g[1].abs_diff(g[2]) < 6, "saturate 0 is gray: {g:?}");
+        assert!(g[0] > 40 && g[0] < 70, "at the red's luminance: {g:?}");
+        let Some(kept) = draw(&mut r, &frame(with(0.0, None, 1.0)), 64) else { return };
+        assert_eq!(at(&kept, 32, 32), [255, 0, 0, 255], "control: saturate 1 keeps the red");
+        let Some(tinted) = draw(&mut r, &frame(with(0.0, Some([0.0, 0.0, 1.0, 1.0]), 1.0)), 64) else { return };
+        assert_eq!(at(&tinted, 32, 32), [0, 0, 255, 255], "an opaque tint covers the backdrop");
+        let Some(half) = draw(&mut r, &frame(with(0.0, Some([0.0, 0.0, 1.0, 0.5]), 1.0)), 64) else { return };
+        let h = at(&half, 32, 32);
+        assert!(h[0] > 100 && h[2] > 100 && h[1] < 10, "a half tint mixes: {h:?}");
+        assert_eq!(at(&half, 4, 4), [255, 0, 0, 255], "outside the glass is untouched");
+    }
+
+    #[test]
+    fn a_material_reads_behind_and_it_is_zero_without_a_backdrop() {
+        let Some(mut r) = renderer() else { return };
+        let wgsl = "fn shade(px: Pixel) -> vec4<f32> { return vec4<f32>(px.behind.rgb, 1.0); }";
+        let mut over = vec![quad(0.0, 0.0, 64.0, 64.0, RED)];
+        over.push(glass(0.0, None, 1.0, Some(material(wgsl, &[]))));
+        let Some(with) = draw(&mut r, &frame(over), 64) else { return };
+        assert_eq!(at(&with, 32, 32), [255, 0, 0, 255], "the material paints what is behind");
+        let mut without = vec![quad(0.0, 0.0, 64.0, 64.0, RED)];
+        without.push(sdf(Rect { x: 16.0, y: 16.0, w: 32.0, h: 32.0 }, CLEAR, Some(material(wgsl, &[]))));
+        let Some(zero) = draw(&mut r, &frame(without), 64) else { return };
+        assert_eq!(at(&zero, 32, 32), [0, 0, 0, 255], "control: no backdrop, behind is zero");
+    }
+
+    fn target(id: &str, color: [f32; 4]) -> DrawCommand {
+        DrawCommand::Target {
+            id: id.into(),
+            width: 16,
+            height: 16,
+            live: false,
+            commands: vec![quad(0.0, 0.0, 16.0, 16.0, color)],
+        }
+    }
+
+    fn reader(id: &str) -> DrawCommand {
+        DrawCommand::Sprite {
+            texture: format!("target:{id}"),
+            src: Rect::default(),
+            dst: Rect { x: 8.0, y: 8.0, w: 16.0, h: 16.0 },
+            rotation: 0.0,
+            opacity: 1.0,
+            flip_x: false,
+            flip_y: false,
+        }
+    }
+
+    #[test]
+    fn a_target_paints_nothing_itself_and_a_sprite_paints_it() {
+        let Some(mut r) = renderer() else { return };
+        let Some(alone) = draw(&mut r, &frame(vec![target("t", GREEN)]), 64) else { return };
+        assert_eq!(at(&alone, 16, 16)[3], 0, "control: a target alone paints nothing in the frame");
+        let Some(shown) = draw(&mut r, &frame(vec![target("t", GREEN), reader("t")]), 64) else { return };
+        assert_eq!(at(&shown, 16, 16), [0, 255, 0, 255], "the sprite paints the target");
+        assert_eq!(at(&shown, 4, 4)[3], 0, "outside the sprite is empty");
+        assert_eq!(at(&shown, 30, 30)[3], 0, "outside the sprite is empty");
+    }
+
+    #[test]
+    fn a_reader_before_its_writer_reads_the_previous_frame() {
+        let Some(mut r) = renderer() else { return };
+        let packet = frame(vec![reader("t"), target("t", GREEN)]);
+        let Some(first) = draw(&mut r, &packet, 64) else { return };
+        assert_eq!(at(&first, 16, 16)[3], 0, "the first frame has no earlier texture to read");
+        let Some(second) = draw(&mut r, &packet, 64) else { return };
+        assert_eq!(at(&second, 16, 16), [0, 255, 0, 255], "the next frame reads what the writer left");
+        let Some(ordered) = draw(&mut r, &frame(vec![target("u", GREEN), reader("u")]), 64) else { return };
+        assert_eq!(at(&ordered, 16, 16), [0, 255, 0, 255], "control: a writer before its reader is read at once");
+    }
+
+    #[test]
+    fn a_reader_before_its_writer_sees_the_old_content_while_the_writer_repaints() {
+        let Some(mut r) = renderer() else { return };
+        let Some(_) = draw(&mut r, &frame(vec![target("t", GREEN)]), 64) else { return };
+        let Some(late) = draw(&mut r, &frame(vec![reader("t"), target("t", RED)]), 64) else { return };
+        assert_eq!(at(&late, 16, 16), [0, 255, 0, 255], "the reader before the writer shows last frame's green");
+        let Some(now) = draw(&mut r, &frame(vec![target("t", RED), reader("t")]), 64) else { return };
+        assert_eq!(at(&now, 16, 16), [255, 0, 0, 255], "control: after the writer it shows the new red");
+    }
+
+    #[test]
+    fn a_target_repaints_when_its_children_change_and_keeps_its_texture_when_they_do_not() {
+        let Some(mut r) = renderer() else { return };
+        let Some(green) = draw(&mut r, &frame(vec![target("t", GREEN), reader("t")]), 64) else { return };
+        assert_eq!(at(&green, 16, 16), [0, 255, 0, 255]);
+        let Some(again) = draw(&mut r, &frame(vec![target("t", GREEN), reader("t")]), 64) else { return };
+        assert_eq!(at(&again, 16, 16), [0, 255, 0, 255], "unchanged children keep the texture");
+        let Some(red) = draw(&mut r, &frame(vec![target("t", RED), reader("t")]), 64) else { return };
+        assert_eq!(at(&red, 16, 16), [255, 0, 0, 255], "changed children repaint it");
+    }
+
+    #[test]
+    fn a_material_samples_its_target_as_target_a() {
+        let Some(mut r) = renderer() else { return };
+        let wgsl = "fn shade(px: Pixel) -> vec4<f32> { return textureSampleLevel(target_a, target_sampler, px.uv, 0.0); }";
+        let left = Rect { x: 0.0, y: 32.0, w: 16.0, h: 16.0 };
+        let right = Rect { x: 32.0, y: 32.0, w: 16.0, h: 16.0 };
+        let both = frame(vec![
+            target("g", GREEN),
+            target("r", RED),
+            sdf(left, WHITE, Some(material(wgsl, &["g"]))),
+            sdf(right, WHITE, Some(material(wgsl, &["r"]))),
+        ]);
+        let Some(pixels) = draw(&mut r, &both, 64) else { return };
+        assert_eq!(at(&pixels, 8, 40), [0, 255, 0, 255], "the first shape samples the green target");
+        assert_eq!(at(&pixels, 40, 40), [255, 0, 0, 255], "the next shape, same WGSL, samples the red one");
+        let none = frame(vec![
+            target("g", GREEN),
+            sdf(left, WHITE, Some(material(wgsl, &[]))),
+            sdf(right, WHITE, Some(material(wgsl, &["nope"]))),
+        ]);
+        let Some(empty) = draw(&mut r, &none, 64) else { return };
+        assert_eq!(at(&empty, 8, 40)[3], 0, "control: no targets, nothing sampled");
+        assert_eq!(at(&empty, 40, 40)[3], 0, "control: an unknown target, nothing sampled");
     }
 }

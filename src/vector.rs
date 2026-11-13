@@ -193,6 +193,17 @@ pub(crate) struct PlacedGlyph {
 pub(crate) struct Shaped {
     pub glyphs: Vec<PlacedGlyph>,
     pub width: f32,
+    pub clusters: Vec<ShapedCluster>,
+}
+
+/// The text bytes one shaper cluster covers and the horizontal extent `x0..x1` of its glyphs (`x0 <= x1`), in the
+/// units of `size`; `rtl` is its bidi run's direction.
+#[derive(Debug, Clone)]
+pub(crate) struct ShapedCluster {
+    pub bytes: Range<usize>,
+    pub x0: f32,
+    pub x1: f32,
+    pub rtl: bool,
 }
 
 /// The face for `c` in `script`: the mono face when asked and it covers `c`, bundled Arabic, the bundled face when its cmap covers the
@@ -288,21 +299,40 @@ pub(crate) fn shape_in(text: &str, size: f32, bold: bool, family: Family) -> Sha
                 let Some(face) = font_for(font) else { continue };
                 let scale = size / face.units_per_em() as f32;
                 let mut buffer = UnicodeBuffer::new();
-                buffer.push_str(&text[range]);
+                buffer.push_str(&text[range.clone()]);
                 buffer.set_direction(if rtl {
                     Direction::RightToLeft
                 } else {
                     Direction::LeftToRight
                 });
                 let shaped = rustybuzz::shape(face, &[], buffer);
+                let piece_len = range.len();
+                let piece_start = range.start;
+                let mut groups: Vec<(u32, f32, f32)> = Vec::new();
                 for (info, pos) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
+                    let advance = pos.x_advance as f32 * scale;
+                    match groups.last_mut() {
+                        Some((c, _, x1)) if *c == info.cluster => *x1 = pen + advance,
+                        _ => groups.push((info.cluster, pen, pen + advance)),
+                    }
                     out.glyphs.push(PlacedGlyph {
                         font,
                         gid: info.glyph_id as u16,
                         x: pen + pos.x_offset as f32 * scale,
                         y: -(pos.y_offset as f32) * scale,
                     });
-                    pen += pos.x_advance as f32 * scale;
+                    pen += advance;
+                }
+                let mut starts: Vec<u32> = groups.iter().map(|g| g.0).collect();
+                starts.sort_unstable();
+                for (cluster, x0, x1) in groups {
+                    let end = starts.iter().copied().find(|s| *s > cluster).map_or(piece_len, |s| s as usize);
+                    out.clusters.push(ShapedCluster {
+                        bytes: piece_start + cluster as usize..piece_start + end,
+                        x0: x0.min(x1),
+                        x1: x0.max(x1),
+                        rtl,
+                    });
                 }
             }
         }

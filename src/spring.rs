@@ -140,7 +140,10 @@ pub(crate) fn has_live_material(scene: &Value) -> bool {
         live |= d
             .pointer("/material/live")
             .and_then(Value::as_bool)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || d.pointer("/target/live")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
     });
     live
 }

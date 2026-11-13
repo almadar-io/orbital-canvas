@@ -594,6 +594,13 @@ impl Xform {
                     flip_y: *flip_y,
                 }
             }
+            DrawCommand::SdfBackdrop { shape, backdrop } => DrawCommand::SdfBackdrop {
+                shape: Box::new(self.command(shape)),
+                backdrop: crate::packet::SdfBackdrop {
+                    blur: backdrop.blur * self.scale.abs(),
+                    ..*backdrop
+                },
+            },
             DrawCommand::SdfBlend {
                 first,
                 second,

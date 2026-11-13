@@ -187,6 +187,8 @@ fn build_pipeline(
     layout: &wgpu::PipelineLayout,
     format: wgpu::TextureFormat,
     source: &str,
+    fragment: &str,
+    blend: wgpu::BlendState,
 ) -> wgpu::RenderPipeline {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("sdf shader"),
@@ -203,10 +205,10 @@ fn build_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: &module,
-            entry_point: Some("fs_main"),
+            entry_point: Some(fragment),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                blend: Some(blend),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -230,9 +232,28 @@ fn build_pipeline(
 /// The pipelines of the pass: the plain one and one per material WGSL.
 pub(crate) struct SdfPass {
     layout: wgpu::BindGroupLayout,
+    aux_layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     format: wgpu::TextureFormat,
     pipelines: HashMap<u64, wgpu::RenderPipeline>,
+    backdrop: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
+    sampler: wgpu::Sampler,
+    empty: wgpu::TextureView,
+}
+
+/// A backdrop's two pipelines: the first clears the frame where the shape covers, the second adds the blurred frame.
+fn backdrop_blends() -> (wgpu::BlendState, wgpu::BlendState) {
+    let component = |src, dst| wgpu::BlendComponent {
+        src_factor: src,
+        dst_factor: dst,
+        operation: wgpu::BlendOperation::Add,
+    };
+    let cut = component(wgpu::BlendFactor::Zero, wgpu::BlendFactor::OneMinusSrcAlpha);
+    let add = component(wgpu::BlendFactor::One, wgpu::BlendFactor::One);
+    (
+        wgpu::BlendState { color: cut, alpha: cut },
+        wgpu::BlendState { color: add, alpha: add },
+    )
 }
 
 impl SdfPass {
@@ -250,22 +271,122 @@ impl SdfPass {
                 count: None,
             }],
         });
+        let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let aux_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sdf aux bind group layout"),
+            entries: &[
+                texture_entry(0),
+                texture_entry(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sdf pipeline layout"),
-            bind_group_layouts: &[&layout],
+            bind_group_layouts: &[&layout, &aux_layout],
             push_constant_ranges: &[],
         });
         let mut pipelines = HashMap::new();
         pipelines.insert(
             PLAIN_KEY,
-            build_pipeline(device, &pipeline_layout, format, &plain_source()),
+            build_pipeline(
+                device,
+                &pipeline_layout,
+                format,
+                &plain_source(),
+                "fs_main",
+                wgpu::BlendState::ALPHA_BLENDING,
+            ),
         );
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("sdf aux sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let empty = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("sdf empty texture"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
         Self {
             layout,
+            aux_layout,
             pipeline_layout,
             format,
             pipelines,
+            backdrop: None,
+            sampler,
+            empty,
         }
+    }
+
+    /// The group-1 bind group: the backdrop texture and the first render target, each an empty texel when absent.
+    pub(crate) fn aux_group(
+        &self,
+        device: &wgpu::Device,
+        behind: Option<&wgpu::TextureView>,
+        target: Option<&wgpu::TextureView>,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sdf aux bind group"),
+            layout: &self.aux_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(behind.unwrap_or(&self.empty)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(target.unwrap_or(&self.empty)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        })
+    }
+
+    /// Build the cut and add pipelines of backdrop shapes once.
+    pub(crate) fn ensure_backdrop(&mut self, device: &wgpu::Device) {
+        if self.backdrop.is_some() {
+            return;
+        }
+        let (cut, add) = backdrop_blends();
+        let source = plain_source();
+        self.backdrop = Some((
+            build_pipeline(device, &self.pipeline_layout, self.format, &source, "fs_backdrop_cut", cut),
+            build_pipeline(device, &self.pipeline_layout, self.format, &source, "fs_backdrop_add", add),
+        ));
+    }
+
+    pub(crate) fn backdrop_pipelines(&self) -> Option<(&wgpu::RenderPipeline, &wgpu::RenderPipeline)> {
+        self.backdrop.as_ref().map(|(cut, add)| (cut, add))
     }
 
     /// Compile the material's pipeline once; a WGSL that does not check is an error naming the reason.
@@ -285,6 +406,8 @@ impl SdfPass {
             &self.pipeline_layout,
             self.format,
             &material_source(wgsl),
+            "fs_main",
+            wgpu::BlendState::ALPHA_BLENDING,
         );
         self.pipelines.insert(key, pipeline);
         Ok(())

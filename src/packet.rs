@@ -293,6 +293,24 @@ pub struct SdfMaterial {
     /// Seconds from `material.anchor` to this frame's epoch, read as `Pixel.since`; 0 without an anchor or an epoch.
     #[serde(default)]
     pub since: f32,
+    /// Ids of render targets (`DrawCommand::Target`) the material samples; the first is `target_a` at `@group(1)`.
+    #[serde(default)]
+    pub targets: Vec<String>,
+}
+
+/// What a backdrop shape shows behind itself: the frame painted so far, Gaussian-blurred by sigma `blur / 2`
+/// painter pixels, saturated, and tinted.
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SdfBackdrop {
+    pub blur: f32,
+    #[serde(default)]
+    pub tint: Option<[f32; 4]>,
+    #[serde(default = "default_saturate")]
+    pub saturate: f32,
+}
+
+fn default_saturate() -> f32 {
+    1.0
 }
 
 /// One path operation. Angles are radians in screen convention (0 = +x,
@@ -438,6 +456,24 @@ pub enum DrawCommand {
         first: Box<DrawCommand>,
         second: Box<DrawCommand>,
         radius: f32,
+    },
+    /// An [`DrawCommand::Sdf`] whose coverage first shows `backdrop` (the frame painted so far, blurred) in place of
+    /// what is behind it; its fill and stroke then paint over that. It ends the SDF batch: the pass needs the frame
+    /// so far.
+    SdfBackdrop {
+        shape: Box<DrawCommand>,
+        backdrop: SdfBackdrop,
+    },
+    /// Children painted into an offscreen texture of `width` x `height` pixels (their origin at its top-left), and
+    /// nothing in the frame. A `Sprite` with `texture: "target:<id>"` paints it and a material lists it in
+    /// `targets`. It repaints when `commands` change, or every frame with `live`.
+    Target {
+        id: String,
+        width: u32,
+        height: u32,
+        #[serde(default)]
+        live: bool,
+        commands: Vec<DrawCommand>,
     },
     /// Draw a vector path: filled, stroked, or both (fill first). Rasterized
     /// anti-aliased in the vector layer.

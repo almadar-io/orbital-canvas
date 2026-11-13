@@ -20,6 +20,8 @@ struct Pixel {
   color: vec4<f32>,
   a: vec4<f32>,
   b: vec4<f32>,
+  // the blurred, saturated, tinted frame under the shape (straight alpha); zero without a `backdrop`
+  behind: vec4<f32>,
 }
 
 struct SdfParams {
@@ -29,6 +31,24 @@ struct SdfParams {
 }
 
 @group(0) @binding(0) var<uniform> sdf_params: SdfParams;
+
+// Group 1: the backdrop (the blurred frame under the shape, premultiplied, frame-sized), the shape's first render
+// target (`material.targets[0]`, premultiplied), and the sampler for both (linear, clamped).
+@group(1) @binding(0) var sdf_behind: texture_2d<f32>;
+@group(1) @binding(1) var target_a: texture_2d<f32>;
+@group(1) @binding(2) var target_sampler: sampler;
+
+fn sdf_behind_raw(pos: vec2<f32>) -> vec4<f32> {
+  let dims = vec2<f32>(textureDimensions(sdf_behind));
+  return textureSampleLevel(sdf_behind, target_sampler, pos / dims, 0.0);
+}
+
+fn sdf_unpremul(c: vec4<f32>) -> vec4<f32> {
+  if (c.a <= 0.0) {
+    return vec4<f32>(0.0);
+  }
+  return vec4<f32>(c.rgb / c.a, c.a);
+}
 
 const SDF_FIELDS: u32 = 12u;
 const SDF_PI: f32 = 3.14159265358979;
@@ -277,7 +297,7 @@ fn sdf_blend_fragment(in: SdfVsOut, aa: f32) -> vec4<f32> {
     pointer = vec2<f32>(dd.x * cs + dd.y * sn, -dd.x * sn + dd.y * cs) + hs;
   }
   let color = mix(fill_b, fill_a, u.y);
-  let px = Pixel(local, size, local / size, u.x, sdf_params.frame.z, sdf_inst(i, 11u).x, pointer, color, sdf_inst(i, 9u), sdf_inst(i, 10u));
+  let px = Pixel(local, size, local / size, u.x, sdf_params.frame.z, sdf_inst(i, 11u).x, pointer, color, sdf_inst(i, 9u), sdf_inst(i, 10u), sdf_unpremul(sdf_behind_raw(in.clip.xy)));
   let base = shade(px);
   let opacity = misc.w;
   let fill_cov = clamp(0.5 - u.x / aa, 0.0, 1.0);
@@ -388,7 +408,7 @@ fn fs_main(in: SdfVsOut) -> @location(0) vec4<f32> {
     let sn = sin(misc.z);
     pointer = vec2<f32>(dd.x * cs + dd.y * sn, -dd.x * sn + dd.y * cs) + hs;
   }
-  let px = Pixel(in.local, size, in.local / size, shape.d, sdf_params.frame.z, sdf_inst(i, 11u).x, pointer, fill, sdf_inst(i, 9u), sdf_inst(i, 10u));
+  let px = Pixel(in.local, size, in.local / size, shape.d, sdf_params.frame.z, sdf_inst(i, 11u).x, pointer, fill, sdf_inst(i, 9u), sdf_inst(i, 10u), sdf_unpremul(sdf_behind_raw(in.clip.xy)));
   var base = shade(px);
   let fill_cov = clamp(0.5 - shape.d / aa, 0.0, 1.0);
   let base_a = base.a * fill_cov * opacity;
@@ -424,4 +444,31 @@ fn fs_main(in: SdfVsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(0.0);
   }
   return vec4<f32>(acc.rgb / acc.a, acc.a);
+}
+
+// Coverage of the shape's fill times its opacity: the mask a backdrop is shown through.
+fn sdf_cover(in: SdfVsOut) -> f32 {
+  let aa = max(max(length(dpdx(in.local)), length(dpdy(in.local))), 0.0001);
+  let i = in.index;
+  let rect = sdf_inst(i, 0u);
+  let radii = sdf_inst(i, 1u);
+  let misc = sdf_inst(i, 2u);
+  let arcv = sdf_inst(i, 3u);
+  let p4 = sdf_inst(i, 4u);
+  let size = max(rect.zw, vec2<f32>(0.001));
+  let hs = size * 0.5;
+  let shape = sdf_shape(u32(misc.x + 0.5), in.local - hs, hs, radii, u32(misc.y + 0.5), arcv.xyz, vec2<f32>(arcv.w, p4.x));
+  return clamp(0.5 - shape.d / aa, 0.0, 1.0) * misc.w;
+}
+
+// Backdrop step 1: take away the frame's own pixels where the shape covers.
+@fragment
+fn fs_backdrop_cut(in: SdfVsOut) -> @location(0) vec4<f32> {
+  return vec4<f32>(0.0, 0.0, 0.0, sdf_cover(in));
+}
+
+// Backdrop step 2: add the blurred frame there, weighted by the same coverage.
+@fragment
+fn fs_backdrop_add(in: SdfVsOut) -> @location(0) vec4<f32> {
+  return sdf_behind_raw(in.clip.xy) * sdf_cover(in);
 }

@@ -84,6 +84,7 @@ pub struct Gathered {
     /// walked, so a label painted after its control still names it.
     texts: std::collections::HashMap<String, String>,
     labelled: Vec<(usize, String)>,
+    valued: Vec<(usize, String)>,
 }
 
 fn invalid(field: &str, detail: impl Into<String>) -> CanvasSceneError {
@@ -241,7 +242,14 @@ pub fn from_props_mapped(
         };
         gathered.semantic[index].name = text.clone();
     }
+    for (index, target) in std::mem::take(&mut gathered.valued) {
+        let Some(text) = gathered.texts.get(&target) else {
+            return Err(invalid("semantic.valueFrom", format!("names `{target}`, which is no draw-text with an id")));
+        };
+        gathered.semantic[index].value = Some(text.clone());
+    }
 
+    super::layer_props::check_target_cycles(&draw_commands)?;
     let packet = GameRenderPacket {
         pattern: "canvas-2d".into(),
         width,
@@ -460,6 +468,12 @@ fn walk(
         }
         gathered.labelled.push((gathered.semantic.len(), target));
     }
+    if let Some(target) = text("valueFrom") {
+        if semantic.get("value").is_some() {
+            return Err(invalid("semantic.valueFrom", "a semantic node takes its value from `value` or `valueFrom`, not both"));
+        }
+        gathered.valued.push((gathered.semantic.len(), target));
+    }
     gathered.semantic.push(super::scene::SemanticNode {
         id: id.to_owned(),
         role: text("role").ok_or_else(|| invalid("semantic.role", "a semantic node needs a role"))?,
@@ -575,6 +589,13 @@ fn walk_paint(
             gathered,
             out,
         )?,
+        Some("draw-emitter") => {
+            let particles = super::emitter::expand(node, epoch_now_ms)
+                .map_err(|e| invalid(e.field, e.detail))?;
+            for particle in &particles {
+                walk(particle, projector, to_screen, zoom, epoch_now_ms, gathered, out)?;
+            }
+        }
         Some("draw-fx-layer") => {
             for drawable in crate::fx_projection::expand_layer(
                 node,
@@ -781,6 +802,11 @@ fn paint_group(
             out,
         )?;
     }
+    if let Some(spec) = node.get("target").filter(|t| !t.is_null()) {
+        gathered.regions.truncate(region_start);
+        gathered.text_hits.truncate(hits_start);
+        return super::layer_props::collect_target(spec, (zero_x, zero_y), out, start);
+    }
     if radians != 0.0
         && out[start..]
             .iter()
@@ -878,7 +904,7 @@ fn paint_group(
     // a text hit's lines ride the same transform (text in a rotated group is refused above, so it only scales and moves)
     for hit in &mut gathered.text_hits[hits_start..] {
         for line in &mut hit.lines {
-            let (x0, x1) = (line.edges.first().copied().unwrap_or(0.0), line.edges.last().copied().unwrap_or(0.0));
+            let (x0, x1) = (line.edges.iter().copied().fold(f32::INFINITY, f32::min), line.edges.iter().copied().fold(f32::NEG_INFINITY, f32::max));
             let before = Rect { x: x0, y: line.top, w: (x1 - x0).max(f32::EPSILON), h: (line.bottom - line.top).max(f32::EPSILON) };
             let mut carrier = vec![DrawCommand::Sprite { texture: String::new(), src: Rect::default(), dst: before, rotation: 0.0, opacity: 1.0, flip_x: false, flip_y: false }];
             crate::animate::transform_group_commands(&mut carrier, origin, translation, scale, radians, 1.0);
@@ -1118,6 +1144,9 @@ fn commands_bounds(commands: &[DrawCommand]) -> Option<Rect> {
                 DrawCommand::Sdf { rect, .. } => {
                     add(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h)
                 }
+                DrawCommand::SdfBackdrop { shape, .. } => {
+                    walk_commands(std::slice::from_ref(shape.as_ref()), add)
+                }
                 DrawCommand::SdfBlend { first, second, .. } => {
                     walk_commands(std::slice::from_ref(first.as_ref()), add);
                     walk_commands(std::slice::from_ref(second.as_ref()), add);
@@ -1250,29 +1279,22 @@ impl TextEditing {
     }
 }
 
-/// The caret positions of each painted line: its first character index in `shown` and the advance before each of its
-/// characters and after the last. `None` when the lines do not join back into `shown` exactly or the text runs right to
-/// left, where prefix advances are not caret positions.
-fn caret_positions(lines: &[String], shown: &str, size: f32, bold: bool, family: crate::packet::TextFamily) -> Option<Vec<(usize, Vec<f32>)>> {
-    if lines.concat() != shown || unicode_bidi::BidiInfo::new(shown, None).has_rtl() {
+/// The layout of each painted line of an editable text: its first character index in `shown`, width, caret edges and
+/// per-character intervals from the shaped, bidi-reordered line. `None` when the lines do not join back into `shown`
+/// exactly or a character has no shaped glyph.
+fn caret_positions(lines: &[String], shown: &str, size: f32, bold: bool, family: crate::packet::TextFamily) -> Option<Vec<super::edit_layout::EditLayout>> {
+    if lines.concat() != shown {
         return None;
     }
     let mut start = 0;
-    Some(
-        lines
-            .iter()
-            .map(|line| {
-                let mut edges = vec![0.0];
-                for (i, _) in line.char_indices().skip(1) {
-                    edges.push(crate::vector::shape(&line[..i], size, bold, family).width);
-                }
-                edges.push(crate::vector::shape(line, size, bold, family).width);
-                let first = start;
-                start += line.chars().count();
-                (first, edges)
-            })
-            .collect(),
-    )
+    lines
+        .iter()
+        .map(|line| {
+            let laid = super::edit_layout::layout_line(line, start, size, bold, family);
+            start += line.chars().count();
+            laid
+        })
+        .collect()
 }
 
 /// One painted line of an editable text, in screen units: left edge, band top and height, first index, edges.
@@ -1282,6 +1304,12 @@ struct EditLine {
     height: f32,
     start: usize,
     edges: Vec<f32>,
+    spans: Vec<(f32, f32)>,
+}
+
+/// The merged visual intervals of the characters `from..to` of `line`, relative to its left edge.
+fn visual_ranges(line: &EditLine, from: usize, to: usize) -> Vec<(f32, f32)> {
+    super::edit_layout::EditLayout { start: line.start, width: 0.0, edges: Vec::new(), spans: line.spans.clone() }.ranges(from, to)
 }
 
 /// Paint `editing`'s selection bands behind the text (inserted at `text_start`) and its preedit underline and caret
@@ -1302,11 +1330,12 @@ fn paint_editing(
         let band = editing.selection_color.unwrap_or([text_color[0], text_color[1], text_color[2], text_color[3] * 0.3]);
         let bands: Vec<DrawCommand> = lines
             .iter()
-            .filter_map(|line| {
+            .flat_map(|line| {
                 let end = line.start + line.edges.len() - 1;
                 let (a, b) = (from.max(line.start), to.min(end));
-                (a < b).then(|| DrawCommand::Quad {
-                    rect: Rect { x: x_of(line, a), y: line.top, w: x_of(line, b) - x_of(line, a), h: line.height },
+                let ranges = if a < b { visual_ranges(line, a - line.start, b - line.start) } else { Vec::new() };
+                ranges.into_iter().map(move |(x0, x1)| DrawCommand::Quad {
+                    rect: Rect { x: line.left + x0, y: line.top, w: x1 - x0, h: line.height },
                     color: band,
                 })
             })
@@ -1319,11 +1348,12 @@ fn paint_editing(
     let line = lines.iter().rev().find(|line| holds(line, at)).or_else(|| lines.last());
     let Some(line) = line else { return };
     if preedit > 0 {
-        let (a, b) = (x_of(line, caret), x_of(line, caret + preedit));
-        out.push(DrawCommand::Quad {
-            rect: Rect { x: a, y: line.top + line.height - (size * 0.08).max(1.0), w: b - a, h: (size * 0.06).max(1.0) },
-            color: text_color,
-        });
+        for (x0, x1) in visual_ranges(line, caret.saturating_sub(line.start), (caret + preedit).saturating_sub(line.start)) {
+            out.push(DrawCommand::Quad {
+                rect: Rect { x: line.left + x0, y: line.top + line.height - (size * 0.08).max(1.0), w: x1 - x0, h: (size * 0.06).max(1.0) },
+                color: text_color,
+            });
+        }
     }
     let on = epoch_now_ms <= 0.0 || (epoch_now_ms / 530.0).floor() as i64 % 2 == 0;
     if on {
@@ -1466,19 +1496,19 @@ fn paint_text(
                     let edit_lines: Vec<EditLine> = positions
                         .into_iter()
                         .enumerate()
-                        .map(|(i, (start, edges))| {
-                            let w = edges.last().copied().unwrap_or(0.0);
+                        .map(|(i, laid)| {
+                            let w = laid.width;
                             let left = match align {
                                 TextAlign::Left => sx,
                                 TextAlign::Center => sx + (width - w) / 2.0,
                                 TextAlign::Right => sx + width - w,
                             };
-                            EditLine { left, top: sy + i as f32 * line_px, height: line_px, start, edges }
+                            EditLine { left, top: sy + i as f32 * line_px, height: line_px, start: laid.start, edges: laid.edges, spans: laid.spans }
                         })
                         .collect();
                     paint_editing(&editing, &edit_lines, color, size, epoch_now_ms, text_start, out);
                 }
-                None => gap_once("text-caret-layout", "draw-text caret and selection need lines that join back into the text, left to right"),
+                None => gap_once("text-caret-layout", "draw-text caret and selection need lines that join back into the text and shape every character"),
             }
         }
         let lines = paragraph.lines.len();
@@ -1502,8 +1532,9 @@ fn paint_text(
                             lines: positions
                                 .into_iter()
                                 .enumerate()
-                                .map(|(i, (start, edges))| {
-                                    let w = edges.last().copied().unwrap_or(0.0);
+                                .map(|(i, laid)| {
+                                    let (start, w) = (laid.start, laid.width);
+                                    let edges = laid.edges;
                                     let left = match align {
                                         TextAlign::Left => sx,
                                         TextAlign::Center => sx + (width - w) / 2.0,
@@ -1587,7 +1618,8 @@ fn paint_text(
                 });
                 if text == original {
                     if let Some(mut positions) = caret_positions(&[text.to_string()], text, size, bold, family) {
-                        let (start, edges) = positions.remove(0);
+                        let laid = positions.remove(0);
+                        let (start, edges) = (laid.start, laid.edges);
                         gathered.text_hits.push(super::scene::TextHit {
                             id: id.to_string(),
                             lines: vec![super::scene::TextHitLine {
@@ -1624,18 +1656,18 @@ fn paint_text(
     if editing.active() {
         match caret_positions(&[text.to_string()], text, size, bold, family) {
             Some(mut positions) => {
-                let (start, edges) = positions.remove(0);
-                let w = edges.last().copied().unwrap_or(0.0);
+                let laid = positions.remove(0);
+                let w = laid.width;
                 let left = match align {
                     TextAlign::Left => sx,
                     TextAlign::Center => sx - w / 2.0,
                     TextAlign::Right => sx - w,
                 };
                 let h = size * line_height;
-                let line = EditLine { left, top: sy - h / 2.0, height: h, start, edges };
+                let line = EditLine { left, top: sy - h / 2.0, height: h, start: laid.start, edges: laid.edges, spans: laid.spans };
                 paint_editing(&editing, &[line], color, size, epoch_now_ms, text_start, out);
             }
-            None => gap_once("text-caret-layout", "draw-text caret and selection need lines that join back into the text, left to right"),
+            None => gap_once("text-caret-layout", "draw-text caret and selection need lines that join back into the text and shape every character"),
         }
     }
     Ok(())
@@ -1854,6 +1886,21 @@ fn paint_sprite(
         gap_once("sprite-position", "draw-sprite without position");
         return Ok(());
     };
+    if let Some(texture) = node.get("texture").filter(|t| !t.is_null()) {
+        let texture = super::layer_props::target_texture(texture)?;
+        super::layer_props::require_sprite_size(node)?;
+        let src = node.get("frame").and_then(parse_xywh).unwrap_or_default();
+        out.push(DrawCommand::Sprite {
+            texture,
+            src,
+            dst: sprite_dst(node, position, projector, to_screen, zoom, src),
+            rotation: get_f32(node, "rotation", 0.0),
+            opacity: get_f32(node, "opacity", 1.0),
+            flip_x: node.get("flipX").and_then(Value::as_bool).unwrap_or(false),
+            flip_y: false,
+        });
+        return Ok(());
+    }
     let asset = node.get("asset");
     let url = asset
         .and_then(|a| a.get("url"))
@@ -2203,7 +2250,7 @@ fn push_styled_path(
 /// Whether a draw-shape is drawn by the SDF pass: a shape only it draws, or `corners` or a `material`.
 fn is_sdf_shape(node: &Value, shape: &str) -> bool {
     matches!(shape, "capsule" | "arc" | "polygon")
-        || ["corners", "material"]
+        || ["corners", "material", "backdrop"]
             .iter()
             .any(|key| node.get(*key).is_some_and(|v| !v.is_null()))
 }
@@ -2451,6 +2498,7 @@ fn paint_sdf_shape(
                 params,
                 live: spec.get("live").and_then(Value::as_bool).unwrap_or(false),
                 since,
+                targets: super::layer_props::material_targets(spec)?,
             })
         }
     };
@@ -2505,7 +2553,7 @@ fn paint_sdf_shape(
             }
         }
     };
-    if fill.is_none() && stroke.is_none() && material.is_none() {
+    if fill.is_none() && stroke.is_none() && material.is_none() && !super::layer_props::has_backdrop(node) {
         return Ok(());
     }
 
@@ -2558,7 +2606,7 @@ fn paint_sdf_shape(
         opacity,
         material,
     });
-    Ok(())
+    super::layer_props::wrap_backdrop(node, zoom, out)
 }
 
 /// Project one world shape through the shared Canvas vector commands.
@@ -3494,10 +3542,90 @@ mod tests {
         assert!(!has_active_fx(&editable(json!({}))), "control: plain text does not");
     }
 
+    fn edit_hit(extra: Value) -> (Vec<f32>, super::super::scene::TextHit) {
+        let mut props = extra;
+        props["hit"] = json!(true);
+        let (_, gathered) = from_props_mapped(&editable(props), 0.0).unwrap();
+        let hit = gathered.text_hits.into_iter().next().expect("a text hit");
+        (hit.lines[0].edges.clone(), hit)
+    }
+
+    fn sans_width(text: &str) -> f32 {
+        crate::vector::shape(text, 20.0, false, TextFamily::Sans).width
+    }
+
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 0.01
+    }
+
     #[test]
-    fn right_to_left_text_gets_no_caret_rather_than_a_wrong_one() {
-        let p = packet_for(editable(json!({ "text": "سلام", "caret": 1, "font": "20px serif" })));
-        assert!(quads(&p).is_empty(), "prefix advances are not caret positions in a right-to-left run");
+    fn pure_arabic_caret_positions_run_right_to_left() {
+        let (edges, _) = edit_hit(json!({ "text": "سلم" }));
+        let w = sans_width("سلم");
+        assert_eq!(edges.len(), 4);
+        assert!(near(edges[0], w) && near(edges[3], 0.0), "the first index is at the right edge, the end at the left: {edges:?}");
+        assert!(edges.windows(2).all(|p| p[0] > p[1]), "strictly leftward: {edges:?}");
+        let p = packet_for(editable(json!({ "text": "سلم", "caret": 1 })));
+        let q = quads(&p);
+        assert_eq!(q.len(), 1, "one caret bar");
+        assert!(near(q[0].x + q[0].w / 2.0, edges[1]), "the bar stands at the index-1 edge: {:?} vs {}", q[0], edges[1]);
+    }
+
+    #[test]
+    fn a_ligature_shares_its_advance_between_its_characters() {
+        let (edges, _) = edit_hit(json!({ "text": "سلام" }));
+        assert_eq!(edges.len(), 5);
+        assert!(near(edges[0], sans_width("سلام")) && near(edges[4], 0.0), "{edges:?}");
+        assert!(edges.windows(2).all(|p| p[0] > p[1]), "strictly leftward through the lam-alef ligature: {edges:?}");
+    }
+
+    #[test]
+    fn a_mixed_line_has_its_carets_in_visual_order_of_the_bidi_runs() {
+        let (edges, _) = edit_hit(json!({ "text": "aسلb" }));
+        let (wa, run, total) = (sans_width("a"), sans_width("سل"), sans_width("aسلb"));
+        assert_eq!(edges.len(), 5);
+        assert!(near(edges[0], 0.0) && near(edges[4], total), "{edges:?}");
+        assert!(near(edges[1], wa), "the boundary after 'a' is at the lower-level character's edge: {edges:?}");
+        assert!(near(edges[3], wa + run), "the boundary before 'b' is at b's leading edge: {edges:?}");
+        assert!(edges[1] < edges[2] && edges[2] < edges[3], "inside the run the index sits between: {edges:?}");
+    }
+
+    #[test]
+    fn a_selection_across_a_direction_boundary_paints_two_rects() {
+        let (edges, _) = edit_hit(json!({ "text": "aسلمb" }));
+        let wa = sans_width("a");
+        let split = quads(&packet_for(editable(json!({ "text": "aسلمb", "selectionStart": 2, "selectionEnd": 5 }))));
+        assert_eq!(split.len(), 2, "the run's left part and 'b' are not visually adjacent: {split:?}");
+        let mut rects = split.clone();
+        rects.sort_by(|a, b| a.x.total_cmp(&b.x));
+        assert!(near(rects[0].x, wa) && near(rects[0].x + rects[0].w, edges[2]), "{rects:?} {edges:?}");
+        assert!(near(rects[1].x, edges[4]) && near(rects[1].x + rects[1].w, edges[5]), "{rects:?} {edges:?}");
+        let whole = quads(&packet_for(editable(json!({ "text": "aسلمb", "selectionStart": 0, "selectionEnd": 4 }))));
+        assert_eq!(whole.len(), 1, "control: a range that stays visually contiguous paints one rect: {whole:?}");
+    }
+
+    #[test]
+    fn a_pointer_x_maps_back_to_the_logical_index_of_its_caret_edge() {
+        for text in ["سلم", "سلام", "aسلb", "aسلمb", "ab"] {
+            let (edges, hit) = edit_hit(json!({ "text": text }));
+            let y = hit.lines[0].top + 1.0;
+            for (i, x) in edges.iter().enumerate() {
+                assert_eq!(hit.index_at(*x, y), Some(i), "{text}: index {i} at x {x} in {edges:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn left_to_right_text_keeps_its_prefix_width_edges_and_right_alignment_ends_at_the_anchor() {
+        let (edges, _) = edit_hit(json!({ "text": "abc" }));
+        let expected: Vec<f32> = ["", "a", "ab", "abc"].iter().map(|p| sans_width(p)).collect();
+        assert!(edges.iter().zip(&expected).all(|(a, b)| near(*a, *b)), "{edges:?} vs {expected:?}");
+        let (right, _) = edit_hit(json!({ "text": "abc", "align": "right", "position": {"x": 200, "y": 0} }));
+        let w = sans_width("abc");
+        assert!(near(right[0], 200.0 - w) && near(right[3], 200.0), "{right:?}");
+        let (rtl, _) = edit_hit(json!({ "text": "سلم", "align": "right", "position": {"x": 200, "y": 0} }));
+        let w = sans_width("سلم");
+        assert!(near(rtl[0], 200.0) && near(rtl[3], 200.0 - w), "an RTL line ends at the anchor too: {rtl:?}");
     }
 
     #[test]
@@ -4386,6 +4514,34 @@ mod tests {
             matches!(&bad, CanvasSceneError::InvalidProp { field, .. } if field == "material.anchor"),
             "{bad:?}"
         );
+    }
+
+    #[test]
+    fn a_semantic_value_from_a_text_takes_that_text_as_its_value() {
+        let combo = |sem: Value| {
+            json!({"type": "draw-shape", "shape": "rect", "id": "season", "hit": true, "anchor": "top-left",
+                "position": {"x": 0, "y": 0}, "width": 40, "height": 20, "fill": "#000000", "semantic": sem})
+        };
+        let shown = json!({"type": "draw-text", "id": "season:value", "text": "الربيع", "anchor": "top-left",
+            "position": {"x": 0, "y": 0}, "color": "#ffffff"});
+        let (_, gathered) = from_props_mapped(
+            &free_props(json!([combo(json!({"role": "combobox", "name": "Season", "valueFrom": "season:value"})), shown.clone()])),
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(gathered.semantic[0].value.as_deref(), Some("الربيع"));
+        let (_, plain) = from_props_mapped(
+            &free_props(json!([combo(json!({"role": "combobox", "name": "Season", "value": "spring"})), shown.clone()])),
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(plain.semantic[0].value.as_deref(), Some("spring"), "control: a literal value is kept");
+        let both = from_props_mapped(
+            &free_props(json!([combo(json!({"role": "combobox", "name": "Season", "value": "spring", "valueFrom": "season:value"})), shown])),
+            0.0,
+        )
+        .unwrap_err();
+        assert!(matches!(&both, CanvasSceneError::InvalidProp { field, .. } if field == "semantic.valueFrom"), "{both:?}");
     }
 
     #[test]
