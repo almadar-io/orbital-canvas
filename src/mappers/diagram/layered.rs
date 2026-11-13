@@ -678,6 +678,195 @@ fn tidy(points: Vec<(f32, f32)>) -> Vec<(f32, f32)> {
     out
 }
 
+pub const PACK_GAP: f32 = 14.0;
+pub const PACK_ASPECT: f32 = 1.6;
+
+/// A trait's states and transitions laid out inside a compound box.
+#[derive(Debug, Clone)]
+pub struct MachineIn {
+    pub nodes: Vec<NodeIn>,
+    pub edges: Vec<EdgeIn>,
+    pub metrics: Metrics,
+}
+
+/// A compound node: a leaf of a fixed size, a container packing child boxes, or a machine
+/// (states laid out layered, child boxes packed to their right) sized to its content plus padding.
+#[derive(Debug, Clone)]
+pub struct BoxIn {
+    pub leaf: (f32, f32),
+    pub head: f32,
+    pub pad: f32,
+    pub min: (f32, f32),
+    pub machine: Option<MachineIn>,
+    pub children: Vec<BoxIn>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoxOut {
+    pub rect: Rect,
+    pub machine: Option<Layout>,
+    pub children: Vec<BoxOut>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Compound {
+    pub boxes: Vec<BoxOut>,
+    pub width: f32,
+    pub height: f32,
+}
+
+struct Sized {
+    w: f32,
+    h: f32,
+    machine: Option<Layout>,
+    kids: Vec<Sized>,
+    kid_at: Vec<(f32, f32)>,
+    kid_origin_x: f32,
+}
+
+/// Row-major shelf packing in declaration order toward a `PACK_ASPECT` box (or `target`).
+fn pack(sizes: &[(f32, f32)], target: Option<f32>) -> (Vec<(f32, f32)>, f32, f32) {
+    if sizes.is_empty() {
+        return (Vec::new(), 0.0, 0.0);
+    }
+    let widest = sizes.iter().map(|s| s.0).fold(0.0, f32::max);
+    let area: f32 = sizes
+        .iter()
+        .map(|s| (s.0 + PACK_GAP) * (s.1 + PACK_GAP))
+        .sum();
+    let limit = target
+        .unwrap_or_else(|| (area * PACK_ASPECT).sqrt())
+        .max(widest);
+    let (mut x, mut y, mut row_h, mut extent) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    let mut at = Vec::with_capacity(sizes.len());
+    for &(w, h) in sizes {
+        if x > 0.0 && x + w > limit {
+            y += row_h + PACK_GAP;
+            x = 0.0;
+            row_h = 0.0;
+        }
+        at.push((x, y));
+        x += w + PACK_GAP;
+        row_h = row_h.max(h);
+        extent = extent.max(x - PACK_GAP);
+    }
+    (at, extent, y + row_h)
+}
+
+fn measure(b: &BoxIn) -> Sized {
+    let kids: Vec<Sized> = b.children.iter().map(measure).collect();
+    let sizes: Vec<(f32, f32)> = kids.iter().map(|k| (k.w, k.h)).collect();
+    let (kid_at, kw, kh) = pack(&sizes, None);
+    match &b.machine {
+        None if kids.is_empty() => Sized {
+            w: b.leaf.0,
+            h: b.leaf.1,
+            machine: None,
+            kids,
+            kid_at,
+            kid_origin_x: 0.0,
+        },
+        None => Sized {
+            w: b.min.0.max(kw + 2.0 * b.pad),
+            h: b.min.1.max(b.head + kh + b.pad),
+            machine: None,
+            kids,
+            kid_at,
+            kid_origin_x: 0.0,
+        },
+        Some(m) => {
+            let inner = layout(&m.nodes, &m.edges, m.metrics);
+            let origin = if kids.is_empty() {
+                0.0
+            } else {
+                inner.width + m.metrics.layer_spacing
+            };
+            let content_w = origin + kw;
+            let content_h = inner.height.max(kh);
+            Sized {
+                w: b.min.0.max(content_w.max(inner.width) + 2.0 * b.pad),
+                h: b.min.1.max(b.head + content_h + b.pad),
+                machine: Some(inner),
+                kids,
+                kid_at,
+                kid_origin_x: origin,
+            }
+        }
+    }
+}
+
+fn place(s: Sized, b: &BoxIn, x: f32, y: f32) -> BoxOut {
+    let mut machine = s.machine;
+    if let Some(l) = machine.as_mut() {
+        shift_layout(l, x + b.pad, y + b.head);
+    }
+    let (ox, oy) = (x + b.pad + s.kid_origin_x, y + b.head);
+    let children = s
+        .kids
+        .into_iter()
+        .zip(&b.children)
+        .zip(&s.kid_at)
+        .map(|((k, kb), at)| place(k, kb, ox + at.0, oy + at.1))
+        .collect();
+    BoxOut {
+        rect: Rect {
+            x,
+            y,
+            w: s.w,
+            h: s.h,
+        },
+        machine,
+        children,
+    }
+}
+
+/// Lay out `roots` packed side by side from the origin: each box is sized to its content plus
+/// padding, a machine box holds its states and then its child boxes, a container only its children.
+/// Deterministic: the same input always yields the same boxes.
+pub fn compound(roots: &[BoxIn], target_width: Option<f32>) -> Compound {
+    let measured: Vec<Sized> = roots.iter().map(measure).collect();
+    let sizes: Vec<(f32, f32)> = measured.iter().map(|m| (m.w, m.h)).collect();
+    let (at, width, height) = pack(&sizes, target_width);
+    let boxes = measured
+        .into_iter()
+        .zip(roots)
+        .zip(&at)
+        .map(|((m, b), at)| place(m, b, at.0, at.1))
+        .collect();
+    Compound {
+        boxes,
+        width,
+        height,
+    }
+}
+
+fn shift_layout(l: &mut Layout, dx: f32, dy: f32) {
+    for n in &mut l.nodes {
+        n.x += dx;
+        n.y += dy;
+    }
+    for e in &mut l.edges {
+        for p in &mut e.points {
+            p.0 += dx;
+            p.1 += dy;
+        }
+        e.label.x += dx;
+        e.label.y += dy;
+    }
+}
+
+/// Move a box, its inner layout and everything nested in it.
+pub fn shift(b: &mut BoxOut, dx: f32, dy: f32) {
+    b.rect.x += dx;
+    b.rect.y += dy;
+    if let Some(l) = b.machine.as_mut() {
+        shift_layout(l, dx, dy);
+    }
+    for c in &mut b.children {
+        shift(c, dx, dy);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,5 +1031,125 @@ mod tests {
             vec![0.0, 100.0],
             "control: a pair already apart does not move"
         );
+    }
+
+    fn leaf_box(w: f32, h: f32) -> BoxIn {
+        BoxIn {
+            leaf: (w, h),
+            head: 0.0,
+            pad: 0.0,
+            min: (0.0, 0.0),
+            machine: None,
+            children: Vec::new(),
+        }
+    }
+
+    fn container(children: Vec<BoxIn>) -> BoxIn {
+        BoxIn {
+            leaf: (0.0, 0.0),
+            head: 38.0,
+            pad: 16.0,
+            min: (60.0, 58.0),
+            machine: None,
+            children,
+        }
+    }
+
+    fn inside(outer: Rect, inner: Rect) -> bool {
+        inner.x >= outer.x
+            && inner.y >= outer.y
+            && inner.x + inner.w <= outer.x + outer.w
+            && inner.y + inner.h <= outer.y + outer.h
+    }
+
+    #[test]
+    fn a_container_is_sized_to_its_children_plus_padding_and_head() {
+        let c = compound(&[container(vec![leaf_box(100.0, 28.0)])], None);
+        let parent = c.boxes[0].rect;
+        let child = c.boxes[0].children[0].rect;
+        assert!(inside(parent, child), "{parent:?} must contain {child:?}");
+        assert!(child.x >= parent.x + 16.0 && child.y >= parent.y + 38.0);
+        assert!(parent.w >= 100.0 + 32.0 && parent.h >= 28.0 + 38.0 + 16.0);
+        assert_eq!((c.width, c.height), (parent.w, parent.h));
+    }
+
+    #[test]
+    fn a_machine_box_holds_its_states_and_its_child_boxes_side_by_side() {
+        let machine = MachineIn {
+            nodes: vec![node(100.0, true), node(100.0, false)],
+            edges: vec![edge(0, 1)],
+            metrics: M,
+        };
+        let host = BoxIn {
+            leaf: (0.0, 0.0),
+            head: 46.0,
+            pad: 16.0,
+            min: (60.0, 66.0),
+            machine: Some(machine),
+            children: vec![leaf_box(90.0, 28.0)],
+        };
+        let c = compound(&[host], None);
+        let parent = c.boxes[0].rect;
+        let inner = c.boxes[0].machine.as_ref().unwrap();
+        let child = c.boxes[0].children[0].rect;
+        for n in &inner.nodes {
+            assert!(inside(parent, *n), "state {n:?} sits in {parent:?}");
+        }
+        assert!(inside(parent, child));
+        let states_right = inner.nodes.iter().map(|n| n.x + n.w).fold(0.0, f32::max);
+        assert!(child.x >= states_right, "children follow the states");
+    }
+
+    #[test]
+    fn many_leaves_pack_into_rows_in_declaration_order_and_the_layout_is_deterministic() {
+        let leaves: Vec<BoxIn> = (0..12).map(|_| leaf_box(100.0, 28.0)).collect();
+        let a = compound(&leaves, None);
+        let b = compound(&leaves, None);
+        let xs: Vec<f32> = a.boxes.iter().map(|x| x.rect.x).collect();
+        let ys: Vec<f32> = a.boxes.iter().map(|x| x.rect.y).collect();
+        assert!(xs.iter().any(|x| *x > 0.0), "more than one column");
+        assert!(ys.iter().any(|y| *y > 0.0), "more than one row");
+        for pair in a.boxes.windows(2) {
+            let (p, q) = (pair[0].rect, pair[1].rect);
+            assert!(q.y > p.y || q.x > p.x, "row-major order: {p:?} then {q:?}");
+        }
+        let again: Vec<(f32, f32)> = b.boxes.iter().map(|x| (x.rect.x, x.rect.y)).collect();
+        let first: Vec<(f32, f32)> = a.boxes.iter().map(|x| (x.rect.x, x.rect.y)).collect();
+        assert_eq!(first, again);
+    }
+
+    #[test]
+    fn a_single_leaf_keeps_its_own_size_and_nothing_is_empty_safe() {
+        let c = compound(&[leaf_box(120.0, 30.0)], None);
+        assert_eq!((c.width, c.height), (120.0, 30.0));
+        assert_eq!(c.boxes[0].rect.w, 120.0);
+        let none = compound(&[], None);
+        assert!(none.boxes.is_empty() && none.width == 0.0 && none.height == 0.0);
+    }
+
+    #[test]
+    fn shifting_a_box_moves_its_children_and_inner_layout_together() {
+        let machine = MachineIn {
+            nodes: vec![node(100.0, true)],
+            edges: Vec::new(),
+            metrics: M,
+        };
+        let host = BoxIn {
+            machine: Some(machine),
+            children: vec![leaf_box(50.0, 20.0)],
+            ..container(Vec::new())
+        };
+        let mut c = compound(&[host], None);
+        let before = (
+            c.boxes[0].children[0].rect,
+            c.boxes[0].machine.as_ref().unwrap().nodes[0],
+        );
+        shift(&mut c.boxes[0], 10.0, 20.0);
+        let after = (
+            c.boxes[0].children[0].rect,
+            c.boxes[0].machine.as_ref().unwrap().nodes[0],
+        );
+        assert_eq!(after.0.x, before.0.x + 10.0);
+        assert_eq!(after.1.y, before.1.y + 20.0);
     }
 }

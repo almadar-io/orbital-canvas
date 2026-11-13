@@ -3,7 +3,7 @@
 //! out left to right, themed by tone, with the execution position (active state, fired
 //! transition, visited path). Layout is [`super::layered`] (the web uses ELK).
 
-use super::draw::{tint, with_alpha, Ink, Motion, Pen};
+use super::draw::{mix, tint, with_alpha, Ink, Motion, Pen};
 use super::effect_glyph;
 use super::layered::{self, EdgeIn, Layout, Metrics, NodeIn};
 use crate::mappers::learning::theme::Rgba;
@@ -12,6 +12,7 @@ use crate::packet::{Easing, Keyframe, TextAlign};
 use crate::vector::{mono_text_width, text_width};
 use orbital_core_base::schema::{format_sexpr, SExpression};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::f32::consts::TAU;
 
 /// `strokeOpacity` of the active-state ring; its SMIL animation swings it 0.28 -> 0.06 -> 0.28.
@@ -983,6 +984,1255 @@ impl Diagram<'_> {
                 }
             }
             x += w + 8.0;
+        }
+    }
+}
+
+/// One state of a `MountedTrait`.
+pub type MountedState = StateInfo;
+
+#[derive(Debug, Clone)]
+pub struct MountedTransition {
+    pub index: usize,
+    pub from: Vec<String>,
+    pub to: String,
+    pub event: String,
+    pub guarded: bool,
+    pub emits: Vec<String>,
+}
+
+/// `MountedTrait`: one trait of a mounted orbital (`program/self { mounted: true }`).
+#[derive(Debug, Clone)]
+pub struct MountedTrait {
+    pub name: String,
+    pub orbital: Option<String>,
+    pub parent: Option<String>,
+    pub depth: usize,
+    pub embedded_in: Vec<String>,
+    pub renders: bool,
+    pub linked: bool,
+    pub linked_entity: Option<String>,
+    pub states: Vec<MountedState>,
+    pub transitions: Vec<MountedTransition>,
+    pub instances: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MountedWire {
+    pub from: String,
+    pub to: String,
+    pub event: String,
+    pub triggers: Option<String>,
+}
+
+/// `MountedOrbital`: the `orbital` prop of `state-machine-view`.
+#[derive(Debug, Clone, Default)]
+pub struct Mounted {
+    pub traits: Vec<MountedTrait>,
+    pub wires: Vec<MountedWire>,
+}
+
+fn text(v: &Value, key: &str) -> Option<String> {
+    v.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+impl Mounted {
+    /// `None` unless `v` is an orbital with at least one trait: the web falls back to the
+    /// single-trait view for an absent, null or empty `orbital`.
+    pub fn from_value(v: &Value) -> Option<Self> {
+        let traits: Vec<MountedTrait> = v
+            .get("traits")?
+            .as_array()?
+            .iter()
+            .filter_map(|t| {
+                Some(MountedTrait {
+                    name: text(t, "trait")?,
+                    orbital: text(t, "orbital"),
+                    parent: text(t, "parent"),
+                    depth: t.get("depth").and_then(Value::as_u64).unwrap_or(0) as usize,
+                    embedded_in: strings(t.get("embeddedIn")),
+                    renders: t.get("renders").and_then(Value::as_bool).unwrap_or(false),
+                    linked: flag(t, "linked"),
+                    linked_entity: text(t, "linkedEntity"),
+                    states: t
+                        .get("states")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .map(|s| StateInfo {
+                                    name: text(s, "name").unwrap_or_default(),
+                                    is_initial: flag(s, "isInitial"),
+                                    is_terminal: flag(s, "isTerminal"),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    transitions: t
+                        .get("transitions")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .enumerate()
+                                .map(|(i, tr)| MountedTransition {
+                                    index: tr
+                                        .get("index")
+                                        .and_then(Value::as_u64)
+                                        .map_or(i, |n| n as usize),
+                                    from: source_names(tr.get("from")),
+                                    to: text(tr, "to").unwrap_or_default(),
+                                    event: text(tr, "event").unwrap_or_default(),
+                                    guarded: flag(tr, "guarded"),
+                                    emits: strings(tr.get("emits")),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    instances: t
+                        .get("instances")
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(|i| text(i, "state")).collect())
+                        .unwrap_or_default(),
+                })
+            })
+            .collect();
+        if traits.is_empty() {
+            return None;
+        }
+        let wires = v
+            .get("wires")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|w| {
+                        Some(MountedWire {
+                            from: text(w, "from")?,
+                            to: text(w, "to")?,
+                            event: text(w, "event")?,
+                            triggers: text(w, "triggers"),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(Self { traits, wires })
+    }
+}
+
+/// The orbital-mode props of `state-machine-view` besides `orbital`.
+#[derive(Debug, Clone)]
+pub struct OrbitalOpts {
+    pub active: Vec<(String, String)>,
+    /// `route`, or `[firedTransition]` when no route is given: the transitions drawn as fired.
+    pub steps: Vec<(String, usize)>,
+    pub expand_depth: f64,
+    pub selected: Option<String>,
+    pub select_event: Option<String>,
+    pub rtl: bool,
+}
+
+fn trait_steps(v: Option<&Value>) -> Vec<(String, usize)> {
+    v.and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| {
+                    Some((
+                        text(s, "trait")?,
+                        s.get("index").and_then(Value::as_u64)? as usize,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+impl OrbitalOpts {
+    pub fn from_props(props: &Value) -> Self {
+        let route = trait_steps(props.get("route"));
+        let fired = props
+            .get("firedTransition")
+            .filter(|f| f.is_object())
+            .map(|f| trait_steps(Some(&Value::Array(vec![f.clone()]))))
+            .unwrap_or_default();
+        Self {
+            active: props
+                .get("activeStates")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| Some((text(s, "trait")?, text(s, "state")?)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            steps: if route.is_empty() { fired } else { route },
+            expand_depth: props
+                .get("expandDepth")
+                .and_then(Value::as_f64)
+                .unwrap_or(2.0),
+            selected: text(props, "selectedTrait").filter(|t| !t.is_empty()),
+            select_event: text(props, "selectEvent").filter(|t| !t.is_empty()),
+            rtl: text(props, "direction").as_deref() == Some("rtl"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxKind {
+    Machine,
+    Collapsed,
+    Chip,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlacedBox {
+    pub trait_name: String,
+    pub kind: BoxKind,
+    pub lane: bool,
+    /// The box this one sits inside; `None` for a root, a lane box and a linked-group member.
+    pub parent: Option<String>,
+    pub container: bool,
+    pub rect: layered::Rect,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlacedState {
+    pub trait_name: String,
+    pub name: String,
+    pub is_initial: bool,
+    pub is_terminal: bool,
+    pub rect: layered::Rect,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlacedEdge {
+    pub trait_name: String,
+    pub index: usize,
+    pub from: String,
+    pub to: String,
+    pub event: String,
+    pub guarded: bool,
+    pub points: Vec<(f32, f32)>,
+    pub label: layered::Rect,
+}
+
+/// Self-transitions of one state folded into a count chip on the state.
+#[derive(Debug, Clone)]
+pub struct PlacedLoop {
+    pub trait_name: String,
+    pub state: String,
+    pub indexes: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlacedEmbed {
+    pub trait_name: String,
+    pub state: String,
+    pub points: Vec<(f32, f32)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlacedWire {
+    pub from: String,
+    pub to: String,
+    pub events: Vec<String>,
+    pub points: Vec<(f32, f32)>,
+    pub label: layered::Rect,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlacedGroup {
+    pub orbital: String,
+    pub rect: layered::Rect,
+}
+
+/// A laid-out whole orbital: its natural size and everything needed to paint it.
+pub struct OrbitalDiagram<'a> {
+    pub mounted: &'a Mounted,
+    pub opts: &'a OrbitalOpts,
+    pub boxes: Vec<PlacedBox>,
+    pub states: Vec<PlacedState>,
+    pub edges: Vec<PlacedEdge>,
+    pub loops: Vec<PlacedLoop>,
+    pub embeds: Vec<PlacedEmbed>,
+    pub wires: Vec<PlacedWire>,
+    pub groups: Vec<PlacedGroup>,
+    pub lane_top: Option<f32>,
+    pub group_top: Option<f32>,
+    pub width: f32,
+    pub height: f32,
+}
+
+const BOX_PAD: f32 = 16.0;
+const BOX_HEAD_MACHINE: f32 = 46.0;
+const BOX_HEAD_CONTAINER: f32 = 38.0;
+const COLLAPSED_H: f32 = 56.0;
+const CHIP_H: f32 = 28.0;
+const HEAD_GLYPH: f32 = 40.0;
+const HEAD_TOGGLE: f32 = 28.0;
+const LOOP_FOLD: usize = 3;
+const LOOP_LINE: f32 = 18.0;
+const LANE_HEAD: f32 = 30.0;
+const LANE_MARGIN: f32 = 36.0;
+const LANE_MIN_WIDTH: f32 = 480.0;
+const GLYPH_ROOM: f32 = 20.0;
+const ORBITAL_ACTIVE_STROKE: f32 = 2.5;
+const ORBITAL_WIRE_STROKE: f32 = 1.5;
+const BACKGROUND_CAPTION: &str = "Runs in the background";
+const LINKED_CAPTION: &str = "Other orbitals this page talks to";
+
+struct EdgeMeta {
+    from: String,
+    to: String,
+    event: String,
+    index: usize,
+    guarded: bool,
+}
+
+struct Named {
+    name: String,
+    kind: BoxKind,
+    edges: Vec<EdgeMeta>,
+    kids: Vec<Named>,
+}
+
+struct Ctx<'a> {
+    o: &'a OrbitalOpts,
+    children_of: HashMap<&'a str, Vec<&'a MountedTrait>>,
+}
+
+impl Ctx<'_> {
+    fn kind(&self, t: &MountedTrait) -> BoxKind {
+        if t.states.len() <= 1 {
+            BoxKind::Chip
+        } else if (t.depth as f64) < self.o.expand_depth {
+            BoxKind::Machine
+        } else {
+            BoxKind::Collapsed
+        }
+    }
+
+    fn compact(&self, t: &MountedTrait, kind: BoxKind) -> (f32, f32) {
+        if kind == BoxKind::Chip {
+            return (
+                (t.name.chars().count() as f32 * BODY_CHAR + 28.0 + HEAD_GLYPH).round(),
+                CHIP_H,
+            );
+        }
+        let sub = t.linked_entity.as_deref().unwrap_or("").chars().count();
+        let longest = t.name.chars().count().max(sub) as f32;
+        (
+            132.0f32.max((longest * BODY_CHAR + 64.0 + HEAD_GLYPH + HEAD_TOGGLE).round()),
+            COLLAPSED_H,
+        )
+    }
+
+    fn build(&self, t: &MountedTrait, loops: &mut Vec<PlacedLoop>) -> (layered::BoxIn, Named) {
+        let kind = self.kind(t);
+        let kids: Vec<&MountedTrait> = self
+            .children_of
+            .get(t.name.as_str())
+            .cloned()
+            .unwrap_or_default();
+        if kind != BoxKind::Machine && kids.is_empty() {
+            let (w, h) = self.compact(t, kind);
+            return (
+                layered::BoxIn {
+                    leaf: (w, h),
+                    head: 0.0,
+                    pad: 0.0,
+                    min: (0.0, 0.0),
+                    machine: None,
+                    children: Vec::new(),
+                },
+                Named {
+                    name: t.name.clone(),
+                    kind,
+                    edges: Vec::new(),
+                    kids: Vec::new(),
+                },
+            );
+        }
+        let head = if kind == BoxKind::Machine {
+            BOX_HEAD_MACHINE
+        } else {
+            BOX_HEAD_CONTAINER
+        };
+        let sub = t.linked_entity.as_deref().unwrap_or("").chars().count();
+        let title = (t.name.chars().count().max(sub) as f32 * BODY_CHAR
+            + 32.0
+            + HEAD_GLYPH
+            + if kind == BoxKind::Chip {
+                0.0
+            } else {
+                HEAD_TOGGLE
+            })
+        .round();
+        let (kid_boxes, kid_names): (Vec<_>, Vec<_>) =
+            kids.iter().map(|k| self.build(k, loops)).unzip();
+        let mut out = layered::BoxIn {
+            leaf: (0.0, 0.0),
+            head,
+            pad: BOX_PAD,
+            min: (title, head + 20.0),
+            machine: None,
+            children: kid_boxes,
+        };
+        let mut named = Named {
+            name: t.name.clone(),
+            kind,
+            edges: Vec::new(),
+            kids: kid_names,
+        };
+        if kind != BoxKind::Machine {
+            return (out, named);
+        }
+        let mut self_count: HashMap<&str, usize> = HashMap::new();
+        for tr in &t.transitions {
+            for from in tr.from.iter().filter(|f| **f == tr.to) {
+                *self_count.entry(from.as_str()).or_default() += 1;
+            }
+        }
+        let folded = |name: &str| self_count.get(name).copied().unwrap_or(0) >= LOOP_FOLD;
+        for st in t.states.iter().filter(|s| folded(&s.name)) {
+            loops.push(PlacedLoop {
+                trait_name: t.name.clone(),
+                state: st.name.clone(),
+                indexes: t
+                    .transitions
+                    .iter()
+                    .filter(|tr| tr.to == st.name && tr.from.contains(&st.name))
+                    .map(|tr| tr.index)
+                    .collect(),
+            });
+        }
+        let nodes: Vec<NodeIn> = t
+            .states
+            .iter()
+            .map(|s| {
+                let (w, h) = node_size(&s.name, NodeShape::Pill);
+                NodeIn {
+                    w,
+                    h: h + if folded(&s.name) { LOOP_LINE } else { 0.0 },
+                    initial: s.is_initial,
+                }
+            })
+            .collect();
+        let index = |name: &str| t.states.iter().position(|s| s.name == name);
+        let mut edges = Vec::new();
+        for tr in &t.transitions {
+            for from in &tr.from {
+                if *from == tr.to && folded(from) {
+                    continue;
+                }
+                let (Some(f), Some(to)) = (index(from), index(&tr.to)) else {
+                    continue;
+                };
+                let (label_w, label_h) = label_size(&TransitionInfo {
+                    from: from.clone(),
+                    to: tr.to.clone(),
+                    event: tr.event.clone(),
+                    guard: None,
+                    effects: Vec::new(),
+                    index: tr.index,
+                });
+                edges.push(EdgeIn {
+                    from: f,
+                    to,
+                    label_w,
+                    label_h,
+                });
+                named.edges.push(EdgeMeta {
+                    from: from.clone(),
+                    to: tr.to.clone(),
+                    event: tr.event.clone(),
+                    index: tr.index,
+                    guarded: tr.guarded,
+                });
+            }
+        }
+        out.machine = Some(layered::MachineIn {
+            nodes,
+            edges,
+            metrics: Metrics {
+                node_spacing: 40.0,
+                layer_spacing: 88.0,
+                rtl: self.o.rtl,
+            },
+        });
+        (out, named)
+    }
+}
+
+struct Collected {
+    boxes: Vec<PlacedBox>,
+    states: Vec<PlacedState>,
+    edges: Vec<PlacedEdge>,
+}
+
+fn collect(
+    bo: &layered::BoxOut,
+    named: &Named,
+    m: &Mounted,
+    parent: Option<&str>,
+    lane: bool,
+    out: &mut Collected,
+) {
+    out.boxes.push(PlacedBox {
+        trait_name: named.name.clone(),
+        kind: named.kind,
+        lane,
+        parent: parent.map(str::to_string),
+        container: !named.kids.is_empty(),
+        rect: bo.rect,
+    });
+    if let (Some(l), Some(t)) = (&bo.machine, m.traits.iter().find(|t| t.name == named.name)) {
+        for (i, s) in t.states.iter().enumerate() {
+            out.states.push(PlacedState {
+                trait_name: t.name.clone(),
+                name: s.name.clone(),
+                is_initial: s.is_initial,
+                is_terminal: s.is_terminal,
+                rect: l.nodes[i],
+            });
+        }
+        for (k, e) in l.edges.iter().enumerate() {
+            let meta = &named.edges[k];
+            out.edges.push(PlacedEdge {
+                trait_name: t.name.clone(),
+                index: meta.index,
+                from: meta.from.clone(),
+                to: meta.to.clone(),
+                event: meta.event.clone(),
+                guarded: meta.guarded,
+                points: e.points.clone(),
+                label: e.label,
+            });
+        }
+    }
+    for (child, kid) in bo.children.iter().zip(&named.kids) {
+        collect(child, kid, m, Some(&named.name), lane, out);
+    }
+}
+
+fn box_wire_path(a: layered::Rect, b: layered::Rect) -> Vec<(f32, f32)> {
+    let (ax, ay) = (a.x + a.w / 2.0, a.y + a.h / 2.0);
+    let (bx, by) = (b.x + b.w / 2.0, b.y + b.h / 2.0);
+    if b.x >= a.x + a.w {
+        vec![(a.x + a.w, ay), (b.x, by)]
+    } else if a.x >= b.x + b.w {
+        vec![(a.x, ay), (b.x + b.w, by)]
+    } else if by >= ay {
+        vec![(ax, a.y + a.h), (bx, b.y)]
+    } else {
+        vec![(ax, a.y), (bx, b.y + b.h)]
+    }
+}
+
+fn wire_label_size(text: &str) -> (f32, f32) {
+    (
+        (text.encode_utf16().count() as f32 * MONO_CHAR + 16.0 + GLYPH_ROOM).round(),
+        PILL_H - 4.0,
+    )
+}
+
+/// `computeOrbitalLayout`: every rendering trait a box nested in its nearest rendering ancestor,
+/// a background lane for the traits that never paint, the linked orbitals' traits grouped below.
+pub fn prepare_orbital<'a>(m: &'a Mounted, o: &'a OrbitalOpts) -> OrbitalDiagram<'a> {
+    let by_name: HashMap<&str, &MountedTrait> =
+        m.traits.iter().map(|t| (t.name.as_str(), t)).collect();
+    let tree: Vec<&MountedTrait> = m.traits.iter().filter(|t| t.renders && !t.linked).collect();
+    let lane: Vec<&MountedTrait> = m
+        .traits
+        .iter()
+        .filter(|t| !t.renders && !t.linked)
+        .collect();
+    let mut linked: Vec<(String, Vec<&MountedTrait>)> = Vec::new();
+    for t in m.traits.iter().filter(|t| t.linked) {
+        let key = t.orbital.clone().unwrap_or_default();
+        match linked.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => v.push(t),
+            None => linked.push((key, vec![t])),
+        }
+    }
+    let effective_parent = |t: &MountedTrait| -> Option<&str> {
+        let mut cur = t.parent.as_deref().and_then(|p| by_name.get(p));
+        let mut hops = 0;
+        while let Some(c) = cur {
+            if c.renders || hops > m.traits.len() {
+                return c.renders.then_some(c.name.as_str());
+            }
+            cur = c.parent.as_deref().and_then(|p| by_name.get(p));
+            hops += 1;
+        }
+        None
+    };
+    let mut children_of: HashMap<&str, Vec<&MountedTrait>> = HashMap::new();
+    let mut roots: Vec<&MountedTrait> = Vec::new();
+    for t in &tree {
+        match effective_parent(t) {
+            Some(p) => children_of.entry(p).or_default().push(t),
+            None => roots.push(t),
+        }
+    }
+    let cx = Ctx { o, children_of };
+    let mut loops = Vec::new();
+    let (root_boxes, root_names): (Vec<_>, Vec<_>) =
+        roots.iter().map(|t| cx.build(t, &mut loops)).unzip();
+    let main = layered::compound(&root_boxes, None);
+    let mut found = Collected {
+        boxes: Vec::new(),
+        states: Vec::new(),
+        edges: Vec::new(),
+    };
+    for (bo, named) in main.boxes.iter().zip(&root_names) {
+        collect(bo, named, m, None, false, &mut found);
+    }
+    let (mut width, mut height) = (main.width, main.height);
+
+    let mut lane_top = None;
+    if !lane.is_empty() {
+        let top = height + LANE_MARGIN;
+        lane_top = Some(top);
+        let kinds: Vec<BoxKind> = lane
+            .iter()
+            .map(|t| {
+                if cx.kind(t) == BoxKind::Chip {
+                    BoxKind::Chip
+                } else {
+                    BoxKind::Collapsed
+                }
+            })
+            .collect();
+        let leaves: Vec<layered::BoxIn> = lane
+            .iter()
+            .zip(&kinds)
+            .map(|(t, k)| layered::BoxIn {
+                leaf: cx.compact(t, *k),
+                head: 0.0,
+                pad: 0.0,
+                min: (0.0, 0.0),
+                machine: None,
+                children: Vec::new(),
+            })
+            .collect();
+        let packed = layered::compound(&leaves, Some(width.max(LANE_MIN_WIDTH)));
+        for ((bo, t), kind) in packed.boxes.iter().zip(&lane).zip(&kinds) {
+            let mut rect = bo.rect;
+            rect.y += top + LANE_HEAD;
+            found.boxes.push(PlacedBox {
+                trait_name: t.name.clone(),
+                kind: *kind,
+                lane: true,
+                parent: None,
+                container: false,
+                rect,
+            });
+        }
+        width = width.max(packed.width);
+        height = top + LANE_HEAD + packed.height;
+    }
+
+    let mut groups = Vec::new();
+    let mut group_top = None;
+    if !linked.is_empty() {
+        let top = height + LANE_MARGIN;
+        group_top = Some(top);
+        let mut group_boxes = Vec::new();
+        let mut group_names = Vec::new();
+        for (name, traits) in &linked {
+            let (kids, names): (Vec<_>, Vec<_>) =
+                traits.iter().map(|t| cx.build(t, &mut loops)).unzip();
+            group_boxes.push(layered::BoxIn {
+                leaf: (0.0, 0.0),
+                head: BOX_HEAD_CONTAINER,
+                pad: BOX_PAD,
+                min: (
+                    (name.chars().count() as f32 * BODY_CHAR + 32.0 + HEAD_GLYPH).round(),
+                    BOX_HEAD_CONTAINER + 20.0,
+                ),
+                machine: None,
+                children: kids,
+            });
+            group_names.push(names);
+        }
+        let packed = layered::compound(&group_boxes, Some(width.max(LANE_MIN_WIDTH)));
+        for ((bo, (name, _)), names) in packed.boxes.iter().zip(&linked).zip(&group_names) {
+            let mut moved = bo.clone();
+            layered::shift(&mut moved, 0.0, top + LANE_HEAD);
+            groups.push(PlacedGroup {
+                orbital: name.clone(),
+                rect: moved.rect,
+            });
+            for (child, named) in moved.children.iter().zip(names) {
+                collect(child, named, m, None, false, &mut found);
+            }
+        }
+        width = width.max(packed.width);
+        height = top + LANE_HEAD + packed.height;
+    }
+
+    let mut embeds = Vec::new();
+    for t in &tree {
+        let Some(parent) = effective_parent(t) else {
+            continue;
+        };
+        let Some(child) = found.boxes.iter().find(|b| b.trait_name == t.name) else {
+            continue;
+        };
+        for state in &t.embedded_in {
+            if let Some(node) = found
+                .states
+                .iter()
+                .find(|s| s.trait_name == parent && s.name == *state)
+            {
+                embeds.push(PlacedEmbed {
+                    trait_name: t.name.clone(),
+                    state: state.clone(),
+                    points: box_wire_path(node.rect, child.rect),
+                });
+            }
+        }
+    }
+
+    let mut pairs: Vec<(String, String, Vec<String>)> = Vec::new();
+    for w in &m.wires {
+        if !by_name.contains_key(w.from.as_str()) || !by_name.contains_key(w.to.as_str()) {
+            continue;
+        }
+        match pairs
+            .iter_mut()
+            .find(|(f, t, _)| *f == w.from && *t == w.to)
+        {
+            Some((_, _, events)) => {
+                if !events.contains(&w.event) {
+                    events.push(w.event.clone());
+                }
+            }
+            None => pairs.push((w.from.clone(), w.to.clone(), vec![w.event.clone()])),
+        }
+    }
+    let mut wires = Vec::new();
+    for (from, to, events) in pairs {
+        let rect = |n: &str| {
+            found
+                .boxes
+                .iter()
+                .find(|b| b.trait_name == n)
+                .map(|b| b.rect)
+        };
+        let (Some(a), Some(b)) = (rect(&from), rect(&to)) else {
+            continue;
+        };
+        let points = box_wire_path(a, b);
+        let (lw, lh) = wire_label_size(&events.join(", "));
+        let mid = (
+            (points[0].0 + points[1].0) / 2.0,
+            (points[0].1 + points[1].1) / 2.0,
+        );
+        wires.push(PlacedWire {
+            from,
+            to,
+            events,
+            points,
+            label: layered::Rect {
+                x: mid.0 - lw / 2.0,
+                y: mid.1 - lh / 2.0,
+                w: lw,
+                h: lh,
+            },
+        });
+    }
+
+    OrbitalDiagram {
+        mounted: m,
+        opts: o,
+        boxes: found.boxes,
+        states: found.states,
+        edges: found.edges,
+        loops,
+        embeds,
+        wires,
+        groups,
+        lane_top,
+        group_top,
+        width: width + 2.0 * MARGIN,
+        height: height + 2.0 * MARGIN,
+    }
+}
+
+impl OrbitalDiagram<'_> {
+    fn actives<'t>(&'t self, t: &'t MountedTrait) -> Vec<&'t str> {
+        let given: Vec<&str> = self
+            .opts
+            .active
+            .iter()
+            .filter(|(name, _)| *name == t.name)
+            .map(|(_, s)| s.as_str())
+            .collect();
+        if given.is_empty() {
+            t.instances.iter().map(String::as_str).collect()
+        } else {
+            given
+        }
+    }
+
+    fn step_of(&self, trait_name: &str, index: usize) -> Option<usize> {
+        self.opts
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(_, (t, i))| t == trait_name && *i == index)
+            .map(|(n, _)| n + 1)
+            .last()
+    }
+
+    fn first_step(&self, trait_name: &str) -> Option<usize> {
+        self.opts.steps.iter().position(|(t, _)| t == trait_name)
+    }
+
+    fn wire_on_route(&self, w: &PlacedWire) -> bool {
+        matches!((self.first_step(&w.from), self.first_step(&w.to)), (Some(a), Some(b)) if a < b)
+    }
+
+    fn depth_of(&self, b: &PlacedBox) -> usize {
+        let mut depth = 0;
+        let mut cur = b.parent.as_deref();
+        while let Some(p) = cur {
+            depth += 1;
+            cur = self
+                .boxes
+                .iter()
+                .find(|x| x.trait_name == p)
+                .and_then(|x| x.parent.as_deref());
+            if depth > self.boxes.len() {
+                break;
+            }
+        }
+        depth
+    }
+
+    /// Paint at the origin of the pen's current transform.
+    pub fn paint(&self, pen: &mut Pen) {
+        let ink = pen.tone("ink");
+        let quiet = pen.tone("label");
+        let line = pen.tone("grid");
+        let surface = pen.card();
+        let focus = pen.tone("primary");
+        let wash = pen.muted();
+        let ground = pen.ground();
+        let o = self.opts;
+        let m = self.mounted;
+        let (ox, oy) = (MARGIN, MARGIN);
+        let at = |p: (f32, f32)| (p.0 + ox, p.1 + oy);
+        let trait_of = |name: &str| m.traits.iter().find(|t| t.name == name);
+
+        if let Some(top) = self.lane_top {
+            pen.text_middle(
+                ox,
+                oy + top + LANE_HEAD / 2.0,
+                BACKGROUND_CAPTION,
+                12.0,
+                quiet,
+                TextAlign::Left,
+                400,
+            );
+        }
+        if let Some(top) = self.group_top {
+            pen.text_middle(
+                ox,
+                oy + top + LANE_HEAD / 2.0,
+                LINKED_CAPTION,
+                12.0,
+                quiet,
+                TextAlign::Left,
+                400,
+            );
+        }
+        for g in &self.groups {
+            let r = g.rect;
+            pen.rrect(
+                ox + r.x,
+                oy + r.y,
+                r.w,
+                r.h,
+                12.0,
+                Some(ground),
+                Some(&Ink::new(line, 1.0).dashed(&[4.0, 3.0])),
+            );
+            pen.text_middle(
+                ox + r.x + 12.0,
+                oy + r.y + BOX_HEAD_CONTAINER / 2.0,
+                &g.orbital,
+                13.0,
+                quiet,
+                TextAlign::Left,
+                600,
+            );
+        }
+
+        for b in &self.boxes {
+            let Some(t) = trait_of(&b.trait_name) else {
+                continue;
+            };
+            let r = b.rect;
+            let (x, y) = (ox + r.x, oy + r.y);
+            let active = self.actives(t);
+            let fired = self.first_step(&b.trait_name).is_some();
+            let chosen = o.selected.as_deref() == Some(b.trait_name.as_str());
+            let expanded = b.kind == BoxKind::Machine;
+            let opens = b.kind != BoxKind::Chip;
+            let head_h = if b.container || expanded {
+                if expanded {
+                    BOX_HEAD_MACHINE
+                } else {
+                    BOX_HEAD_CONTAINER
+                }
+            } else {
+                r.h
+            };
+            if fired {
+                pen.rrect(
+                    x - 2.0,
+                    y - 2.0,
+                    r.w + 4.0,
+                    r.h + 4.0,
+                    14.0,
+                    None,
+                    Some(&Ink::new(tint(focus, 28.0), 4.0)),
+                );
+            }
+            let fill = if self.depth_of(b) % 2 == 0 {
+                surface
+            } else {
+                wash
+            };
+            let border = if fired || chosen { focus } else { line };
+            pen.rrect(
+                x,
+                y,
+                r.w,
+                r.h,
+                12.0,
+                Some(fill),
+                Some(&Ink::new(border, if chosen { 2.0 } else { 1.0 })),
+            );
+            let cy = y + head_h / 2.0;
+            let mut tx = x + 8.0;
+            if opens {
+                let c = (tx + 6.0, cy);
+                let chevron: [(f32, f32); 3] = if expanded {
+                    [
+                        (c.0 - 4.0, c.1 - 2.0),
+                        (c.0, c.1 + 2.0),
+                        (c.0 + 4.0, c.1 - 2.0),
+                    ]
+                } else if o.rtl {
+                    [
+                        (c.0 + 2.0, c.1 - 4.0),
+                        (c.0 - 2.0, c.1),
+                        (c.0 + 2.0, c.1 + 4.0),
+                    ]
+                } else {
+                    [
+                        (c.0 - 2.0, c.1 - 4.0),
+                        (c.0 + 2.0, c.1),
+                        (c.0 - 2.0, c.1 + 4.0),
+                    ]
+                };
+                pen.polyline(&chevron, false, None, Some(&Ink::new(quiet, 1.5)));
+                tx += HEAD_TOGGLE - 4.0;
+            }
+            pen.circle(tx + 6.0, cy, 5.0, None, Some(&Ink::new(quiet, 1.2)));
+            tx += 20.0;
+            let entity = t
+                .linked_entity
+                .as_deref()
+                .filter(|_| b.kind != BoxKind::Chip);
+            let name_y = if entity.is_some() { cy - 7.0 } else { cy };
+            pen.text_middle(tx, name_y, &t.name, 13.0, ink, TextAlign::Left, 600);
+            if let Some(e) = entity {
+                pen.text_middle(tx, cy + 8.0, e, 11.0, quiet, TextAlign::Left, 400);
+            }
+            if b.kind == BoxKind::Collapsed && !active.is_empty() {
+                let label = active.join(", ");
+                let w = text_width(&label, 11.0) + 12.0;
+                let bx = tx + text_width(&t.name, 13.0) + 8.0;
+                pen.rrect(bx, name_y - 9.0, w, 18.0, 9.0, Some(focus), None);
+                pen.text_middle(
+                    bx + w / 2.0,
+                    name_y,
+                    &label,
+                    11.0,
+                    surface,
+                    TextAlign::Center,
+                    600,
+                );
+            }
+            if let Some(ev) = &o.select_event {
+                pen.hit(
+                    x,
+                    y,
+                    r.w,
+                    head_h,
+                    vec![Emit {
+                        event: ev.clone(),
+                        arg: String::new(),
+                        payload: json!({ "trait": b.trait_name }),
+                    }],
+                );
+            }
+        }
+
+        for e in &self.embeds {
+            let pts: Vec<(f32, f32)> = e.points.iter().map(|p| at(*p)).collect();
+            pen.polyline(
+                &pts,
+                false,
+                None,
+                Some(&Ink::new(with_alpha(quiet, 0.6), 1.0).dashed(&[1.0, 4.0])),
+            );
+        }
+        for s in self.states.iter().filter(|s| s.is_initial) {
+            let r = s.rect;
+            let cy = r.y + r.h / 2.0;
+            let (dot, a, b) = if o.rtl {
+                (r.x + r.w + 18.0, r.x + r.w + 13.0, r.x + r.w + 1.0)
+            } else {
+                (r.x - 18.0, r.x - 13.0, r.x - 1.0)
+            };
+            let c = at((dot, cy));
+            pen.circle(c.0, c.1, 4.0, Some(ink), None);
+            let (pa, pb) = (at((a, cy)), at((b, cy)));
+            pen.line(pa, pb, &Ink::new(quiet, 1.5));
+            arrow_head(pen, pa, pb, 7.0, 1.5, with_alpha(quiet, 0.8));
+        }
+
+        let is_next = |trait_name: &str, from: &str| {
+            trait_of(trait_name).is_some_and(|t| self.actives(t).contains(&from))
+        };
+        for e in &self.edges {
+            if e.points.len() < 2 {
+                continue;
+            }
+            let lit = self.step_of(&e.trait_name, e.index).is_some();
+            let next = !lit && is_next(&e.trait_name, &e.from);
+            let color = if lit || next { focus } else { quiet };
+            let alpha = if lit {
+                1.0
+            } else if next {
+                0.5
+            } else {
+                0.3
+            };
+            let width = if lit {
+                ORBITAL_ACTIVE_STROKE
+            } else {
+                ORBITAL_WIRE_STROKE
+            };
+            let pts: Vec<(f32, f32)> = e.points.iter().map(|p| at(*p)).collect();
+            pen.polyline(
+                &rounded(&pts, 10.0),
+                false,
+                None,
+                Some(&Ink::new(with_alpha(color, alpha), width)),
+            );
+            let head = if lit {
+                focus
+            } else if next {
+                with_alpha(focus, 0.55)
+            } else {
+                with_alpha(quiet, 0.8)
+            };
+            arrow_head(
+                pen,
+                pts[pts.len() - 2],
+                pts[pts.len() - 1],
+                if lit { 6.0 } else { 7.0 },
+                width,
+                head,
+            );
+        }
+
+        let shown = |w: &&PlacedWire| {
+            self.wire_on_route(w)
+                || o.selected.as_deref() == Some(w.from.as_str())
+                || o.selected.as_deref() == Some(w.to.as_str())
+        };
+        for w in self.wires.iter().filter(shown) {
+            let lit = self.wire_on_route(w);
+            let color = if lit { focus } else { with_alpha(quiet, 0.45) };
+            let width = if lit {
+                ORBITAL_ACTIVE_STROKE
+            } else {
+                ORBITAL_WIRE_STROKE
+            };
+            let pts: Vec<(f32, f32)> = w.points.iter().map(|p| at(*p)).collect();
+            pen.polyline(
+                &pts,
+                false,
+                None,
+                Some(&Ink::new(color, width).dashed(&[6.0, 4.0])),
+            );
+            arrow_head(
+                pen,
+                pts[0],
+                pts[pts.len() - 1],
+                if lit { 6.0 } else { 7.0 },
+                width,
+                if lit { focus } else { with_alpha(quiet, 0.8) },
+            );
+        }
+
+        for e in &self.edges {
+            if e.label.w <= 0.0 {
+                continue;
+            }
+            let step = self.step_of(&e.trait_name, e.index);
+            let emphasis = step.is_some();
+            let next = !emphasis && is_next(&e.trait_name, &e.from);
+            let l = e.label;
+            let (x, y) = (ox + l.x, oy + l.y);
+            let border = if emphasis || next { focus } else { line };
+            pen.rrect(
+                x,
+                y,
+                l.w,
+                l.h,
+                6.0,
+                Some(surface),
+                Some(&Ink::new(border, 1.0)),
+            );
+            let color = if emphasis {
+                focus
+            } else if next {
+                ink
+            } else {
+                quiet
+            };
+            pen.mono_text_middle(
+                x + l.w / 2.0,
+                y + l.h / 2.0,
+                &e.event,
+                12.0,
+                color,
+                TextAlign::Center,
+                if emphasis { 600 } else { 400 },
+            );
+            if let Some(n) = step {
+                pen.circle(x, y, 9.0, Some(focus), None);
+                pen.text_middle(x, y, &n.to_string(), 10.0, surface, TextAlign::Center, 700);
+            }
+            if next && e.guarded {
+                let (gx, gy) = (x + l.w + 10.0, y - 10.0 + 10.0);
+                pen.polyline(
+                    &[
+                        (gx, gy - 5.0),
+                        (gx + 5.0, gy),
+                        (gx, gy + 5.0),
+                        (gx - 5.0, gy),
+                    ],
+                    true,
+                    Some(surface),
+                    Some(&Ink::new(quiet, 1.2)),
+                );
+            }
+        }
+        for w in self.wires.iter().filter(shown) {
+            let l = w.label;
+            let (x, y) = (ox + l.x, oy + l.y);
+            pen.rrect(
+                x,
+                y,
+                l.w,
+                l.h,
+                6.0,
+                Some(ground),
+                Some(&Ink::new(line, 1.0).dashed(&[3.0, 2.0])),
+            );
+            pen.mono_text_middle(
+                x + 8.0 + GLYPH_ROOM - 4.0,
+                y + l.h / 2.0,
+                &w.events.join(", "),
+                11.0,
+                quiet,
+                TextAlign::Left,
+                400,
+            );
+        }
+
+        for s in &self.states {
+            let Some(t) = trait_of(&s.trait_name) else {
+                continue;
+            };
+            let r = s.rect;
+            let (x, y) = (ox + r.x, oy + r.y);
+            let active = self.actives(t).contains(&s.name.as_str());
+            let looped = self
+                .loops
+                .iter()
+                .find(|l| l.trait_name == s.trait_name && l.state == s.name);
+            let extra = if looped.is_some() { LOOP_LINE } else { 0.0 };
+            if s.is_terminal {
+                pen.rrect(
+                    x - 4.0,
+                    y - 4.0,
+                    r.w + 8.0,
+                    r.h + 8.0,
+                    12.0,
+                    None,
+                    Some(&Ink::new(line, 1.0)),
+                );
+            }
+            let fill = if active {
+                mix(focus, 10.0, surface)
+            } else {
+                surface
+            };
+            let border = if active { focus } else { line };
+            pen.rrect(
+                x,
+                y,
+                r.w,
+                r.h,
+                8.0,
+                Some(fill),
+                Some(&Ink::new(border, if active { 2.0 } else { 1.0 })),
+            );
+            pen.text_middle(
+                x + r.w / 2.0,
+                y + (r.h - extra) / 2.0,
+                &s.name,
+                13.0,
+                if active { ink } else { quiet },
+                TextAlign::Center,
+                if active { 600 } else { 500 },
+            );
+            if let Some(l) = looped {
+                let fired = l
+                    .indexes
+                    .iter()
+                    .any(|i| self.step_of(&s.trait_name, *i).is_some());
+                let label = l.indexes.len().to_string();
+                let w = text_width(&label, 11.0) + 16.0;
+                let (cx, cy) = (x + r.w / 2.0, y + r.h - LOOP_LINE / 2.0 - 2.0);
+                pen.rrect(
+                    cx - w / 2.0,
+                    cy - 8.0,
+                    w,
+                    16.0,
+                    8.0,
+                    Some(if fired { focus } else { wash }),
+                    None,
+                );
+                pen.text_middle(
+                    cx,
+                    cy,
+                    &label,
+                    11.0,
+                    if fired { surface } else { quiet },
+                    TextAlign::Center,
+                    600,
+                );
+            }
         }
     }
 }

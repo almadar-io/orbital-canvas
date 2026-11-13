@@ -4,7 +4,8 @@
 
 use super::draw::{frame, Ink, Pen};
 use super::state_machine::{
-    prepare, Diagram, NodeShape, Opts, StateInfo, TraitData, TransitionInfo,
+    prepare, prepare_orbital, Diagram, Mounted, NodeShape, Opts, OrbitalOpts, StateInfo, TraitData,
+    TransitionInfo,
 };
 use super::{props_f32, props_str};
 use crate::mappers::game_canvas_2d::CanvasSceneError;
@@ -93,6 +94,16 @@ pub fn state_machine_view(
 ) -> Result<MappedScene, CanvasSceneError> {
     if let Some(s) = status_scene("state-machine-view", props, viewport) {
         return Ok(s);
+    }
+    if let Some(mounted) = props.get("orbital").and_then(Mounted::from_value) {
+        let theme = theme_for(props);
+        let opts = OrbitalOpts::from_props(props);
+        let d = prepare_orbital(&mounted, &opts);
+        let (xf, pw, ph) = frame(d.width, d.height, viewport);
+        let mut pen = Pen::new(&theme, xf);
+        pen.clear(theme.ground);
+        d.paint(&mut pen);
+        return Ok(pen.finish("state-machine-view", pw, ph));
     }
     let Some(trait_data) = props.get("trait").and_then(TraitData::from_level) else {
         return Ok(message_scene(
@@ -669,5 +680,340 @@ mod tests {
         let mut rtl = machine();
         rtl["direction"] = json!("rtl");
         assert!(x_of(&rtl) > x_of(&machine()));
+    }
+
+    fn mounted_trait(name: &str, patch: Value) -> Value {
+        let mut t = json!({
+            "trait": name, "orbital": "O", "parent": null, "depth": 0, "embeddedIn": [],
+            "renders": true, "linked": false, "observer": false, "stepsIn": "browser",
+            "linkedEntity": "Thing",
+            "states": [
+                {"name": "idle", "isInitial": true, "isTerminal": false},
+                {"name": "busy", "isInitial": false, "isTerminal": false}
+            ],
+            "transitions": [
+                {"index": 0, "from": ["idle"], "to": "busy", "event": "GO", "guarded": false, "emits": ["STARTED"]},
+                {"index": 1, "from": ["busy"], "to": "idle", "event": "STOP", "guarded": false, "emits": []}
+            ],
+            "emits": ["STARTED"], "listens": [], "instances": []
+        });
+        for (k, v) in patch.as_object().unwrap() {
+            t[k] = v.clone();
+        }
+        t
+    }
+
+    fn orbital_props(traits: Vec<Value>, extra: Value) -> Value {
+        let mut p = json!({
+            "type": "state-machine-view",
+            "orbital": {"page": "/p", "traits": traits, "wires": []}
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            if k == "wires" {
+                p["orbital"]["wires"] = v.clone();
+            } else {
+                p[k] = v.clone();
+            }
+        }
+        p
+    }
+
+    fn nested() -> Vec<Value> {
+        vec![
+            mounted_trait("Parent", json!({})),
+            mounted_trait(
+                "Child",
+                json!({"parent": "Parent", "depth": 1, "embeddedIn": ["idle"]}),
+            ),
+            mounted_trait("Other", json!({})),
+        ]
+    }
+
+    fn laid_out(props: &Value) -> (Vec<super::super::state_machine::PlacedBox>, f32) {
+        let m = Mounted::from_value(&props["orbital"]).unwrap();
+        let o = OrbitalOpts::from_props(props);
+        let d = prepare_orbital(&m, &o);
+        (d.boxes.clone(), d.width)
+    }
+
+    fn contains(outer: super::super::layered::Rect, inner: super::super::layered::Rect) -> bool {
+        inner.x >= outer.x
+            && inner.y >= outer.y
+            && inner.x + inner.w <= outer.x + outer.w
+            && inner.y + inner.h <= outer.y + outer.h
+    }
+
+    fn count(t: &[String], what: &str) -> usize {
+        t.iter().filter(|x| *x == what).count()
+    }
+
+    fn heavy_strokes(s: &MappedScene) -> usize {
+        s.packet
+            .draw_commands
+            .iter()
+            .filter(|c| matches!(c, DrawCommand::Path { stroke: Some(k), .. } if k.width >= 2.0))
+            .count()
+    }
+
+    #[test]
+    fn an_orbital_lays_the_embedded_trait_inside_its_embedders_box() {
+        let props = orbital_props(nested(), json!({}));
+        let m = Mounted::from_value(&props["orbital"]).unwrap();
+        let o = OrbitalOpts::from_props(&props);
+        let d = prepare_orbital(&m, &o);
+        let by = |n: &str| d.boxes.iter().find(|b| b.trait_name == n).unwrap();
+        let (parent, child, other) = (by("Parent"), by("Child"), by("Other"));
+        assert_eq!(child.parent.as_deref(), Some("Parent"));
+        assert!(parent.container && !child.container);
+        assert!(
+            contains(parent.rect, child.rect),
+            "{parent:?} holds {child:?}"
+        );
+        assert!(
+            !contains(parent.rect, other.rect),
+            "a sibling root sits beside it"
+        );
+        assert_eq!(other.parent, None);
+        for s in d.states.iter().filter(|s| s.trait_name == "Child") {
+            assert!(
+                contains(child.rect, s.rect),
+                "child state {s:?} is in the child box"
+            );
+        }
+        for s in d.states.iter().filter(|s| s.trait_name == "Parent") {
+            assert!(contains(parent.rect, s.rect));
+            assert!(
+                !contains(child.rect, s.rect),
+                "the parent's own states are not in the child"
+            );
+        }
+        assert_eq!(
+            d.embeds.len(),
+            1,
+            "one dotted tie from the embedding state to the child"
+        );
+        assert_eq!(d.embeds[0].trait_name, "Child");
+        assert_eq!(d.embeds[0].state, "idle");
+        let t = texts(&state_machine_view(&props, None).unwrap());
+        for name in ["Parent", "Child", "Other", "idle", "busy", "GO", "STOP"] {
+            assert!(t.iter().any(|x| x == name), "{name} missing from {t:?}");
+        }
+        assert_eq!(count(&t, "GO"), 3, "every opened box draws its own machine");
+    }
+
+    #[test]
+    fn expand_depth_zero_collapses_every_box_but_keeps_the_nesting() {
+        let deep = orbital_props(nested(), json!({"expandDepth": 0}));
+        let (boxes, _) = laid_out(&deep);
+        use super::super::state_machine::BoxKind;
+        assert!(boxes.iter().all(|b| b.kind == BoxKind::Collapsed));
+        let by = |n: &str| boxes.iter().find(|b| b.trait_name == n).unwrap();
+        assert!(contains(by("Parent").rect, by("Child").rect));
+        let t = texts(&state_machine_view(&deep, None).unwrap());
+        assert!(
+            t.iter().any(|x| x == "Child"),
+            "the compact box still names the trait"
+        );
+        for hidden in ["idle", "busy", "GO", "STOP"] {
+            assert!(
+                !t.iter().any(|x| x == hidden),
+                "{hidden} must stay folded: {t:?}"
+            );
+        }
+        let open = orbital_props(nested(), json!({"expandDepth": 2}));
+        let (boxes, _) = laid_out(&open);
+        assert!(
+            boxes.iter().all(|b| b.kind == BoxKind::Machine),
+            "control: depth below 2 opens"
+        );
+        let one = orbital_props(nested(), json!({"expandDepth": 1}));
+        let (boxes, _) = laid_out(&one);
+        let kind = |n: &str| boxes.iter().find(|b| b.trait_name == n).unwrap().kind;
+        assert_eq!(kind("Parent"), BoxKind::Machine);
+        assert_eq!(kind("Child"), BoxKind::Collapsed, "depth 1 is not below 1");
+    }
+
+    #[test]
+    fn an_active_state_is_highlighted_and_a_collapsed_box_names_it() {
+        let quiet = state_machine_view(&orbital_props(nested(), json!({})), None).unwrap();
+        let live = state_machine_view(
+            &orbital_props(
+                nested(),
+                json!({"activeStates": [{"trait": "Parent", "state": "busy"}]}),
+            ),
+            None,
+        )
+        .unwrap();
+        assert!(
+            heavy_strokes(&live) > heavy_strokes(&quiet),
+            "the active state's border is drawn at active weight"
+        );
+        let folded = state_machine_view(
+            &orbital_props(
+                nested(),
+                json!({"expandDepth": 0, "activeStates": [{"trait": "Child", "state": "busy"}]}),
+            ),
+            None,
+        )
+        .unwrap();
+        assert!(
+            texts(&folded).iter().any(|x| x == "busy"),
+            "the compact box carries the state badge"
+        );
+        let none =
+            state_machine_view(&orbital_props(nested(), json!({"expandDepth": 0})), None).unwrap();
+        assert!(
+            !texts(&none).iter().any(|x| x == "busy"),
+            "control: no active state, no badge"
+        );
+    }
+
+    #[test]
+    fn a_running_instance_marks_its_state_when_no_active_state_is_given() {
+        let mut t = nested();
+        t[0]["instances"] = json!([{"state": "busy"}]);
+        let marked = state_machine_view(&orbital_props(t, json!({})), None).unwrap();
+        let plain = state_machine_view(&orbital_props(nested(), json!({})), None).unwrap();
+        assert!(heavy_strokes(&marked) > heavy_strokes(&plain));
+    }
+
+    #[test]
+    fn the_fired_transition_is_emphasized_with_its_step_number() {
+        let fired = state_machine_view(
+            &orbital_props(
+                nested(),
+                json!({"firedTransition": {"trait": "Parent", "index": 0}}),
+            ),
+            None,
+        )
+        .unwrap();
+        let quiet = state_machine_view(&orbital_props(nested(), json!({})), None).unwrap();
+        assert!(count(&texts(&fired), "1") == 1, "one numbered step");
+        assert!(
+            count(&texts(&quiet), "1") == 0,
+            "control: nothing fired, no step number"
+        );
+        assert!(
+            heavy_strokes(&fired) > heavy_strokes(&quiet),
+            "the fired wire is drawn at active weight"
+        );
+        let routed = state_machine_view(
+            &orbital_props(
+                nested(),
+                json!({"route": [{"trait": "Parent", "index": 0}, {"trait": "Child", "index": 1}]}),
+            ),
+            None,
+        )
+        .unwrap();
+        let t = texts(&routed);
+        assert!(
+            t.iter().any(|x| x == "1") && t.iter().any(|x| x == "2"),
+            "a route numbers its steps in order"
+        );
+    }
+
+    #[test]
+    fn traits_that_never_render_sit_in_a_background_lane_below_the_page() {
+        let props = orbital_props(
+            vec![
+                mounted_trait("Ui", json!({})),
+                mounted_trait("Store", json!({"renders": false})),
+            ],
+            json!({}),
+        );
+        let m = Mounted::from_value(&props["orbital"]).unwrap();
+        let o = OrbitalOpts::from_props(&props);
+        let d = prepare_orbital(&m, &o);
+        let by = |n: &str| d.boxes.iter().find(|b| b.trait_name == n).unwrap();
+        assert!(by("Store").lane && !by("Ui").lane);
+        assert!(
+            by("Store").rect.y >= by("Ui").rect.y + by("Ui").rect.h,
+            "the lane starts below the tree"
+        );
+        assert!(d.lane_top.is_some());
+        assert!(texts(&state_machine_view(&props, None).unwrap())
+            .iter()
+            .any(|x| x == "Runs in the background"));
+        let alone = orbital_props(vec![mounted_trait("Ui", json!({}))], json!({}));
+        let m = Mounted::from_value(&alone["orbital"]).unwrap();
+        let o = OrbitalOpts::from_props(&alone);
+        assert!(
+            prepare_orbital(&m, &o).lane_top.is_none(),
+            "control: no lane without background traits"
+        );
+        assert!(!texts(&state_machine_view(&alone, None).unwrap())
+            .iter()
+            .any(|x| x == "Runs in the background"));
+    }
+
+    #[test]
+    fn listen_wires_draw_as_labelled_arrows_only_for_the_chosen_trait_or_the_route() {
+        let wires = json!({"wires": [
+            {"from": "A", "to": "B", "event": "PING", "triggers": "GO"},
+            {"from": "A", "to": "B", "event": "PING", "triggers": "STOP"}
+        ]});
+        let traits = || vec![mounted_trait("A", json!({})), mounted_trait("B", json!({}))];
+        let m_props = orbital_props(traits(), wires.clone());
+        let m = Mounted::from_value(&m_props["orbital"]).unwrap();
+        let o = OrbitalOpts::from_props(&m_props);
+        let d = prepare_orbital(&m, &o);
+        assert_eq!(
+            d.wires.len(),
+            1,
+            "two listens between the same pair are one wire"
+        );
+        assert_eq!(d.wires[0].events, vec!["PING".to_string()]);
+        let by = |n: &str| d.boxes.iter().find(|b| b.trait_name == n).unwrap().rect;
+        assert!(
+            d.wires[0].points[0].0 >= by("A").x && d.wires[0].points[1].0 <= by("B").x + by("B").w,
+            "the arrow runs from A to B"
+        );
+        let chosen = state_machine_view(
+            &orbital_props(
+                traits(),
+                json!({"wires": wires["wires"].clone(), "selectedTrait": "A"}),
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(count(&texts(&chosen), "PING"), 1);
+        let plain = state_machine_view(&m_props, None).unwrap();
+        assert_eq!(
+            count(&texts(&plain), "PING"),
+            0,
+            "control: an unchosen wire stays out of sight"
+        );
+        let routed = state_machine_view(
+            &orbital_props(
+                traits(),
+                json!({"wires": wires["wires"].clone(), "route": [{"trait": "A", "index": 0}, {"trait": "B", "index": 0}]}),
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            count(&texts(&routed), "PING"),
+            1,
+            "the last dispatch's wire draws"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_null_orbital_paints_the_single_trait_view_exactly_as_before() {
+        let base = machine();
+        let want = serde_json::to_string(&state_machine_view(&base, None).unwrap().packet).unwrap();
+        for orbital in [
+            Value::Null,
+            json!({"page": "/p", "traits": [], "wires": []}),
+        ] {
+            let mut p = base.clone();
+            p["orbital"] = orbital;
+            let got = serde_json::to_string(&state_machine_view(&p, None).unwrap().packet).unwrap();
+            assert_eq!(got, want);
+        }
+        let mut with = base.clone();
+        with["orbital"] = orbital_props(nested(), json!({}))["orbital"].clone();
+        let got = serde_json::to_string(&state_machine_view(&with, None).unwrap().packet).unwrap();
+        assert_ne!(got, want, "a real orbital wins over the trait prop");
     }
 }
