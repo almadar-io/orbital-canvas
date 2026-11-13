@@ -5,9 +5,6 @@ use crate::{Canvas, RendererError, Result};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
-#[path = "glyph_atlas.rs"]
-mod glyph_atlas;
-
 fn align_up(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & !(alignment - 1)
 }
@@ -388,7 +385,7 @@ enum Draw {
     /// Glyph quads of one atlas page, before adjacent runs of the page are merged.
     GlyphRun {
         page: u64,
-        instances: Vec<glyph_atlas::GlyphInstance>,
+        instances: Vec<crate::glyph_atlas::GlyphInstance>,
     },
     Glyphs {
         page: u64,
@@ -440,7 +437,7 @@ pub struct SharedDeviceRenderer {
     format: wgpu::TextureFormat,
     particles: Option<crate::particles::ParticlePass>,
     sdf: Option<crate::sdf::SdfPass>,
-    glyphs: Option<glyph_atlas::GlyphPass>,
+    glyphs: Option<crate::glyph_atlas::GlyphPass>,
 }
 
 impl SharedDeviceRenderer {
@@ -1059,7 +1056,7 @@ impl SharedDeviceRenderer {
         );
         let pass = self
             .glyphs
-            .get_or_insert_with(|| glyph_atlas::GlyphPass::new(&device, format));
+            .get_or_insert_with(|| crate::glyph_atlas::GlyphPass::new(&device, format));
         let runs = pass.place_text(&device, &queue, command, scale, (tw, th))?;
         Some(
             runs.into_iter()
@@ -1071,13 +1068,13 @@ impl SharedDeviceRenderer {
     /// Merge adjacent glyph runs of one page into one instance buffer each.
     fn finalize_glyphs(&self, draws: Vec<Draw>) -> Vec<Draw> {
         let mut out: Vec<Draw> = Vec::with_capacity(draws.len());
-        let mut pending: Option<(u64, Vec<glyph_atlas::GlyphInstance>)> = None;
-        let flush = |pending: Option<(u64, Vec<glyph_atlas::GlyphInstance>)>,
+        let mut pending: Option<(u64, Vec<crate::glyph_atlas::GlyphInstance>)> = None;
+        let flush = |pending: Option<(u64, Vec<crate::glyph_atlas::GlyphInstance>)>,
                      out: &mut Vec<Draw>| {
             if let Some((page, instances)) = pending {
                 out.push(Draw::Glyphs {
                     page,
-                    buffer: glyph_atlas::GlyphPass::instance_buffer(&self.device, &instances),
+                    buffer: crate::glyph_atlas::GlyphPass::instance_buffer(&self.device, &instances),
                     count: instances.len() as u32,
                 });
             }
@@ -2524,7 +2521,7 @@ mod vector_layer_tests {
             color: RED,
             align: TextAlign::Left,
             weight: 400,
-            mono: false,
+            family: crate::packet::TextFamily::Sans,
             halo: None,
         }
     }
@@ -2659,7 +2656,7 @@ mod vector_layer_tests {
     #[test]
     fn a_full_atlas_evicts_a_page_and_still_draws() {
         let Some(mut r) = renderer() else { return };
-        r.glyphs = Some(glyph_atlas::GlyphPass::with_limits(
+        r.glyphs = Some(crate::glyph_atlas::GlyphPass::with_limits(
             r.device(),
             wgpu::TextureFormat::Rgba8Unorm,
             64,
@@ -2698,7 +2695,7 @@ mod vector_layer_tests {
     #[test]
     fn one_frame_wider_than_the_budget_grows_then_trims_back() {
         let Some(mut r) = renderer() else { return };
-        r.glyphs = Some(glyph_atlas::GlyphPass::with_limits(
+        r.glyphs = Some(crate::glyph_atlas::GlyphPass::with_limits(
             r.device(),
             wgpu::TextureFormat::Rgba8Unorm,
             64,
@@ -2739,7 +2736,7 @@ mod vector_layer_tests {
             color: RED,
             align: TextAlign::Center,
             weight: 400,
-            mono: false,
+            family: crate::packet::TextFamily::Sans,
             halo: None,
         };
         let Some(rgba) = draw(&mut r, &packet(vec![stroke]), 16) else {

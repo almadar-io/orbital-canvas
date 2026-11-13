@@ -440,7 +440,7 @@ fn label(
             color: colors.halo,
             width: HALO_WIDTH,
         }),
-        mono: true,
+        family: crate::packet::TextFamily::Mono,
     }
 }
 

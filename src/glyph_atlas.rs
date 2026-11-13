@@ -415,13 +415,13 @@ impl GlyphPass {
             align,
             weight,
             halo: None,
-            mono,
+            family,
         } = command
         else {
             return None;
         };
         let bold = *weight >= 600;
-        let layout = vector::text_layout(text, *pos, *size, *align, bold, *mono)?;
+        let layout = vector::text_layout(text, *pos, *size, *align, bold, *family)?;
         let px = *size * (scale.0 + scale.1) / 2.0;
         let size_q = (px * QUARTERS).round().max(1.0) as u32;
         let color = color.map(|c| c.clamp(0.0, 1.0));

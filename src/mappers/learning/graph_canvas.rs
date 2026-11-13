@@ -1229,7 +1229,7 @@ fn label_tooltip(cmds: &mut Vec<DrawCommand>, n: &Node, xf: Xf, theme: &DiagramT
             align: TextAlign::Center,
             weight: 400,
             halo: None,
-            mono: false,
+            family: crate::packet::TextFamily::Sans,
         });
     }
 }
@@ -1373,7 +1373,7 @@ pub fn map_with(
                     color,
                     align: TextAlign::Center,
                     weight,
-                    mono: false,
+                    family: crate::packet::TextFamily::Sans,
                     halo: halo.then(|| Halo {
                         color: theme.ground,
                         width: (theme.text_px("xs") * 0.3).max(2.0) * xf.s,

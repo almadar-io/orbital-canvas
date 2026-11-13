@@ -79,7 +79,7 @@ pub fn from_props(props: &serde_json::Value) -> GameRenderPacket {
         color: [0.8, 0.8, 0.8, 1.0],
         align: Default::default(),
         weight: 400,
-        mono: false,
+        family: crate::packet::TextFamily::Sans,
         halo: None,
     });
 
@@ -125,7 +125,7 @@ pub fn from_props(props: &serde_json::Value) -> GameRenderPacket {
             color: [1.0, 1.0, 1.0, 1.0],
             align: Default::default(),
             weight: 400,
-            mono: false,
+            family: crate::packet::TextFamily::Sans,
             halo: None,
         });
     }

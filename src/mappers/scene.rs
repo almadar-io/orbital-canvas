@@ -137,6 +137,35 @@ pub struct SemanticNode {
     pub rect: Rect,
 }
 
+/// One laid-out line of a hit `draw-text`: its vertical band and the left edge of each caret position, so a press
+/// reports the caret index nearest it (contract §11). `start` is the line's first character index in the text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextHitLine {
+    pub top: f32,
+    pub bottom: f32,
+    pub start: usize,
+    pub edges: Vec<f32>,
+}
+
+/// A hit `draw-text`'s caret positions, in packet units.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextHit {
+    pub id: String,
+    pub lines: Vec<TextHitLine>,
+}
+
+impl TextHit {
+    /// The caret index nearest the point: the line whose band holds `y` (else the nearest line), then its nearest edge.
+    pub fn index_at(&self, x: f32, y: f32) -> Option<usize> {
+        let line = self.lines.iter().min_by(|a, b| {
+            let dist = |l: &TextHitLine| if y < l.top { l.top - y } else if y > l.bottom { y - l.bottom } else { 0.0 };
+            dist(a).total_cmp(&dist(b))
+        })?;
+        let (i, _) = line.edges.iter().enumerate().min_by(|(_, a), (_, b)| (*a - x).abs().total_cmp(&(*b - x).abs()))?;
+        Some(line.start + i)
+    }
+}
+
 /// The size of a `draw-text` with `measure: true`, in packet units.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Measured {
@@ -161,6 +190,8 @@ pub struct MappedScene {
     pub pointer_regions: Vec<PointerRegion>,
     /// Every `draw-text` with `measure: true` and an `id`, in paint order.
     pub measured: Vec<Measured>,
+    /// The caret positions of every hit `draw-text`, in paint order.
+    pub text_hits: Vec<TextHit>,
     /// The semantic tree, in reading order (`order`, then paint order).
     pub semantic_nodes: Vec<SemanticNode>,
 }
@@ -282,6 +313,7 @@ pub fn map_scene(
             })
             .collect(),
         measured: gathered.measured,
+        text_hits: gathered.text_hits,
         semantic_nodes: {
             let mut nodes = gathered.semantic;
             nodes.sort_by(|a, b| a.order.total_cmp(&b.order));

@@ -2768,10 +2768,10 @@ impl Walk<'_> {
             None | Some("") => [1.0; 4],
             Some(c) => css(&Value::String(c.to_owned()), &join(path, "color"))?,
         };
-        let (em, bold, mono) = match opt_str(f, "font", path)? {
-            None => (LABEL_EM, false, false),
+        let (em, bold, family) = match opt_str(f, "font", path)? {
+            None => (LABEL_EM, false, crate::packet::TextFamily::Sans),
             Some(font) => {
-                let (px, weight, mono) = super::game_canvas_2d::parse_text_font(Some(font))
+                let (px, weight, family) = super::game_canvas_2d::parse_text_font(Some(font))
                     .ok_or_else(|| {
                         bad(
                             &join(path, "font"),
@@ -2781,7 +2781,7 @@ impl Walk<'_> {
                 (
                     (f64::from(px) * place.cell / f64::from(TILE_WIDTH)) as f32,
                     weight >= 600,
-                    mono,
+                    family,
                 )
             }
         };
@@ -2817,7 +2817,7 @@ impl Walk<'_> {
         let style = LabelStyle {
             em,
             bold,
-            mono,
+            family,
             color,
             halo: LABEL_OUTLINE,
             halo_color: [0.0, 0.0, 0.0, 1.0],

@@ -78,6 +78,7 @@ pub struct Region {
 pub struct Gathered {
     pub regions: Vec<Region>,
     pub measured: Vec<Measured>,
+    pub text_hits: Vec<super::scene::TextHit>,
     pub semantic: Vec<super::scene::SemanticNode>,
 }
 
@@ -997,7 +998,7 @@ fn paint_text(
         gap_once("text-color", "draw-text color is not a supported CSS color");
         return Ok(());
     };
-    let (size, weight, mono) = match parse_text_font(node.get("font").and_then(Value::as_str)) {
+    let (size, weight, family) = match parse_text_font(node.get("font").and_then(Value::as_str)) {
         Some(font) => font,
         None => {
             gap_once(
@@ -1058,7 +1059,7 @@ fn paint_text(
             text,
             size,
             bold,
-            mono,
+            family,
             ParagraphBox {
                 width: width,
                 wrap: wrap,
@@ -1087,7 +1088,7 @@ fn paint_text(
                 align,
                 weight,
                 halo: None,
-                mono,
+                family,
             });
         }
         let lines = paragraph.lines.len();
@@ -1151,7 +1152,7 @@ fn paint_text(
     if let Some(id) = id {
         let tracked = hit_id(node).is_some();
         if tracked || measure {
-            let w = crate::vector::shape(text, size, bold, mono).width;
+            let w = crate::vector::shape(text, size, bold, family).width;
             let h = size * line_height;
             let left = match align {
                 TextAlign::Left => sx,
@@ -1188,7 +1189,7 @@ fn paint_text(
         align,
         weight,
         halo: None,
-        mono,
+        family,
     });
     Ok(())
 }
@@ -1216,7 +1217,7 @@ pub(crate) fn layout_paragraph(
     text: &str,
     size: f32,
     bold: bool,
-    mono: bool,
+    family: crate::packet::TextFamily,
     frame: ParagraphBox,
 ) -> Paragraph {
     let ParagraphBox {
@@ -1225,7 +1226,7 @@ pub(crate) fn layout_paragraph(
         max_lines,
         truncate,
     } = frame;
-    let measure = |s: &str| crate::vector::shape(s, size, bold, mono).width;
+    let measure = |s: &str| crate::vector::shape(s, size, bold, family).width;
     let mut lines: Vec<String> = Vec::new();
     for hard in text.split('\n') {
         if !wrap {
@@ -1319,9 +1320,12 @@ fn breaks_between(previous: char, next: char) -> bool {
     is_ideographic(previous) || is_ideographic(next)
 }
 
-pub(crate) fn parse_text_font(font: Option<&str>) -> Option<(f32, u16, bool)> {
+pub(crate) fn parse_text_font(
+    font: Option<&str>,
+) -> Option<(f32, u16, crate::packet::TextFamily)> {
+    use crate::packet::TextFamily;
     let Some(font) = font else {
-        return Some((10.0, 400, false));
+        return Some((10.0, 400, TextFamily::Sans));
     };
     let mut tokens = font.split_whitespace();
     let first = tokens.next()?;
@@ -1343,8 +1347,11 @@ pub(crate) fn parse_text_font(font: Option<&str>) -> Option<(f32, u16, bool)> {
     }
     let family = tokens.collect::<Vec<_>>().join(" ");
     match family.as_str() {
-        "sans-serif" | "system-ui" | "system-ui, sans-serif" => Some((size, weight, false)),
-        "monospace" => Some((size, weight, true)),
+        "sans-serif" | "system-ui" | "system-ui, sans-serif" => {
+            Some((size, weight, TextFamily::Sans))
+        }
+        "monospace" => Some((size, weight, TextFamily::Mono)),
+        "serif" => Some((size, weight, TextFamily::Serif)),
         _ => None,
     }
 }
@@ -2707,6 +2714,7 @@ pub(crate) fn get_string(props: &Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packet::TextFamily;
     use serde_json::json;
 
     fn packet_for(props: Value) -> GameRenderPacket {
@@ -2937,30 +2945,64 @@ mod tests {
                     color,
                     align,
                     weight,
-                    mono,
+                    family,
                     ..
-                } => Some((text.as_str(), *size, color[3], *align, *weight, *mono)),
+                } => Some((text.as_str(), *size, color[3], *align, *weight, *family)),
                 _ => None,
             })
             .collect();
         assert_eq!(texts.len(), 2);
-        assert_eq!(texts[0], ("one", 14.0, 0.5, TextAlign::Center, 700, true));
-        assert_eq!(texts[1], ("two", 10.0, 1.0, TextAlign::Left, 400, false));
+        assert_eq!(
+            texts[0],
+            ("one", 14.0, 0.5, TextAlign::Center, 700, TextFamily::Mono)
+        );
+        assert_eq!(
+            texts[1],
+            ("two", 10.0, 1.0, TextAlign::Left, 400, TextFamily::Sans)
+        );
+    }
+
+    #[test]
+    fn a_serif_font_yields_a_serif_text_command_and_no_font_the_default_family() {
+        let family_of = |font: Option<&str>| {
+            let mut atom = json!({ "type": "draw-text", "text": "x", "position": {"x": 1, "y": 2},
+                "color": "#ffffff" });
+            if let Some(f) = font {
+                atom["font"] = json!(f);
+            }
+            let p = packet_for(json!({
+                "projection": "free", "scale": 1.0, "drawables": [atom]
+            }));
+            p.draw_commands
+                .iter()
+                .find_map(|c| match c {
+                    DrawCommand::Text { family, .. } => Some(*family),
+                    _ => None,
+                })
+                .expect("a text command")
+        };
+        assert_eq!(family_of(Some("400 16px serif")), TextFamily::Serif);
+        assert_eq!(family_of(Some("400 16px sans-serif")), TextFamily::Sans);
+        assert_eq!(family_of(None), TextFamily::Sans);
+        assert_eq!(
+            parse_text_font(Some("700 20px serif")),
+            Some((20.0, 700, TextFamily::Serif))
+        );
     }
 
     #[test]
     fn a_css_numeric_weight_is_read_like_bold_and_an_out_of_range_one_is_refused() {
         assert_eq!(
             parse_text_font(Some("600 26px sans-serif")),
-            Some((26.0, 600, false))
+            Some((26.0, 600, TextFamily::Sans))
         );
         assert_eq!(
             parse_text_font(Some("400 15px monospace")),
-            Some((15.0, 400, true))
+            Some((15.0, 400, TextFamily::Mono))
         );
         assert_eq!(
             parse_text_font(Some("bold 12px sans-serif")),
-            Some((12.0, 700, false))
+            Some((12.0, 700, TextFamily::Sans))
         );
         assert_eq!(parse_text_font(Some("1200 12px sans-serif")), None);
         assert_eq!(parse_text_font(Some("600 12px Custom")), None);
@@ -3992,7 +4034,7 @@ mod tests {
             text,
             12.0,
             false,
-            false,
+            crate::packet::TextFamily::Sans,
             ParagraphBox {
                 width: width,
                 wrap: true,
@@ -4006,7 +4048,7 @@ mod tests {
             text,
             12.0,
             false,
-            false,
+            crate::packet::TextFamily::Sans,
             ParagraphBox {
                 width: width,
                 wrap: false,
@@ -4020,7 +4062,7 @@ mod tests {
             text,
             12.0,
             false,
-            false,
+            crate::packet::TextFamily::Sans,
             ParagraphBox {
                 width: width,
                 wrap: true,
@@ -4035,7 +4077,7 @@ mod tests {
             text,
             12.0,
             false,
-            false,
+            crate::packet::TextFamily::Sans,
             ParagraphBox {
                 width: width,
                 wrap: true,
@@ -4054,7 +4096,7 @@ mod tests {
             "alphabet",
             12.0,
             false,
-            false,
+            crate::packet::TextFamily::Sans,
             ParagraphBox {
                 width: narrow,
                 wrap: true,
@@ -4067,7 +4109,7 @@ mod tests {
             "alphabet",
             12.0,
             false,
-            false,
+            crate::packet::TextFamily::Sans,
             ParagraphBox {
                 width: narrow,
                 wrap: true,
@@ -4085,7 +4127,7 @@ mod tests {
             "a\nb",
             12.0,
             false,
-            false,
+            crate::packet::TextFamily::Sans,
             ParagraphBox {
                 width: 1000.0,
                 wrap: true,

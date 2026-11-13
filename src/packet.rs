@@ -132,6 +132,16 @@ pub struct Tile {
     pub kind: String,
 }
 
+/// The generic font family a text command is drawn in.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextFamily {
+    #[default]
+    Sans,
+    Mono,
+    Serif,
+}
+
 /// Horizontal text alignment against the anchor x.
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -388,9 +398,9 @@ pub enum DrawCommand {
         weight: u16,
         #[serde(default)]
         halo: Option<Halo>,
-        /// Draw in the monospace face (the theme's `mono` label font).
+        /// The generic family the text is drawn in; `mono` is the theme's `mono` label font.
         #[serde(default)]
-        mono: bool,
+        family: TextFamily,
     },
     /// One signed-distance shape drawn by the SDF pass in z-order with the other commands: anti-aliased by the
     /// distance's screen derivative, stroke centred on the edge, shadow blurred analytically. `corners` run top-left,

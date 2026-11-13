@@ -27,7 +27,7 @@ pub struct Label {
 pub struct LabelStyle {
     pub em: f32,
     pub bold: bool,
-    pub mono: bool,
+    pub family: crate::packet::TextFamily,
     pub color: [f32; 4],
     pub halo: f32,
     pub halo_color: [f32; 4],
@@ -49,12 +49,12 @@ pub fn label(text: &str, style: &LabelStyle) -> Result<Label, String> {
     }
     let (ascent, descent) =
         crate::vector::text_font_metrics(style.em).ok_or("the bundled text face is unavailable")?;
-    let text_width = crate::vector::shape(text, style.em, style.bold, style.mono).width;
+    let text_width = crate::vector::shape(text, style.em, style.bold, style.family).width;
     // the AA fringe and the halo stroke sit outside the glyph box
     let pad = style.halo + 1.0 / DENSITY;
     // the raster draws the Latin face's middle on the quad's center, so the quad grows evenly around it to hold the
     // tallest face the text is shaped with
-    let (top, bottom) = crate::vector::text_run_extent(text, style.em, style.bold, style.mono)
+    let (top, bottom) = crate::vector::text_run_extent(text, style.em, style.bold, style.family)
         .ok_or("the bundled text face is unavailable")?;
     let middle = (ascent + descent) / 2.0;
     let half = (top - middle).max(middle - bottom);
@@ -74,7 +74,7 @@ pub fn label(text: &str, style: &LabelStyle) -> Result<Label, String> {
     {
         v.to_bits().hash(&mut hasher);
     }
-    (style.bold, style.mono).hash(&mut hasher);
+    (style.bold, style.family).hash(&mut hasher);
     let key = format!("scene3d-label:{:016x}", hasher.finish());
     let fresh = registered()
         .lock()
@@ -95,7 +95,7 @@ pub fn label(text: &str, style: &LabelStyle) -> Result<Label, String> {
                 color: style.halo_color,
                 width: 2.0 * style.halo * density,
             }),
-            mono: style.mono,
+            family: style.family,
         };
         let encoded = crate::vector::rasterize(&[&command], px_w, px_h, 1.0, 1.0)
             .ok_or_else(|| format!("a {px_w} x {px_h} label surface cannot be allocated"))
@@ -136,7 +136,7 @@ mod tests {
         LabelStyle {
             em: 1.0,
             bold,
-            mono: false,
+            family: crate::packet::TextFamily::Sans,
             color: [1.0, 1.0, 1.0, 1.0],
             halo: 0.0,
             halo_color: [0.0, 0.0, 0.0, 1.0],

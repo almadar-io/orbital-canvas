@@ -59,24 +59,7 @@ impl FontId {
     }
 }
 
-/// The generic family a run of text is drawn in.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum Family {
-    Sans,
-    Mono,
-    #[allow(dead_code)]
-    Serif,
-}
-
-impl Family {
-    pub(crate) fn of_mono(mono: bool) -> Self {
-        if mono {
-            Family::Mono
-        } else {
-            Family::Sans
-        }
-    }
-}
+pub(crate) use crate::packet::TextFamily as Family;
 
 fn font_for(id: FontId) -> Option<&'static rustybuzz::Face<'static>> {
     static FACES: OnceLock<[Option<rustybuzz::Face<'static>>; 6]> = OnceLock::new();
@@ -271,8 +254,8 @@ fn char_fonts(text: &str, bold: bool, family: Family) -> Vec<FontId> {
 }
 
 /// Shape `text` at `size` into glyphs laid out left to right in visual order.
-pub(crate) fn shape(text: &str, size: f32, bold: bool, mono: bool) -> Shaped {
-    shape_in(text, size, bold, Family::of_mono(mono))
+pub(crate) fn shape(text: &str, size: f32, bold: bool, family: Family) -> Shaped {
+    shape_in(text, size, bold, family)
 }
 
 /// [`shape`] in a generic family.
@@ -369,12 +352,12 @@ pub fn uses_text(command: &DrawCommand) -> bool {
 
 /// Advance width of `text` at `size`, in the same units as `size`.
 pub fn text_width(text: &str, size: f32) -> f32 {
-    shape(text, size, false, false).width
+    shape(text, size, false, Family::Sans).width
 }
 
 /// [`text_width`] in the monospace face.
 pub fn mono_text_width(text: &str, size: f32) -> f32 {
-    shape(text, size, false, true).width
+    shape(text, size, false, Family::Mono).width
 }
 
 /// The Latin face's ascent and descent in packet units. The vector text path
@@ -390,9 +373,9 @@ pub fn text_font_metrics(size: f32) -> Option<(f32, f32)> {
 
 /// The highest ascent and the lowest descent among the faces `text` is shaped with, in packet units. A face taller
 /// than the Latin one (the Arabic face, whose dots hang under its letters) reaches past [`text_font_metrics`].
-pub(crate) fn text_run_extent(text: &str, size: f32, bold: bool, mono: bool) -> Option<(f32, f32)> {
+pub(crate) fn text_run_extent(text: &str, size: f32, bold: bool, family: Family) -> Option<(f32, f32)> {
     let (mut top, mut bottom) = text_font_metrics(size)?;
-    for font in char_fonts(text, bold, Family::of_mono(mono)) {
+    for font in char_fonts(text, bold, family) {
         if let Some(face) = font_for(font) {
             let scale = size / face.units_per_em() as f32;
             top = top.max(face.ascender() as f32 * scale);
@@ -819,10 +802,10 @@ pub(crate) fn text_layout(
     size: f32,
     align: TextAlign,
     bold: bool,
-    mono: bool,
+    family: Family,
 ) -> Option<TextLayout> {
     let base = face()?;
-    let shaped = shape(text, size, bold, mono);
+    let shaped = shape(text, size, bold, family);
     let x0 = match align {
         TextAlign::Left => pos.x,
         TextAlign::Center => pos.x - shaped.width / 2.0,
@@ -845,13 +828,13 @@ fn text_path(
     size: f32,
     align: TextAlign,
     bold: bool,
-    mono: bool,
+    family: Family,
 ) -> Option<TextPaths> {
     let TextLayout {
         shaped,
         x0,
         baseline,
-    } = text_layout(text, pos, size, align, bold, mono)?;
+    } = text_layout(text, pos, size, align, bold, family)?;
     let mut all = PathBuilder::new();
     let mut faux = PathBuilder::new();
     for g in &shaped.glyphs {
@@ -1122,10 +1105,10 @@ fn draw_command(pixmap: &mut Pixmap, command: &DrawCommand, ts: Transform) {
             align,
             weight,
             halo,
-            mono,
+            family,
         } => {
             let bold = *weight >= 600;
-            let Some(paths) = text_path(text, *pos, *size, *align, bold, *mono) else {
+            let Some(paths) = text_path(text, *pos, *size, *align, bold, *family) else {
                 return;
             };
             let path = &paths.all;
@@ -1300,7 +1283,7 @@ mod tests {
             align: TextAlign::Center,
             weight,
             halo: None,
-            mono: false,
+            family: crate::packet::TextFamily::Sans,
         };
         let rgba = rasterize(&[&cmd], 80, 80, 1.0, 1.0).unwrap();
         (0..80).find(|&y| (0..80).any(|x| at(&rgba, 80, x, y)[3] > 0))
@@ -1547,7 +1530,7 @@ mod tests {
             color: RED,
             align,
             weight: 400,
-            mono: false,
+            family: crate::packet::TextFamily::Sans,
             halo: None,
         }
     }
@@ -1599,7 +1582,7 @@ mod tests {
             color: RED,
             align: TextAlign::Left,
             weight: 400,
-            mono: false,
+            family: crate::packet::TextFamily::Sans,
             halo: Some(crate::packet::Halo {
                 color: [1.0, 1.0, 1.0, 1.0],
                 width: 4.0,
@@ -1667,7 +1650,7 @@ mod tests {
             text_width("i", 12.0) < text_width("W", 12.0),
             "control: the body face is proportional"
         );
-        assert!(shape("ab", 12.0, false, true)
+        assert!(shape("ab", 12.0, false, Family::Mono)
             .glyphs
             .iter()
             .all(|g| g.font == FontId::Mono));
@@ -1675,7 +1658,7 @@ mod tests {
 
     #[test]
     fn mono_text_falls_to_the_script_face_where_mono_has_no_glyph() {
-        let s = shape("a\u{645}", 12.0, false, true);
+        let s = shape("a\u{645}", 12.0, false, Family::Mono);
         assert_eq!(s.glyphs.first().map(|g| g.font), Some(FontId::Mono));
         assert!(s.glyphs.iter().any(|g| g.font == FontId::ArabicRegular));
     }
@@ -1686,7 +1669,7 @@ mod tests {
     #[test]
     fn an_uncovered_script_is_reported_missing_once() {
         let _turn = MISSING_LIST.lock().unwrap_or_else(|e| e.into_inner());
-        let s = shape("\u{05e9}\u{05dc}\u{05d5}\u{05dd}", 16.0, false, false);
+        let s = shape("\u{05e9}\u{05dc}\u{05d5}\u{05dd}", 16.0, false, Family::Sans);
         assert!(!s.glyphs.is_empty(), "still lays out (as .notdef)");
         let first = take_missing_scripts();
         assert!(
@@ -1696,7 +1679,7 @@ mod tests {
             }),
             "{first:?}"
         );
-        shape("\u{05e9}\u{05dc}\u{05d5}\u{05dd}", 16.0, false, false);
+        shape("\u{05e9}\u{05dc}\u{05d5}\u{05dd}", 16.0, false, Family::Sans);
         assert!(
             !take_missing_scripts().iter().any(|m| m.script == "Hebr"),
             "reported once"
@@ -1706,7 +1689,7 @@ mod tests {
     #[test]
     fn control_a_covered_script_is_never_reported() {
         let _turn = MISSING_LIST.lock().unwrap_or_else(|e| e.into_inner());
-        shape("Hello \u{03b8}", 16.0, false, false);
+        shape("Hello \u{03b8}", 16.0, false, Family::Sans);
         let missing = take_missing_scripts();
         assert!(
             !missing
@@ -1724,13 +1707,13 @@ mod tests {
         let before = font_generation();
         add_font_face("Deva", ARABIC_REGULAR_BYTES.to_vec(), 0).unwrap();
         assert!(font_generation() > before);
-        let s = shape("\u{0928}\u{092e}", 16.0, false, false);
+        let s = shape("\u{0928}\u{092e}", 16.0, false, Family::Sans);
         assert!(
             s.glyphs.iter().all(|g| matches!(g.font, FontId::Host(_))),
             "{:?}",
             fonts_of(&s)
         );
-        let latin = shape("ab", 16.0, false, false);
+        let latin = shape("ab", 16.0, false, Family::Sans);
         assert!(
             latin.glyphs.iter().all(|g| g.font == FontId::Latin),
             "control: Latin keeps the bundled face"
@@ -1742,11 +1725,11 @@ mod tests {
         let _font = FONT_GENERATION_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        shape("\u{0e01}", 16.0, false, false);
+        shape("\u{0e01}", 16.0, false, Family::Sans);
         let err = add_font_face("Thai", LATIN_BYTES.to_vec(), 0).unwrap_err();
         assert!(err.contains("no glyph"), "{err}");
         assert!(
-            shape("\u{0e01}", 16.0, false, false)
+            shape("\u{0e01}", 16.0, false, Family::Sans)
                 .glyphs
                 .iter()
                 .all(|g| g.font == FontId::Latin),
@@ -1792,16 +1775,16 @@ mod tests {
     #[test]
     fn arabic_glyph_count_differs_from_char_count_and_latin_does_not() {
         for word in [KITAB, MARHABA] {
-            let ar = shape(word, 14.0, false, false);
+            let ar = shape(word, 14.0, false, Family::Sans);
             assert_ne!(ar.glyphs.len(), word.chars().count(), "{word}");
         }
-        let en = shape("salm", 14.0, false, false);
+        let en = shape("salm", 14.0, false, Family::Sans);
         assert_eq!(en.glyphs.len(), "salm".chars().count());
     }
 
     #[test]
     fn arabic_uses_cursive_forms_not_the_nominal_glyphs() {
-        let s = shape(MARHABA, 14.0, false, false);
+        let s = shape(MARHABA, 14.0, false, Family::Sans);
         assert!(s.glyphs.iter().all(|g| g.font == FontId::ArabicRegular));
         let nominal = nominal_gids(FontId::ArabicRegular, MARHABA);
         assert!(nominal.iter().all(|g| *g != 0), "subset covers the letters");
@@ -1811,7 +1794,7 @@ mod tests {
             Some(nominal[0]),
             "initial meem is not the isolated meem"
         );
-        let lone = shape("\u{645}", 14.0, false, false);
+        let lone = shape("\u{645}", 14.0, false, Family::Sans);
         assert_eq!(
             lone.glyphs.last().map(|g| g.gid),
             Some(nominal[0]),
@@ -1823,12 +1806,12 @@ mod tests {
     fn rtl_run_is_reversed_and_an_ltr_run_is_not() {
         let alef_dal = "\u{627}\u{62F}";
         let nominal = nominal_gids(FontId::ArabicRegular, alef_dal);
-        let rtl = shape(alef_dal, 14.0, false, false);
+        let rtl = shape(alef_dal, 14.0, false, Family::Sans);
         let got: Vec<u16> = rtl.glyphs.iter().map(|g| g.gid).collect();
         assert_eq!(got, vec![nominal[1], nominal[0]], "dal draws left of alef");
         assert!(rtl.glyphs[0].x < rtl.glyphs[1].x);
 
-        let ltr = shape("ab", 14.0, false, false);
+        let ltr = shape("ab", 14.0, false, Family::Sans);
         let got: Vec<u16> = ltr.glyphs.iter().map(|g| g.gid).collect();
         assert_eq!(got, nominal_gids(FontId::Latin, "ab"));
     }
@@ -1836,7 +1819,7 @@ mod tests {
     #[test]
     fn mixed_latin_and_arabic_pick_their_own_fonts_in_bidi_order() {
         let ltr_base = format!("abc {MARHABA} def");
-        let s = shape(&ltr_base, 14.0, false, false);
+        let s = shape(&ltr_base, 14.0, false, Family::Sans);
         let fonts = fonts_of(&s);
         assert_eq!(fonts.first(), Some(&FontId::Latin));
         assert_eq!(fonts.last(), Some(&FontId::Latin));
@@ -1850,7 +1833,7 @@ mod tests {
         assert!(s.glyphs.last().unwrap().x > s.glyphs[0].x);
 
         let rtl_base = format!("{MARHABA} abc");
-        let r = shape(&rtl_base, 14.0, false, false);
+        let r = shape(&rtl_base, 14.0, false, Family::Sans);
         let fonts = fonts_of(&r);
         assert_eq!(
             fonts.first(),
@@ -1863,7 +1846,7 @@ mod tests {
     #[test]
     fn latin_label_is_unchanged_by_shaping() {
         let label = "Hello, World 123";
-        let s = shape(label, 14.0, false, false);
+        let s = shape(label, 14.0, false, Family::Sans);
         assert_eq!(
             s.glyphs.iter().map(|g| g.gid).collect::<Vec<_>>(),
             nominal_gids(FontId::Latin, label)
@@ -1884,9 +1867,9 @@ mod tests {
 
     #[test]
     fn bold_arabic_uses_the_real_bold_face_and_bold_latin_stays_faux() {
-        let b = shape(MARHABA, 14.0, true, false);
+        let b = shape(MARHABA, 14.0, true, Family::Sans);
         assert!(b.glyphs.iter().all(|g| g.font == FontId::ArabicBold));
-        let l = shape("abc", 14.0, true, false);
+        let l = shape("abc", 14.0, true, Family::Sans);
         assert!(l.glyphs.iter().all(|g| g.font == FontId::Latin));
     }
 
@@ -1915,9 +1898,9 @@ mod tests {
 
     #[test]
     fn missing_glyph_in_every_face_still_measures_and_draws_nothing_wild() {
-        let s = shape("", 14.0, false, false);
+        let s = shape("", 14.0, false, Family::Sans);
         assert!(s.glyphs.is_empty() && s.width == 0.0);
-        let cjk = shape("\u{4E2D}", 14.0, false, false);
+        let cjk = shape("\u{4E2D}", 14.0, false, Family::Sans);
         assert_eq!(cjk.glyphs.len(), 1);
     }
 
@@ -1950,6 +1933,22 @@ mod tests {
             (again.width, again.coverage),
             "control: one face twice is the same"
         );
+    }
+
+    #[test]
+    fn a_text_command_with_the_serif_family_lays_out_in_the_serif_face() {
+        let at = Vec2 { x: 0.0, y: 0.0 };
+        let layout = |family| text_layout("Hg", at, 24.0, TextAlign::Left, false, family).unwrap();
+        assert!(layout(Family::Serif)
+            .shaped
+            .glyphs
+            .iter()
+            .all(|g| g.font == FontId::Serif));
+        assert!(layout(Family::Sans)
+            .shaped
+            .glyphs
+            .iter()
+            .all(|g| g.font == FontId::Latin));
     }
 
     #[test]

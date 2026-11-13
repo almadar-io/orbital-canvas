@@ -1019,7 +1019,7 @@ pub fn paint(shape: &Shape, ctx: &PaintCtx, out: &mut Vec<DrawCommand>) {
                     Align::Right => TextAlign::Right,
                 },
                 weight: theme.label_weight,
-                mono: false,
+                family: crate::packet::TextFamily::Sans,
                 halo: Some(Halo {
                     color: theme.ground,
                     width: (theme.text_px("xs") * 0.3).max(2.0) * xf.s,

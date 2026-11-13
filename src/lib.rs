@@ -10,6 +10,7 @@ pub mod atlas;
 pub mod c_api;
 pub mod device;
 pub mod fx_projection;
+pub(crate) mod glyph_atlas;
 pub mod gpu;
 pub mod mappers;
 pub mod packet;

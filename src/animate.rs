@@ -489,7 +489,7 @@ impl Xform {
                 align,
                 weight,
                 halo,
-                mono,
+                family,
             } => DrawCommand::Text {
                 text: text.clone(),
                 pos: self.point(*pos),
@@ -497,7 +497,7 @@ impl Xform {
                 color: self.color(*color),
                 align: *align,
                 weight: *weight,
-                mono: *mono,
+                family: *family,
                 halo: halo.map(|h| Halo {
                     color: self.color(h.color),
                     width: h.width * self.scale,
@@ -1074,7 +1074,7 @@ mod tests {
                 color: RED,
                 align: Default::default(),
                 weight: 400,
-                mono: false,
+                family: crate::packet::TextFamily::Sans,
                 halo: None,
             },
             DrawCommand::Line {

@@ -368,7 +368,7 @@ impl<'a> Pen<'a> {
         align: TextAlign,
         weight: u16,
     ) {
-        self.text_face(x, middle_y, text, size, color, align, weight, false);
+        self.text_face(x, middle_y, text, size, color, align, weight, crate::packet::TextFamily::Sans);
     }
 
     /// [`Self::text_middle`] in the monospace face (`font-family: mono` on the web).
@@ -382,7 +382,7 @@ impl<'a> Pen<'a> {
         align: TextAlign,
         weight: u16,
     ) {
-        self.text_face(x, middle_y, text, size, color, align, weight, true);
+        self.text_face(x, middle_y, text, size, color, align, weight, crate::packet::TextFamily::Mono);
     }
 
     fn text_face(
@@ -394,7 +394,7 @@ impl<'a> Pen<'a> {
         color: Rgba,
         align: TextAlign,
         weight: u16,
-        mono: bool,
+        family: crate::packet::TextFamily,
     ) {
         if text.is_empty() {
             return;
@@ -408,7 +408,7 @@ impl<'a> Pen<'a> {
             align,
             weight,
             halo: None,
-            mono,
+            family,
         });
     }
 
