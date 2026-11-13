@@ -173,6 +173,8 @@ pub struct SceneHost {
     /// The semantic tree of the latest layout, and the size last sent as `resizeEvent`.
     pub(crate) semantic: Vec<mappers::scene::SemanticNode>,
     pub(crate) resize_reported: Option<(f32, f32)>,
+    /// The `embeds` ids already answered through `embedEvent`.
+    pub(crate) embeds_answered: Vec<String>,
     /// The region under the pointer, the region holding a press, and the last pointer position.
     pub(crate) hovered: Option<String>,
     pub(crate) captured: Option<String>,
@@ -351,6 +353,7 @@ impl SceneHost {
             measure_reported: Vec::new(),
             semantic: Vec::new(),
             resize_reported: None,
+            embeds_answered: Vec::new(),
             hovered: None,
             captured: None,
             pointer: None,
@@ -485,6 +488,7 @@ impl SceneHost {
         self.semantic = mapped.semantic_nodes;
         self.report_measured();
         self.report_resize();
+        self.report_embeds();
     }
 
     /// The prop `name` of the current canvas node, when it declares it.
@@ -505,6 +509,34 @@ impl SceneHost {
                 arg: String::new(),
                 payload,
             });
+        }
+    }
+
+    /// Answer each embed the canvas declares (`embeds: [{ id, kind, source }]`) once through `embedEvent`: this host
+    /// realizes no embedded view yet, so the answer is `unavailable` with reason `host` (contract 14). An embed that
+    /// leaves the list and returns is answered again.
+    fn report_embeds(&mut self) {
+        if self.canvas_event("embedEvent").is_none() {
+            return;
+        }
+        let ids: Vec<String> = self
+            .scene
+            .as_ref()
+            .and_then(|node| node.get("props").unwrap_or(node).get("embeds").and_then(serde_json::Value::as_array).cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|e| e.get("id").and_then(serde_json::Value::as_str).map(str::to_owned))
+            .collect();
+        self.embeds_answered.retain(|id| ids.contains(id));
+        for id in ids {
+            if self.embeds_answered.contains(&id) {
+                continue;
+            }
+            self.queue_canvas_event(
+                "embedEvent",
+                serde_json::json!({ "target": id, "status": "unavailable", "reason": "host" }),
+            );
+            self.embeds_answered.push(id);
         }
     }
 
@@ -1795,6 +1827,33 @@ mod tests {
         assert!(events(&mut r).is_empty(), "same size: nothing");
         r.set_viewport(1000, 600);
         assert_eq!(events(&mut r), vec!["RESIZED"], "new size: sent again");
+    }
+
+    #[test]
+    fn each_declared_embed_is_answered_unavailable_once() {
+        let embeds = |ids: &[&str]| serde_json::Value::Array(ids.iter().map(|id| serde_json::json!({"id": id, "kind": "program", "source": "/x"})).collect());
+        let mut r = host_with(serde_json::json!({"embedEvent": "EMBED", "embeds": embeds(&["a"])}));
+        let sent = r.take_scene_events();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].event, "EMBED");
+        assert_eq!(sent[0].payload, serde_json::json!({"target": "a", "status": "unavailable", "reason": "host"}));
+        let mut node = r.scene.clone().unwrap();
+        node["embeds"] = embeds(&["a", "b"]);
+        r.set_scene(node.clone()).unwrap();
+        let sent = r.take_scene_events();
+        assert_eq!(sent.iter().map(|e| e.payload["target"].clone()).collect::<Vec<_>>(), vec![serde_json::json!("b")], "an answered embed is not answered again");
+        node["embeds"] = embeds(&["b"]);
+        r.set_scene(node.clone()).unwrap();
+        assert!(r.take_scene_events().is_empty());
+        node["embeds"] = embeds(&["a", "b"]);
+        r.set_scene(node).unwrap();
+        assert_eq!(r.take_scene_events().len(), 1, "edge: an embed that left and came back is answered again");
+    }
+
+    #[test]
+    fn control_embeds_without_an_embed_event_send_nothing() {
+        let mut r = host_with(serde_json::json!({"embeds": [{"id": "a", "kind": "program", "source": "/x"}]}));
+        assert!(r.take_scene_events().is_empty());
     }
 
     #[test]
