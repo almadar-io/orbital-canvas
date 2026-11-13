@@ -594,6 +594,70 @@ impl Xform {
                     flip_y: *flip_y,
                 }
             }
+            DrawCommand::SdfBlend {
+                first,
+                second,
+                radius,
+            } => DrawCommand::SdfBlend {
+                first: Box::new(self.command(first)),
+                second: Box::new(self.command(second)),
+                radius: radius * self.scale.abs(),
+            },
+            DrawCommand::Sdf {
+                kind,
+                rect,
+                corners,
+                corner_kind,
+                arc,
+                polygon,
+                fill,
+                stroke,
+                shadow,
+                rotation,
+                opacity,
+                material,
+            } => {
+                let center = self.point(Vec2 {
+                    x: rect.x + rect.w / 2.0,
+                    y: rect.y + rect.h / 2.0,
+                });
+                let size = self.scale.abs();
+                let (w, h) = (rect.w * size, rect.h * size);
+                let stroke_scale = if self.scale_strokes { self.scale } else { 1.0 };
+                DrawCommand::Sdf {
+                    kind: *kind,
+                    rect: crate::packet::Rect {
+                        x: center.x - w / 2.0,
+                        y: center.y - h / 2.0,
+                        w,
+                        h,
+                    },
+                    corners: corners.map(|radius| radius * size),
+                    corner_kind: *corner_kind,
+                    arc: [arc[0], arc[1], arc[2] * size],
+                    polygon: *polygon,
+                    fill: self.color(*fill),
+                    stroke: stroke.map(|s| crate::packet::SdfStroke {
+                        color: self.color(s.color),
+                        width: s.width * stroke_scale,
+                        dash: s.dash.map(|d| d * stroke_scale),
+                        dash_offset: s.dash_offset + self.dash_offset,
+                    }),
+                    shadow: shadow.map(|s| crate::packet::SdfShadow {
+                        color: self.color(s.color),
+                        sigma: s.sigma * size,
+                        offset: Vec2 {
+                            x: (s.offset.x * self.cos - s.offset.y * self.sin) * self.scale,
+                            y: (s.offset.x * self.sin + s.offset.y * self.cos) * self.scale,
+                        },
+                    }),
+                    rotation: *rotation
+                        + self.sin.atan2(self.cos)
+                        + if self.scale < 0.0 { std::f32::consts::PI } else { 0.0 },
+                    opacity: *opacity * self.opacity,
+                    material: material.clone(),
+                }
+            }
             other => other.clone(),
         }
     }
@@ -1192,5 +1256,68 @@ mod tests {
         assert_eq!(stroke.width, 3.0);
         assert_eq!(stroke.dash, vec![2.0, 1.0]);
         assert_eq!(stroke.color[3], 0.5);
+    }
+
+    #[test]
+    fn an_sdf_shape_rides_the_group_transform_about_its_centre() {
+        let sdf = DrawCommand::Sdf {
+            kind: crate::packet::SdfKind::Rect,
+            rect: crate::packet::Rect { x: 10.0, y: 10.0, w: 20.0, h: 10.0 },
+            corners: [2.0; 4],
+            corner_kind: 0,
+            arc: [0.0; 3],
+            polygon: [0.0; 2],
+            fill: RED,
+            stroke: Some(crate::packet::SdfStroke { color: RED, width: 3.0, dash: [0.0; 2], dash_offset: 0.0 }),
+            shadow: Some(crate::packet::SdfShadow { color: RED, sigma: 4.0, offset: Vec2::default() }),
+            rotation: 0.0,
+            opacity: 1.0,
+            material: None,
+        };
+        let mut moved = vec![sdf.clone()];
+        transform_group_commands(&mut moved, Vec2::default(), Vec2 { x: 5.0, y: 0.0 }, 2.0, 0.0, 0.5);
+        let DrawCommand::Sdf { rect, corners, fill, stroke, shadow, rotation, opacity, .. } = &moved[0] else {
+            panic!("sdf")
+        };
+        assert!((rect.x - 25.0).abs() < 1e-4 && (rect.y - 20.0).abs() < 1e-4, "{rect:?}");
+        assert_eq!((rect.w, rect.h), (40.0, 20.0));
+        assert_eq!(*corners, [4.0; 4]);
+        assert_eq!(fill[3], 0.5);
+        assert_eq!(stroke.unwrap().width, 3.0, "group strokes keep their width");
+        assert_eq!(shadow.unwrap().sigma, 8.0);
+        assert_eq!((*rotation, *opacity), (0.0, 0.5));
+        let mut turned = vec![sdf.clone()];
+        transform_group_commands(&mut turned, Vec2::default(), Vec2::default(), 1.0, std::f32::consts::FRAC_PI_2, 1.0);
+        let DrawCommand::Sdf { rect, rotation, .. } = &turned[0] else { panic!("sdf") };
+        assert!((rotation - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
+        assert!((rect.x + rect.w / 2.0 + 15.0).abs() < 1e-3 && (rect.y + rect.h / 2.0 - 20.0).abs() < 1e-3, "centre (20,15) turns to (-15,20): {rect:?}");
+        let mut still = vec![sdf.clone()];
+        transform_group_commands(&mut still, Vec2::default(), Vec2::default(), 1.0, 0.0, 1.0);
+        assert_eq!(format!("{:?}", still[0]), format!("{sdf:?}"), "control: the identity transform changes nothing");
+    }
+
+    #[test]
+    fn a_blend_rides_the_group_transform_with_its_radius_scaled() {
+        let member = |x: f32| DrawCommand::Sdf {
+            kind: crate::packet::SdfKind::Ellipse,
+            rect: crate::packet::Rect { x, y: 0.0, w: 10.0, h: 10.0 },
+            corners: [0.0; 4],
+            corner_kind: 0,
+            arc: [0.0; 3],
+            polygon: [0.0; 2],
+            fill: RED,
+            stroke: None,
+            shadow: None,
+            rotation: 0.0,
+            opacity: 1.0,
+            material: None,
+        };
+        let mut commands = vec![DrawCommand::SdfBlend { first: Box::new(member(0.0)), second: Box::new(member(20.0)), radius: 3.0 }];
+        transform_group_commands(&mut commands, Vec2::default(), Vec2 { x: 1.0, y: 0.0 }, 2.0, 0.0, 1.0);
+        let DrawCommand::SdfBlend { first, second, radius } = &commands[0] else { panic!("blend") };
+        assert_eq!(*radius, 6.0);
+        let (DrawCommand::Sdf { rect: a, .. }, DrawCommand::Sdf { rect: b, .. }) = (first.as_ref(), second.as_ref()) else { panic!("members") };
+        assert_eq!((a.x, a.w), (1.0, 20.0));
+        assert_eq!((b.x, b.w), (41.0, 20.0));
     }
 }

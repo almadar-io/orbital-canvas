@@ -696,6 +696,11 @@ pub fn has_active_fx(node: &Value) -> bool {
     {
         return true;
     }
+    if node.get("type").and_then(Value::as_str) == Some("draw-text")
+        && node.get("caret").and_then(Value::as_f64).is_some_and(|caret| caret >= 0.0)
+    {
+        return true;
+    }
     ["props", "drawables", "children", "items"]
         .into_iter()
         .filter_map(|key| node.get(key))
@@ -743,7 +748,7 @@ fn paint_group(
         .unwrap_or(0.0) as f32;
     let radians = get_f32(node, "rotate", 0.0) + rotation_z + animated_number("rotateZ", 0.0);
     let start = out.len();
-    let (region_start, measured_start) = (gathered.regions.len(), gathered.measured.len());
+    let (region_start, measured_start, hits_start) = (gathered.regions.len(), gathered.measured.len(), gathered.text_hits.len());
     for child in items(node) {
         walk(
             child,
@@ -755,19 +760,6 @@ fn paint_group(
             out,
         )?;
     }
-    if out[start..]
-        .iter()
-        .any(|cmd| matches!(cmd, DrawCommand::Sdf { .. }))
-    {
-        out.truncate(start);
-        gathered.regions.truncate(region_start);
-        gathered.measured.truncate(measured_start);
-        gap_once(
-            "group-sdf",
-            "draw-group transforming an SDF shape needs the group transform to carry Sdf commands",
-        );
-        return Ok(());
-    }
     if radians != 0.0
         && out[start..]
             .iter()
@@ -776,29 +768,41 @@ fn paint_group(
         out.truncate(start);
         gathered.regions.truncate(region_start);
         gathered.measured.truncate(measured_start);
+        gathered.text_hits.truncate(hits_start);
         gap_once(
             "group-rotated-text",
             "draw-group rotating text needs a vector glyph path",
         );
         return Ok(());
     }
-    if let Some(clip) = node
-        .get("clip")
-        .and_then(Value::as_str)
-        .filter(|clip| !clip.is_empty())
-    {
-        let Some(segments) = parse_path_data(
-            clip,
-            Xf {
-                s: projector.tile_width * zoom,
-                ox: zero_x,
-                oy: zero_y,
-            },
-        ) else {
-            out.truncate(start);
-            gap_once("group-clip-path", "malformed draw-group SVG clip path");
-            return Ok(());
-        };
+    if let Some(radius) = node.get("smoothUnion").filter(|r| !r.is_null()) {
+        blend_group_shapes(radius, projector.tile_width * zoom, out, start)?;
+    }
+    let mut rect_clip = false;
+    let clip = match node.get("clip").filter(|clip| !clip.is_null()) {
+        Some(Value::String(clip)) if !clip.is_empty() => {
+            let parsed = parse_path_data(
+                clip,
+                Xf {
+                    s: projector.tile_width * zoom,
+                    ox: zero_x,
+                    oy: zero_y,
+                },
+            );
+            if parsed.is_none() {
+                out.truncate(start);
+                gap_once("group-clip-path", "malformed draw-group SVG clip path");
+                return Ok(());
+            }
+            parsed
+        }
+        Some(Value::Object(spec)) => {
+            rect_clip = true;
+            Some(rect_clip_segments(spec, projector, to_screen, zoom)?)
+        }
+        _ => None,
+    };
+    if let Some(segments) = clip {
         let commands = out.drain(start..).collect();
         out.push(DrawCommand::ClipGroup {
             clip: segments,
@@ -850,11 +854,202 @@ fn paint_group(
             region.rotation = *rotation;
         }
     }
+    // a text hit's lines ride the same transform (text in a rotated group is refused above, so it only scales and moves)
+    for hit in &mut gathered.text_hits[hits_start..] {
+        for line in &mut hit.lines {
+            let (x0, x1) = (line.edges.first().copied().unwrap_or(0.0), line.edges.last().copied().unwrap_or(0.0));
+            let before = Rect { x: x0, y: line.top, w: (x1 - x0).max(f32::EPSILON), h: (line.bottom - line.top).max(f32::EPSILON) };
+            let mut carrier = vec![DrawCommand::Sprite { texture: String::new(), src: Rect::default(), dst: before, rotation: 0.0, opacity: 1.0, flip_x: false, flip_y: false }];
+            crate::animate::transform_group_commands(&mut carrier, origin, translation, scale, radians, 1.0);
+            if let Some(DrawCommand::Sprite { dst, .. }) = carrier.first() {
+                for edge in &mut line.edges {
+                    *edge = dst.x + (*edge - before.x) * dst.w / before.w;
+                }
+                line.top = dst.y;
+                line.bottom = dst.y + dst.h;
+            }
+        }
+    }
     for entry in &mut gathered.measured[measured_start..] {
         entry.width *= scale.abs();
         entry.height *= scale.abs();
     }
+    if rect_clip {
+        if let Some(DrawCommand::ClipGroup { clip, .. }) = out.get(start) {
+            if let Some(bounds) = segments_bounds(clip) {
+                cut_regions_to(&mut gathered.regions, region_start, bounds);
+            }
+        }
+    }
     Ok(())
+}
+
+/// Replace the two SDF shapes a `smoothUnion` group painted by one [`DrawCommand::SdfBlend`] (contract 14.4).
+fn blend_group_shapes(
+    radius: &Value,
+    unit: f32,
+    out: &mut Vec<DrawCommand>,
+    start: usize,
+) -> Result<(), CanvasSceneError> {
+    let radius = radius
+        .as_f64()
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .ok_or_else(|| invalid("smoothUnion", "a smooth union radius is a number above zero"))?;
+    if !matches!(&out[start..], [DrawCommand::Sdf { .. }, DrawCommand::Sdf { .. }]) {
+        return Err(invalid(
+            "smoothUnion",
+            "a smooth union group holds exactly two SDF draw-shape children and nothing else",
+        ));
+    }
+    let second = out.pop();
+    let first = out.pop();
+    let (Some(first), Some(second)) = (first, second) else {
+        return Err(invalid("smoothUnion", "a smooth union group holds two SDF shapes"));
+    };
+    let compatible = match (&first, &second) {
+        (
+            DrawCommand::Sdf { stroke: first_stroke, opacity: first_opacity, material: first_material, .. },
+            DrawCommand::Sdf { stroke, shadow, opacity, material, .. },
+        ) => {
+            if first_stroke.is_some_and(|s| s.dash != [0.0, 0.0]) {
+                Err("a blended union draws a solid stroke, not a dashed one")
+            } else if stroke.is_some() || shadow.is_some() {
+                Err("the second shape carries no stroke and no shadow")
+            } else if opacity != first_opacity {
+                Err("both shapes carry the same opacity")
+            } else if material != first_material {
+                Err("both shapes carry the same material, or none")
+            } else {
+                Ok(())
+            }
+        }
+        _ => Err("a smooth union group holds two SDF shapes"),
+    };
+    compatible.map_err(|detail| invalid("smoothUnion", detail))?;
+    out.push(DrawCommand::SdfBlend {
+        first: Box::new(first),
+        second: Box::new(second),
+        radius: radius as f32 * unit,
+    });
+    Ok(())
+}
+
+/// The box of an authored rect clip: `x`, `y`, `width`, `height` in group units, `radius` one number or four.
+fn rect_clip_segments(
+    spec: &serde_json::Map<String, Value>,
+    projector: &Projector,
+    to_screen: &dyn Fn(f32, f32) -> (f32, f32),
+    zoom: f32,
+) -> Result<Vec<PathSegment>, CanvasSceneError> {
+    let number = |key: &str| spec.get(key).and_then(Value::as_f64).filter(|v| v.is_finite());
+    let size = |key: &str| {
+        number(key)
+            .filter(|v| *v > 0.0)
+            .ok_or_else(|| invalid("clip", format!("a rect clip needs `{key}` above zero")))
+    };
+    let (width, height) = (size("width")?, size("height")?);
+    let origin = ScenePos {
+        x: number("x").unwrap_or(0.0) as f32,
+        y: number("y").unwrap_or(0.0) as f32,
+    };
+    let (px, py) = projector.project(origin);
+    let (x, y) = to_screen(px, py);
+    let unit = projector.tile_width * zoom;
+    let (w, h) = (width as f32 * unit, height as f32 * unit);
+    let radii = match spec.get("radius").filter(|r| !r.is_null()) {
+        None => [0.0; 4],
+        Some(Value::Number(n)) => [n.as_f64().unwrap_or(-1.0) as f32; 4],
+        Some(Value::Array(items)) if items.len() == 4 => {
+            let mut radii = [0.0; 4];
+            for (slot, item) in radii.iter_mut().zip(items) {
+                *slot = item.as_f64().unwrap_or(-1.0) as f32;
+            }
+            radii
+        }
+        Some(_) => {
+            return Err(invalid("clip", "`radius` is one number or four (tl, tr, br, bl)"));
+        }
+    };
+    if radii.iter().any(|r| !r.is_finite() || *r < 0.0) {
+        return Err(invalid("clip", "`radius` values are zero or more"));
+    }
+    let limit = w.min(h) / 2.0;
+    let [tl, tr, br, bl] = radii.map(|r| (r * unit).min(limit));
+    const KAPPA: f32 = 0.552_284_75;
+    let corner = |c1: (f32, f32), c2: (f32, f32), to: (f32, f32)| PathSegment::CubicTo {
+        x1: c1.0,
+        y1: c1.1,
+        x2: c2.0,
+        y2: c2.1,
+        x: to.0,
+        y: to.1,
+    };
+    let mut path = vec![PathSegment::MoveTo { x: x + tl, y }];
+    path.push(PathSegment::LineTo { x: x + w - tr, y });
+    if tr > 0.0 {
+        path.push(corner((x + w - tr + tr * KAPPA, y), (x + w, y + tr - tr * KAPPA), (x + w, y + tr)));
+    }
+    path.push(PathSegment::LineTo { x: x + w, y: y + h - br });
+    if br > 0.0 {
+        path.push(corner((x + w, y + h - br + br * KAPPA), (x + w - br + br * KAPPA, y + h), (x + w - br, y + h)));
+    }
+    path.push(PathSegment::LineTo { x: x + bl, y: y + h });
+    if bl > 0.0 {
+        path.push(corner((x + bl - bl * KAPPA, y + h), (x, y + h - bl + bl * KAPPA), (x, y + h - bl)));
+    }
+    path.push(PathSegment::LineTo { x, y: y + tl });
+    if tl > 0.0 {
+        path.push(corner((x, y + tl - tl * KAPPA), (x + tl - tl * KAPPA, y), (x + tl, y)));
+    }
+    path.push(PathSegment::Close);
+    Ok(path)
+}
+
+/// The box that holds every point of a path (curve control points included).
+fn segments_bounds(segments: &[PathSegment]) -> Option<Rect> {
+    let mut bounds: Option<(f32, f32, f32, f32)> = None;
+    let mut add = |x: f32, y: f32| {
+        bounds = Some(match bounds {
+            None => (x, y, x, y),
+            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+        });
+    };
+    for segment in segments {
+        match *segment {
+            PathSegment::MoveTo { x, y } | PathSegment::LineTo { x, y } => add(x, y),
+            PathSegment::CubicTo { x1, y1, x2, y2, x, y } => {
+                add(x1, y1);
+                add(x2, y2);
+                add(x, y);
+            }
+            PathSegment::Arc { cx, cy, rx, ry, .. } => {
+                add(cx - rx, cy - ry);
+                add(cx + rx, cy + ry);
+            }
+            PathSegment::Close => {}
+        }
+    }
+    bounds.map(|(x0, y0, x1, y1)| Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
+}
+
+/// Cut the regions a clipped group gathered to the clip's bounds: one wholly outside is dropped, a straddling
+/// one is intersected, a rotated one stays whole.
+fn cut_regions_to(regions: &mut Vec<Region>, from: usize, bounds: Rect) {
+    let mut kept: Vec<Region> = Vec::new();
+    for mut region in regions.drain(from..) {
+        if region.rotation == 0.0 {
+            let x0 = region.rect.x.max(bounds.x);
+            let y0 = region.rect.y.max(bounds.y);
+            let x1 = (region.rect.x + region.rect.w).min(bounds.x + bounds.w);
+            let y1 = (region.rect.y + region.rect.h).min(bounds.y + bounds.h);
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            region.rect = Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+        }
+        kept.push(region);
+    }
+    regions.extend(kept);
 }
 
 fn paint_sprite_gathering(
@@ -901,6 +1096,10 @@ fn commands_bounds(commands: &[DrawCommand]) -> Option<Rect> {
                 }
                 DrawCommand::Sdf { rect, .. } => {
                     add(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h)
+                }
+                DrawCommand::SdfBlend { first, second, .. } => {
+                    walk_commands(std::slice::from_ref(first.as_ref()), add);
+                    walk_commands(std::slice::from_ref(second.as_ref()), add);
                 }
                 DrawCommand::Poly { points, .. } => {
                     for p in points {
@@ -971,6 +1170,150 @@ fn animated_text(node: &Value, epoch_now_ms: f64) -> Option<Value> {
 /// other Canvas labels. Unsupported CSS fonts/baselines are reported rather
 /// than silently given a different face or anchor. With a `width` the text is a
 /// paragraph laid out from the top-left of `position` (see [`layout_paragraph`]).
+/// A `draw-text`'s editing decorations (contract §11): caret, selection band and the input method's preedit.
+struct TextEditing {
+    caret: Option<usize>,
+    selection: Option<(usize, usize)>,
+    preedit: String,
+    caret_color: Option<[f32; 4]>,
+    selection_color: Option<[f32; 4]>,
+}
+
+impl TextEditing {
+    fn read(node: &Value) -> Result<Self, CanvasSceneError> {
+        let index = |field: &str| -> Result<Option<usize>, CanvasSceneError> {
+            match node.get(field) {
+                None | Some(Value::Null) => Ok(None),
+                Some(value) => match value.as_f64() {
+                    Some(v) if v.is_finite() && v < 0.0 => Ok(None),
+                    Some(v) if v.is_finite() && v.fract() == 0.0 => Ok(Some(v as usize)),
+                    _ => Err(invalid(field, "must be a whole number")),
+                },
+            }
+        };
+        let color = |field: &str| node.get(field).and_then(Value::as_str).and_then(parse_css_color);
+        let selection = match (index("selectionStart")?, index("selectionEnd")?) {
+            (Some(a), Some(b)) if a != b => Some((a.min(b), a.max(b))),
+            _ => None,
+        };
+        Ok(Self {
+            caret: index("caret")?,
+            selection,
+            preedit: node.get("preedit").and_then(Value::as_str).unwrap_or_default().to_string(),
+            caret_color: color("caretColor"),
+            selection_color: color("selectionColor"),
+        })
+    }
+
+    fn active(&self) -> bool {
+        self.caret.is_some() || self.selection.is_some()
+    }
+
+    /// The text as painted: the preedit is shown at the caret, though it is not part of the text.
+    fn shown(&self, text: &str) -> String {
+        match self.caret.filter(|_| !self.preedit.is_empty()) {
+            Some(caret) => {
+                let at = text.char_indices().nth(caret).map_or(text.len(), |(i, _)| i);
+                format!("{}{}{}", &text[..at], self.preedit, &text[at..])
+            }
+            None => text.to_string(),
+        }
+    }
+
+    /// A text index as an index of the shown text.
+    fn shown_index(&self, index: usize) -> usize {
+        match self.caret {
+            Some(caret) if index >= caret => index + self.preedit.chars().count(),
+            _ => index,
+        }
+    }
+}
+
+/// The caret positions of each painted line: its first character index in `shown` and the advance before each of its
+/// characters and after the last. `None` when the lines do not join back into `shown` exactly or the text runs right to
+/// left, where prefix advances are not caret positions.
+fn caret_positions(lines: &[String], shown: &str, size: f32, bold: bool, family: crate::packet::TextFamily) -> Option<Vec<(usize, Vec<f32>)>> {
+    if lines.concat() != shown || unicode_bidi::BidiInfo::new(shown, None).has_rtl() {
+        return None;
+    }
+    let mut start = 0;
+    Some(
+        lines
+            .iter()
+            .map(|line| {
+                let mut edges = vec![0.0];
+                for (i, _) in line.char_indices().skip(1) {
+                    edges.push(crate::vector::shape(&line[..i], size, bold, family).width);
+                }
+                edges.push(crate::vector::shape(line, size, bold, family).width);
+                let first = start;
+                start += line.chars().count();
+                (first, edges)
+            })
+            .collect(),
+    )
+}
+
+/// One painted line of an editable text, in screen units: left edge, band top and height, first index, edges.
+struct EditLine {
+    left: f32,
+    top: f32,
+    height: f32,
+    start: usize,
+    edges: Vec<f32>,
+}
+
+/// Paint `editing`'s selection bands behind the text (inserted at `text_start`) and its preedit underline and caret
+/// over it. The caret blinks on the scene clock (530 ms on, 530 ms off); a scene drawn with no clock shows it steady.
+fn paint_editing(
+    editing: &TextEditing,
+    lines: &[EditLine],
+    text_color: [f32; 4],
+    size: f32,
+    epoch_now_ms: f64,
+    text_start: usize,
+    out: &mut Vec<DrawCommand>,
+) {
+    let x_of = |line: &EditLine, index: usize| line.left + line.edges[(index - line.start).min(line.edges.len() - 1)];
+    let holds = |line: &EditLine, index: usize| index >= line.start && index < line.start + line.edges.len();
+    if let Some((from, to)) = editing.selection {
+        let (from, to) = (editing.shown_index(from), editing.shown_index(to));
+        let band = editing.selection_color.unwrap_or([text_color[0], text_color[1], text_color[2], text_color[3] * 0.3]);
+        let bands: Vec<DrawCommand> = lines
+            .iter()
+            .filter_map(|line| {
+                let end = line.start + line.edges.len() - 1;
+                let (a, b) = (from.max(line.start), to.min(end));
+                (a < b).then(|| DrawCommand::Quad {
+                    rect: Rect { x: x_of(line, a), y: line.top, w: x_of(line, b) - x_of(line, a), h: line.height },
+                    color: band,
+                })
+            })
+            .collect();
+        out.splice(text_start..text_start, bands);
+    }
+    let Some(caret) = editing.caret else { return };
+    let preedit = editing.preedit.chars().count();
+    let at = editing.shown_index(caret);
+    let line = lines.iter().rev().find(|line| holds(line, at)).or_else(|| lines.last());
+    let Some(line) = line else { return };
+    if preedit > 0 {
+        let (a, b) = (x_of(line, caret), x_of(line, caret + preedit));
+        out.push(DrawCommand::Quad {
+            rect: Rect { x: a, y: line.top + line.height - (size * 0.08).max(1.0), w: b - a, h: (size * 0.06).max(1.0) },
+            color: text_color,
+        });
+    }
+    let on = epoch_now_ms <= 0.0 || (epoch_now_ms / 530.0).floor() as i64 % 2 == 0;
+    if on {
+        let w = (size * 0.07).max(1.0);
+        out.push(DrawCommand::Quad {
+            rect: Rect { x: x_of(line, at) - w / 2.0, y: line.top, w, h: line.height },
+            color: editing.caret_color.unwrap_or(text_color),
+        });
+    }
+}
+
 fn paint_text(
     node: &Value,
     projector: &Projector,
@@ -1027,6 +1370,10 @@ fn paint_text(
         },
     };
     let bold = weight >= 600;
+    let editing = TextEditing::read(node)?;
+    let original = text;
+    let shown = editing.shown(text);
+    let text = shown.as_str();
     let id = node.get("id").and_then(Value::as_str);
     let measure = node
         .get("measure")
@@ -1068,6 +1415,7 @@ fn paint_text(
             },
         );
         let line_px = size * line_height;
+        let text_start = out.len();
         for (i, line) in paragraph.lines.iter().enumerate() {
             if line.is_empty() {
                 continue;
@@ -1091,6 +1439,27 @@ fn paint_text(
                 family,
             });
         }
+        if let Some(positions) = editing.active().then(|| caret_positions(&paragraph.lines, text, size, bold, family)) {
+            match positions {
+                Some(positions) => {
+                    let edit_lines: Vec<EditLine> = positions
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, (start, edges))| {
+                            let w = edges.last().copied().unwrap_or(0.0);
+                            let left = match align {
+                                TextAlign::Left => sx,
+                                TextAlign::Center => sx + (width - w) / 2.0,
+                                TextAlign::Right => sx + width - w,
+                            };
+                            EditLine { left, top: sy + i as f32 * line_px, height: line_px, start, edges }
+                        })
+                        .collect();
+                    paint_editing(&editing, &edit_lines, color, size, epoch_now_ms, text_start, out);
+                }
+                None => gap_once("text-caret-layout", "draw-text caret and selection need lines that join back into the text, left to right"),
+            }
+        }
         let lines = paragraph.lines.len();
         let height = lines as f32 * line_px;
         if let Some(id) = id {
@@ -1105,6 +1474,31 @@ fn paint_text(
                     },
                     rotation: 0.0,
                 });
+                if text == original {
+                    if let Some(positions) = caret_positions(&paragraph.lines, text, size, bold, family) {
+                        gathered.text_hits.push(super::scene::TextHit {
+                            id: id.to_string(),
+                            lines: positions
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, (start, edges))| {
+                                    let w = edges.last().copied().unwrap_or(0.0);
+                                    let left = match align {
+                                        TextAlign::Left => sx,
+                                        TextAlign::Center => sx + (width - w) / 2.0,
+                                        TextAlign::Right => sx + width - w,
+                                    };
+                                    super::scene::TextHitLine {
+                                        top: sy + i as f32 * line_px,
+                                        bottom: sy + (i + 1) as f32 * line_px,
+                                        start,
+                                        edges: edges.into_iter().map(|e| left + e).collect(),
+                                    }
+                                })
+                                .collect(),
+                        });
+                    }
+                }
             }
             if measure {
                 gathered.measured.push(Measured {
@@ -1170,6 +1564,20 @@ fn paint_text(
                     },
                     rotation: 0.0,
                 });
+                if text == original {
+                    if let Some(mut positions) = caret_positions(&[text.to_string()], text, size, bold, family) {
+                        let (start, edges) = positions.remove(0);
+                        gathered.text_hits.push(super::scene::TextHit {
+                            id: id.to_string(),
+                            lines: vec![super::scene::TextHitLine {
+                                top: sy - h / 2.0,
+                                bottom: sy + h / 2.0,
+                                start,
+                                edges: edges.into_iter().map(|e| left + e).collect(),
+                            }],
+                        });
+                    }
+                }
             }
             if measure {
                 gathered.measured.push(Measured {
@@ -1181,6 +1589,7 @@ fn paint_text(
             }
         }
     }
+    let text_start = out.len();
     out.push(DrawCommand::Text {
         text: text.to_owned(),
         pos: Vec2 { x: sx, y: sy },
@@ -1191,6 +1600,23 @@ fn paint_text(
         halo: None,
         family,
     });
+    if editing.active() {
+        match caret_positions(&[text.to_string()], text, size, bold, family) {
+            Some(mut positions) => {
+                let (start, edges) = positions.remove(0);
+                let w = edges.last().copied().unwrap_or(0.0);
+                let left = match align {
+                    TextAlign::Left => sx,
+                    TextAlign::Center => sx - w / 2.0,
+                    TextAlign::Right => sx - w,
+                };
+                let h = size * line_height;
+                let line = EditLine { left, top: sy - h / 2.0, height: h, start, edges };
+                paint_editing(&editing, &[line], color, size, epoch_now_ms, text_start, out);
+            }
+            None => gap_once("text-caret-layout", "draw-text caret and selection need lines that join back into the text, left to right"),
+        }
+    }
     Ok(())
 }
 
@@ -2990,6 +3416,69 @@ mod tests {
         );
     }
 
+    fn editable(extra: Value) -> Value {
+        let mut text = json!({ "type": "draw-text", "id": "t", "text": "ab", "position": {"x": 0, "y": 0}, "anchor": "top-left",
+            "color": "#ffffff", "font": "20px sans-serif", "align": "left", "baseline": "middle" });
+        for (k, v) in extra.as_object().unwrap() {
+            text[k] = v.clone();
+        }
+        json!({ "projection": "free", "scale": 1.0, "drawables": [text] })
+    }
+
+    fn quads(p: &GameRenderPacket) -> Vec<Rect> {
+        p.draw_commands.iter().filter_map(|c| match c { DrawCommand::Quad { rect, .. } => Some(*rect), _ => None }).collect()
+    }
+
+    #[test]
+    fn a_caret_is_a_bar_at_the_shaped_width_of_the_text_before_it() {
+        let p = packet_for(editable(json!({ "caret": 1 })));
+        let q = quads(&p);
+        assert_eq!(q.len(), 1, "one caret bar: {:?}", p.draw_commands);
+        let before = crate::vector::shape("a", 20.0, false, TextFamily::Sans).width;
+        assert!((q[0].x + q[0].w / 2.0 - before).abs() < 0.01, "the bar stands after 'a': {:?} vs {before}", q[0]);
+        assert!(quads(&packet_for(editable(json!({ "caret": -1 })))).is_empty(), "control: no caret, no bar");
+        assert!(quads(&packet_for(editable(json!({})))).is_empty(), "control: no decorations at all");
+    }
+
+    #[test]
+    fn a_selection_band_is_painted_behind_its_characters() {
+        let p = packet_for(editable(json!({ "selectionStart": 0, "selectionEnd": 2, "selectionColor": "#3366ff" })));
+        let band = p.draw_commands.iter().position(|c| matches!(c, DrawCommand::Quad { .. })).expect("a band");
+        let text = p.draw_commands.iter().position(|c| matches!(c, DrawCommand::Text { .. })).expect("the text");
+        assert!(band < text, "the band is drawn first, under the text: {:?}", p.draw_commands);
+        let w = crate::vector::shape("ab", 20.0, false, TextFamily::Sans).width;
+        assert!((quads(&p)[0].w - w).abs() < 0.01);
+        assert!(quads(&packet_for(editable(json!({ "selectionStart": 1, "selectionEnd": 1 })))).is_empty(), "control: an empty selection paints no band");
+    }
+
+    #[test]
+    fn a_preedit_is_shown_at_the_caret_underlined_and_the_caret_follows_it() {
+        let p = packet_for(editable(json!({ "caret": 1, "preedit": "X" })));
+        let text = p.draw_commands.iter().find_map(|c| match c { DrawCommand::Text { text, .. } => Some(text.clone()), _ => None });
+        assert_eq!(text.as_deref(), Some("aXb"));
+        let q = quads(&p);
+        assert_eq!(q.len(), 2, "an underline and the caret: {:?}", p.draw_commands);
+        let after = crate::vector::shape("aX", 20.0, false, TextFamily::Sans).width;
+        assert!((q[1].x + q[1].w / 2.0 - after).abs() < 0.01, "the caret stands after the preedit");
+    }
+
+    #[test]
+    fn the_caret_blinks_on_the_scene_clock_and_a_caret_keeps_the_scene_drawing() {
+        let scene = editable(json!({ "caret": 1 }));
+        let at = |ms: f64| quads(&from_props_at(&scene, ms).unwrap()).len();
+        assert_eq!(at(100.0), 1, "on in the first 530 ms");
+        assert_eq!(at(600.0), 0, "off in the next 530 ms");
+        assert_eq!(at(1100.0), 1, "on again");
+        assert!(has_active_fx(&scene), "a caret keeps frames coming");
+        assert!(!has_active_fx(&editable(json!({}))), "control: plain text does not");
+    }
+
+    #[test]
+    fn right_to_left_text_gets_no_caret_rather_than_a_wrong_one() {
+        let p = packet_for(editable(json!({ "text": "سلام", "caret": 1, "font": "20px serif" })));
+        assert!(quads(&p).is_empty(), "prefix advances are not caret positions in a right-to-left run");
+    }
+
     #[test]
     fn a_css_numeric_weight_is_read_like_bold_and_an_out_of_range_one_is_refused() {
         assert_eq!(
@@ -4191,5 +4680,156 @@ mod tests {
             !has_active_fx(&plain),
             "control: a plain text needs no frames"
         );
+    }
+
+    fn clipped_group(clip: Value) -> Value {
+        let mut group = json!({"type": "draw-group", "position": {"x": 2, "y": 3}, "items": [
+            {"type": "draw-shape", "shape": "rect", "id": "inside", "hit": true, "anchor": "top-left",
+             "position": {"x": 0, "y": 0}, "width": 30, "height": 10, "fill": "#ff0000", "corners": {"radius": [2, 2, 2, 2]}},
+            {"type": "draw-shape", "shape": "rect", "id": "edge", "hit": true, "anchor": "top-left",
+             "position": {"x": 40, "y": 0}, "width": 30, "height": 10, "fill": "#ff0000", "corners": {"radius": [2, 2, 2, 2]}},
+            {"type": "draw-shape", "shape": "rect", "id": "outside", "hit": true, "anchor": "top-left",
+             "position": {"x": 0, "y": 40}, "width": 30, "height": 10, "fill": "#ff0000", "corners": {"radius": [2, 2, 2, 2]}},
+            {"type": "draw-text", "text": "hello", "position": {"x": 0, "y": 5}, "color": "#ffffff",
+             "font": "12px sans-serif", "align": "left", "baseline": "middle"}]});
+        if !clip.is_null() {
+            group["clip"] = clip;
+        }
+        free_props(json!([group]))
+    }
+
+    #[test]
+    fn a_rect_clip_scopes_sdf_shapes_and_text_and_cuts_the_regions() {
+        let (packet, gathered) = from_props_mapped(
+            &clipped_group(json!({"x": 0, "y": 0, "width": 50, "height": 20})),
+            0.0,
+        )
+        .unwrap();
+        let Some((clip, commands)) = packet.draw_commands.iter().find_map(|c| match c {
+            DrawCommand::ClipGroup { clip, commands } => Some((clip, commands)),
+            _ => None,
+        }) else {
+            panic!("a scoped clip group: {:?}", packet.draw_commands)
+        };
+        assert!(commands.iter().any(|c| matches!(c, DrawCommand::Text { .. })), "text rides the clip");
+        let sdf = commands.iter().find_map(|c| match c {
+            DrawCommand::Sdf { rect, .. } => Some(*rect),
+            _ => None,
+        });
+        let sdf = sdf.expect("an SDF shape rides the clip, not refused by the group");
+        let bounds = segments_bounds(clip).expect("clip box");
+        assert_eq!((bounds.x, bounds.y), (sdf.x, sdf.y), "the clip is anchored at the group origin");
+        assert!((bounds.w - sdf.w * 50.0 / 30.0).abs() < 1e-3 && (bounds.h - sdf.h * 2.0).abs() < 1e-3, "{bounds:?} {sdf:?}");
+        let ids: Vec<&str> = gathered.regions.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["inside", "edge"], "a region wholly outside the clip is dropped");
+        let edge = gathered.regions.iter().find(|r| r.id == "edge").unwrap().rect;
+        assert!((edge.x + edge.w - (bounds.x + bounds.w)).abs() < 1e-3 && edge.w < sdf.w, "the straddling region is cut at the edge: {edge:?}");
+        let inside = gathered.regions.iter().find(|r| r.id == "inside").unwrap().rect;
+        assert_eq!(inside, sdf, "control: a region inside the clip is untouched");
+    }
+
+    #[test]
+    fn control_a_group_without_a_clip_keeps_every_region_and_no_clip_group() {
+        let (packet, gathered) = from_props_mapped(&clipped_group(Value::Null), 0.0).unwrap();
+        assert!(!packet.draw_commands.iter().any(|c| matches!(c, DrawCommand::ClipGroup { .. })));
+        assert_eq!(gathered.regions.len(), 3);
+        assert!(packet.draw_commands.iter().filter(|c| matches!(c, DrawCommand::Sdf { .. })).count() == 3);
+    }
+
+    #[test]
+    fn a_rounded_rect_clip_has_curved_corners_and_a_square_one_has_none() {
+        let curves = |clip: Value| {
+            let packet = packet_for(clipped_group(clip));
+            packet.draw_commands.iter().find_map(|c| match c {
+                DrawCommand::ClipGroup { clip, .. } => Some(
+                    clip.iter()
+                        .filter(|s| matches!(s, PathSegment::CubicTo { .. }))
+                        .count(),
+                ),
+                _ => None,
+            })
+        };
+        assert_eq!(curves(json!({"x": 0, "y": 0, "width": 50, "height": 20, "radius": 4})), Some(4));
+        assert_eq!(curves(json!({"x": 0, "y": 0, "width": 50, "height": 20, "radius": [4, 0, 0, 4]})), Some(2));
+        assert_eq!(curves(json!({"x": 0, "y": 0, "width": 50, "height": 20})), Some(0), "control: no radius, no curve");
+    }
+
+    #[test]
+    fn a_malformed_rect_clip_is_a_scene_error_naming_clip() {
+        for clip in [
+            json!({"x": 0, "y": 0, "height": 20}),
+            json!({"x": 0, "y": 0, "width": 0, "height": 20}),
+            json!({"x": 0, "y": 0, "width": 50, "height": 20, "radius": [1, 2, 3]}),
+            json!({"x": 0, "y": 0, "width": 50, "height": 20, "radius": -2}),
+        ] {
+            let error = from_props(&clipped_group(clip.clone())).unwrap_err();
+            assert!(matches!(&error, CanvasSceneError::InvalidProp { field, .. } if field == "clip"), "{clip}: {error:?}");
+        }
+    }
+
+    fn union_group(extra: Value, second: Value) -> Value {
+        let mut group = json!({"type": "draw-group", "position": {"x": 0, "y": 0}, "smoothUnion": 8, "items": [
+            {"type": "draw-shape", "shape": "capsule", "id": "a", "hit": true, "position": {"x": 10, "y": 20},
+             "width": 24, "height": 24, "fill": "#ff0000"},
+            {"type": "draw-shape", "shape": "capsule", "id": "b", "hit": true, "position": {"x": 40, "y": 20},
+             "width": 24, "height": 24, "fill": "#0000ff"}]});
+        for (key, value) in extra.as_object().unwrap() {
+            group[key] = value.clone();
+        }
+        for (key, value) in second.as_object().unwrap() {
+            group["items"][1][key] = value.clone();
+        }
+        free_props(json!([group]))
+    }
+
+    #[test]
+    fn a_smooth_union_group_paints_its_two_shapes_as_one_blend_and_keeps_both_regions() {
+        let (packet, gathered) = from_props_mapped(&union_group(json!({}), json!({})), 0.0).unwrap();
+        let blends: Vec<&DrawCommand> = packet.draw_commands.iter().filter(|c| matches!(c, DrawCommand::SdfBlend { .. })).collect();
+        let [DrawCommand::SdfBlend { first, second, radius }] = blends.as_slice() else {
+            panic!("one blend: {:?}", packet.draw_commands)
+        };
+        assert_eq!(*radius, 8.0);
+        assert!(matches!(first.as_ref(), DrawCommand::Sdf { fill, .. } if fill[0] == 1.0));
+        assert!(matches!(second.as_ref(), DrawCommand::Sdf { fill, .. } if fill[2] == 1.0));
+        assert!(sdf_commands(&packet).is_empty(), "the two shapes are not also painted alone");
+        let ids: Vec<&str> = gathered.regions.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"], "each shape keeps its own pointer region");
+    }
+
+    #[test]
+    fn control_a_group_without_smooth_union_paints_two_separate_shapes() {
+        let mut props = union_group(json!({}), json!({}));
+        props["drawables"][0].as_object_mut().unwrap().remove("smoothUnion");
+        let packet = packet_for(props);
+        assert!(!packet.draw_commands.iter().any(|c| matches!(c, DrawCommand::SdfBlend { .. })));
+        assert_eq!(sdf_commands(&packet).len(), 2);
+    }
+
+    #[test]
+    fn a_smooth_union_that_cannot_blend_is_a_scene_error_naming_smooth_union() {
+        let bad = [
+            union_group(json!({"smoothUnion": 0}), json!({})),
+            union_group(json!({"smoothUnion": "wide"}), json!({})),
+            union_group(json!({}), json!({"stroke": "#ffffff"})),
+            union_group(json!({}), json!({"shadow": {"color": "#000000", "blur": 4}})),
+            union_group(json!({}), json!({"opacity": 0.5})),
+            union_group(json!({}), json!({"material": {"wgsl": "fn shade(px: Pixel) -> vec4<f32> { return px.color; }", "params": [], "live": false}})),
+        ];
+        for props in bad {
+            let error = from_props(&props).unwrap_err();
+            assert!(matches!(&error, CanvasSceneError::InvalidProp { field, .. } if field == "smoothUnion"), "{error:?}");
+        }
+        let mut three = union_group(json!({}), json!({}));
+        let extra = three["drawables"][0]["items"][0].clone();
+        three["drawables"][0]["items"].as_array_mut().unwrap().push(extra);
+        assert!(matches!(from_props(&three).unwrap_err(), CanvasSceneError::InvalidProp { field, .. } if field == "smoothUnion"), "three children");
+        let mut dashed = union_group(json!({}), json!({}));
+        dashed["drawables"][0]["items"][0]["stroke"] = json!("#ffffff");
+        dashed["drawables"][0]["items"][0]["strokeDash"] = json!([4, 2]);
+        assert!(matches!(from_props(&dashed).unwrap_err(), CanvasSceneError::InvalidProp { field, .. } if field == "smoothUnion"), "dashed stroke");
+        let mut solid = union_group(json!({}), json!({}));
+        solid["drawables"][0]["items"][0]["stroke"] = json!("#ffffff");
+        assert!(from_props(&solid).is_ok(), "control: a solid stroke on the first shape blends");
     }
 }

@@ -431,6 +431,14 @@ pub enum DrawCommand {
         #[serde(default)]
         material: Option<SdfMaterial>,
     },
+    /// Two [`DrawCommand::Sdf`] shapes painted as one: their distances meet in a polynomial smooth minimum of
+    /// `radius` painter pixels, so they melt into each other. `first` supplies stroke, shadow, opacity and
+    /// material; the fill colour is mixed from both by the blend weight.
+    SdfBlend {
+        first: Box<DrawCommand>,
+        second: Box<DrawCommand>,
+        radius: f32,
+    },
     /// Draw a vector path: filled, stroked, or both (fill first). Rasterized
     /// anti-aliased in the vector layer.
     Path {

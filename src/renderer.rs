@@ -1025,7 +1025,7 @@ impl SharedDeviceRenderer {
             tracing::error!(target: "almadar::game_renderer", %error, "sdf material not drawn");
             return;
         }
-        for chunk in instances.chunks(crate::sdf::MAX_INSTANCES) {
+        for chunk in crate::sdf::batches(&instances) {
             let bind_group = pass.bind_group(
                 &device,
                 chunk,
@@ -1224,6 +1224,20 @@ impl SharedDeviceRenderer {
                             key: crate::sdf::pipeline_key(wgsl.as_deref()),
                             wgsl,
                             instances: vec![instance],
+                        });
+                    }
+                }
+                DrawCommand::SdfBlend { .. } => {
+                    self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
+                    if !quad_batch.is_empty() {
+                        draws.push(Draw::Quads(std::mem::take(&mut quad_batch)));
+                    }
+                    if let Some((pair, material)) = crate::sdf::SdfInstance::from_blend(command) {
+                        let wgsl = material.map(|m| m.wgsl.clone());
+                        draws.push(Draw::SdfRun {
+                            key: crate::sdf::pipeline_key(wgsl.as_deref()),
+                            wgsl,
+                            instances: pair.to_vec(),
                         });
                     }
                 }
@@ -2998,5 +3012,82 @@ mod sdf_tests {
             [0, 0, 255, 255],
             "control: quad last"
         );
+    }
+
+    fn clipped_scene(clip: Option<serde_json::Value>) -> GameRenderPacket {
+        let mut group = serde_json::json!({"type": "draw-group", "position": {"x": 0, "y": 0}, "items": [
+            {"type": "draw-shape", "shape": "rect", "anchor": "top-left", "position": {"x": 0, "y": 0},
+             "width": 64, "height": 64, "fill": "#ff0000", "corners": {"radius": [0, 0, 0, 0]}}]});
+        if let Some(clip) = clip {
+            group["clip"] = clip;
+        }
+        crate::mappers::game_canvas_2d::from_props(&serde_json::json!({
+            "width": 64, "height": 64, "scale": 1.0, "projection": "free", "bgColor": "#00000000",
+            "drawables": [group]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_rect_clip_cuts_an_sdf_shape_at_its_edges_and_rounds_its_corners() {
+        let Some(mut r) = renderer() else { return };
+        let clip = serde_json::json!({"x": 8, "y": 8, "width": 48, "height": 48, "radius": 16});
+        let Some(clipped) = draw(&mut r, &clipped_scene(Some(clip)), 64) else {
+            return;
+        };
+        assert!(painted(&clipped, 32, 32), "inside the clip the shape shows");
+        assert!(!painted(&clipped, 4, 32), "left of the clip it is cut");
+        assert!(!painted(&clipped, 60, 32), "right of the clip it is cut");
+        assert!(painted(&clipped, 32, 10), "just inside the top edge it shows");
+        assert!(!painted(&clipped, 9, 9), "the rounded corner of the clip cuts the shape");
+        let Some(free) = draw(&mut r, &clipped_scene(None), 64) else {
+            return;
+        };
+        assert!(painted(&free, 4, 32) && painted(&free, 9, 9), "control: no clip, no cut");
+    }
+
+    fn two_circles(radius: Option<f32>) -> GameRenderPacket {
+        let circle = |x: f32, fill: [f32; 4]| DrawCommand::Sdf {
+            kind: SdfKind::Ellipse,
+            rect: Rect { x, y: 20.0, w: 24.0, h: 24.0 },
+            corners: [0.0; 4],
+            corner_kind: 0,
+            arc: [0.0; 3],
+            polygon: [0.0; 2],
+            fill,
+            stroke: None,
+            shadow: None,
+            rotation: 0.0,
+            opacity: 1.0,
+            material: None,
+        };
+        let (a, b) = (circle(4.0, RED), circle(36.0, [0.0, 0.0, 1.0, 1.0]));
+        let commands = match radius {
+            Some(radius) => vec![DrawCommand::SdfBlend { first: Box::new(a), second: Box::new(b), radius }],
+            None => vec![a, b],
+        };
+        packet(commands, 0.0, None)
+    }
+
+    #[test]
+    fn a_smooth_union_melts_two_apart_circles_into_one_neck_and_mixes_their_colours() {
+        let Some(mut r) = renderer() else { return };
+        let Some(blended) = draw(&mut r, &two_circles(Some(24.0)), 64) else {
+            return;
+        };
+        assert!(painted(&blended, 32, 32), "the neck bridges the 8px gap");
+        assert!(painted(&blended, 16, 32) && painted(&blended, 48, 32), "both shapes are there");
+        assert!(!painted(&blended, 32, 8), "above the neck stays empty");
+        let near_a = px(&blended, 64, 12, 32);
+        let near_b = px(&blended, 64, 52, 32);
+        assert!(near_a[0] > 200 && near_a[2] < 60, "the first circle is red: {near_a:?}");
+        assert!(near_b[2] > 200 && near_b[0] < 60, "the second circle is blue: {near_b:?}");
+        let neck = px(&blended, 64, 32, 32);
+        assert!(neck[0] > 60 && neck[2] > 60, "the neck mixes both fills: {neck:?}");
+        let Some(apart) = draw(&mut r, &two_circles(None), 64) else {
+            return;
+        };
+        assert!(!painted(&apart, 32, 32), "control: two separate circles leave the gap empty");
+        assert!(painted(&apart, 16, 32) && painted(&apart, 48, 32));
     }
 }

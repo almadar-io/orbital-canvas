@@ -165,6 +165,8 @@ pub struct SceneHost {
     pub(crate) springs: spring::SpringBank,
     /// Pointer regions of the current scene (draw order), in logical points.
     pub(crate) pointer_regions: Vec<mappers::scene::PointerRegion>,
+    /// The caret positions of each hit `draw-text`, so a press reports the caret index nearest it.
+    pub(crate) text_hits: Vec<mappers::scene::TextHit>,
     /// The sizes of the measured texts at the latest layout, and the list last sent as `measureEvent`.
     pub(crate) measured: Vec<mappers::scene::Measured>,
     pub(crate) measure_reported: Vec<(String, f32, f32, u32)>,
@@ -177,6 +179,27 @@ pub struct SceneHost {
     pub(crate) pointer: Option<(f32, f32)>,
     /// Whether a drawable paints a material that reads the clock.
     pub(crate) live_material: bool,
+    /// The pointers held down (ascending id), the one whose press began the gesture, and the `touches` payload
+    /// of the event being dispatched when a multi-touch gesture is in progress.
+    pub(crate) touches: Vec<Touch>,
+    pub(crate) primary_pointer: Option<i64>,
+    pub(crate) touch_payload: Option<serde_json::Value>,
+}
+
+/// Whose a pointer event is: the gesture's primary pointer, a further pointer, or a leftover to drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TouchRoute {
+    Primary,
+    Further,
+    Ignore,
+}
+
+/// One pointer held down: the host's id for it and its position in packet units.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Touch {
+    pub(crate) id: i64,
+    pub(crate) x: f32,
+    pub(crate) y: f32,
 }
 
 fn contains(r: &packet::Rect, x: f32, y: f32) -> bool {
@@ -323,6 +346,7 @@ impl SceneHost {
             view3d_moving: false,
             springs: spring::SpringBank::new(),
             pointer_regions: Vec::new(),
+            text_hits: Vec::new(),
             measured: Vec::new(),
             measure_reported: Vec::new(),
             semantic: Vec::new(),
@@ -331,6 +355,9 @@ impl SceneHost {
             captured: None,
             pointer: None,
             live_material: false,
+            touches: Vec::new(),
+            primary_pointer: None,
+            touch_payload: None,
         }
     }
 
@@ -453,6 +480,7 @@ impl SceneHost {
         self.double_hits = mapped.double_hits;
         self.pannable = mapped.pannable;
         self.pointer_regions = mapped.pointer_regions;
+        self.text_hits = mapped.text_hits;
         self.measured = mapped.measured;
         self.semantic = mapped.semantic_nodes;
         self.report_measured();
@@ -713,6 +741,22 @@ impl SceneHost {
         }
     }
 
+    /// The wheel turned at a point (logical points): queues `wheelEvent` for the topmost region under it, or for
+    /// the canvas (`target` empty). Returns whether the canvas declares `wheelEvent`, the host's cue to keep the
+    /// wheel from the page.
+    pub fn wheel(&mut self, x: f32, y: f32, dx: f32, dy: f32) -> bool {
+        if self.canvas_event("wheelEvent").is_none() {
+            return false;
+        }
+        let (x, y) = self.to_packet_units(x, y);
+        let target = self.region_at(x, y).map(|r| r.id.clone()).unwrap_or_default();
+        self.queue_canvas_event(
+            "wheelEvent",
+            serde_json::json!({ "target": target, "x": x, "y": y, "dx": dx, "dy": dy }),
+        );
+        true
+    }
+
     /// A double tap (the host's recognizer) at a point: the events of the region under it.
     pub fn double_tap(&mut self, x: f32, y: f32) {
         let (x, y) = self.to_packet_units(x, y);
@@ -770,10 +814,111 @@ impl SceneHost {
         button: i32,
         key: Option<&str>,
     ) -> bool {
+        self.input_pointer(event_type, x, y, button, key, 0)
+    }
+
+    /// [`Self::input`] from one of several pointers: `pointer_id` is the host's id for it. The pointer whose press
+    /// began the gesture behaves as a single pointer does; a further one reaches the region that holds capture,
+    /// and every event of a multi-touch gesture carries `touches` (contract 14.3).
+    pub fn input_pointer(
+        &mut self,
+        event_type: &str,
+        x: f32,
+        y: f32,
+        button: i32,
+        key: Option<&str>,
+        pointer_id: i64,
+    ) -> bool {
         if self.view3d.is_some() {
             return self.input_3d(event_type, x, y, button);
         }
         let (x, y) = self.to_packet_units(x, y);
+        let before = self.touches.len();
+        match self.track_touch(event_type, pointer_id, x, y) {
+            TouchRoute::Primary => {}
+            TouchRoute::Further => {
+                self.touch_payload = self.gesture_payload(before);
+                self.further_pointer(event_type, x, y);
+                self.touch_payload = None;
+                return true;
+            }
+            TouchRoute::Ignore => return true,
+        }
+        self.touch_payload = self.gesture_payload(before);
+        let accepted = self.input_primary(event_type, x, y, button, key);
+        self.touch_payload = None;
+        accepted
+    }
+
+    /// Update the held pointers for one event and say who it belongs to.
+    fn track_touch(&mut self, event_type: &str, id: i64, x: f32, y: f32) -> TouchRoute {
+        let known = self.touches.iter().any(|t| t.id == id);
+        let route = match (event_type, self.primary_pointer) {
+            ("hover" | "leave", _) => return TouchRoute::Primary,
+            ("touch-down", None) => {
+                self.primary_pointer = Some(id);
+                TouchRoute::Primary
+            }
+            (_, Some(primary)) if primary == id => TouchRoute::Primary,
+            (_, Some(_)) => {
+                if known || event_type == "touch-down" {
+                    TouchRoute::Further
+                } else {
+                    TouchRoute::Ignore
+                }
+            }
+            (_, None) if known => TouchRoute::Ignore,
+            (_, None) => TouchRoute::Primary,
+        };
+        match event_type {
+            "touch-down" | "touch-move" => {
+                if route != TouchRoute::Ignore {
+                    match self.touches.iter_mut().find(|t| t.id == id) {
+                        Some(held) => (held.x, held.y) = (x, y),
+                        None => {
+                            self.touches.push(Touch { id, x, y });
+                            self.touches.sort_by_key(|t| t.id);
+                        }
+                    }
+                }
+            }
+            "touch-up" | "touch-cancel" => {
+                self.touches.retain(|t| t.id != id);
+                if self.primary_pointer == Some(id) {
+                    self.primary_pointer = None;
+                }
+            }
+            _ => {}
+        }
+        route
+    }
+
+    /// The `touches` payload of the event under way: the pointers still held, present while more than one
+    /// pointer is or was down.
+    fn gesture_payload(&self, before: usize) -> Option<serde_json::Value> {
+        (before > 1 || self.touches.len() > 1).then(|| {
+            serde_json::Value::Array(
+                self.touches
+                    .iter()
+                    .map(|t| serde_json::json!({ "pointerId": t.id, "x": t.x, "y": t.y }))
+                    .collect(),
+            )
+        })
+    }
+
+    /// A further pointer's press, move or release, sent to the region that holds capture.
+    fn further_pointer(&mut self, event_type: &str, x: f32, y: f32) {
+        let Some(id) = self.captured.clone() else {
+            return;
+        };
+        match event_type {
+            "touch-down" => self.emit_pointer(&id, x, y, |e| &e.down, false),
+            "touch-move" | "touch-up" | "touch-cancel" => self.emit_pointer(&id, x, y, |e| &e.moved, false),
+            _ => {}
+        }
+    }
+
+    fn input_primary(&mut self, event_type: &str, x: f32, y: f32, button: i32, key: Option<&str>) -> bool {
         if matches!(event_type, "hover" | "leave") {
             self.pointer_input(event_type, x, y);
             return true;
@@ -856,6 +1001,7 @@ impl SceneHost {
         x: f32,
         y: f32,
         pick: fn(&mappers::scene::PointerEvents) -> &Option<String>,
+        with_index: bool,
     ) {
         let event = self
             .pointer_regions
@@ -868,7 +1014,17 @@ impl SceneHost {
                 event,
                 arg: String::new(),
                 // `target`, not `id`: a control payload's `id` seeds the dispatch on that row (client_core extract_entity_id)
-                payload: serde_json::json!({ "target": id, "x": x, "y": y }),
+                payload: {
+                    let mut payload = serde_json::json!({ "target": id, "x": x, "y": y });
+                    if let Some(touches) = &self.touch_payload {
+                        payload["touches"] = touches.clone();
+                    }
+                    // a press on a hit draw-text carries the caret index nearest it (contract §11)
+                    if let Some(index) = with_index.then(|| self.text_hits.iter().rev().find(|hit| hit.id == id)).flatten().and_then(|hit| hit.index_at(x, y)) {
+                        payload["index"] = serde_json::json!(index);
+                    }
+                    payload
+                },
             });
         }
     }
@@ -879,10 +1035,10 @@ impl SceneHost {
             return;
         }
         if let Some(old) = self.hovered.take() {
-            self.emit_pointer(&old, x, y, |e| &e.leave);
+            self.emit_pointer(&old, x, y, |e| &e.leave, false);
         }
         if let Some(new) = under {
-            self.emit_pointer(&new, x, y, |e| &e.enter);
+            self.emit_pointer(&new, x, y, |e| &e.enter, false);
             self.hovered = Some(new);
         }
     }
@@ -903,7 +1059,7 @@ impl SceneHost {
             self.captured.clone().or_else(|| self.hovered.clone())
         };
         if let Some(id) = target {
-            self.emit_pointer(&id, x, y, |e| &e.moved);
+            self.emit_pointer(&id, x, y, |e| &e.moved, false);
         }
     }
 
@@ -917,21 +1073,21 @@ impl SceneHost {
             "leave" => {
                 self.pointer = None;
                 if let Some(old) = self.hovered.take() {
-                    self.emit_pointer(&old, x, y, |e| &e.leave);
+                    self.emit_pointer(&old, x, y, |e| &e.leave, false);
                 }
             }
             "touch-down" => {
                 self.pointer = Some((x, y));
                 self.hover_to(x, y);
                 if let Some(id) = self.region_at(x, y).map(|r| r.id.clone()) {
-                    self.emit_pointer(&id, x, y, |e| &e.down);
+                    self.emit_pointer(&id, x, y, |e| &e.down, true);
                     self.captured = Some(id);
                 }
             }
             "touch-up" => {
                 self.pointer = Some((x, y));
                 if let Some(id) = self.captured.take() {
-                    self.emit_pointer(&id, x, y, |e| &e.up);
+                    self.emit_pointer(&id, x, y, |e| &e.up, false);
                 }
                 self.hover_to(x, y);
             }
@@ -1311,6 +1467,29 @@ mod tests {
             "drawables": [{"type": "draw-shape", "id": "b", "shape": "rect", "anchor": "top-left",
                 "position": {"x": 0, "y": 0}, "width": 100, "height": 40, "fill": "#000000", "hit": true}]
         })
+    }
+
+    #[test]
+    fn a_press_on_a_hit_text_reports_the_caret_index_nearest_it() {
+        let mut r = SceneHost::new();
+        r.set_scene(serde_json::json!({
+            "type": "canvas", "mode": "2d", "projection": "free", "camera": {"zoom": 1}, "pointerDownEvent": "DOWN",
+            "drawables": [
+                {"type": "draw-text", "id": "t", "text": "hello", "position": {"x": 0, "y": 0}, "anchor": "top-left",
+                 "color": "#ffffff", "font": "20px sans-serif", "align": "left", "baseline": "middle", "hit": true},
+                {"type": "draw-shape", "id": "b", "shape": "rect", "anchor": "top-left", "position": {"x": 0, "y": 100},
+                 "width": 100, "height": 40, "fill": "#000000", "hit": true}]
+        })).unwrap();
+        let hit = r.text_hits.iter().find(|h| h.id == "t").expect("the text's caret positions").clone();
+        let after_he = hit.lines[0].edges[2];
+        r.input("touch-down", after_he + 0.5, hit.lines[0].top + 1.0, 0, None);
+        let down = r.take_scene_events();
+        assert_eq!(down[0].payload["index"], serde_json::json!(2), "{:?}", down[0].payload);
+        r.input("touch-up", after_he, hit.lines[0].top + 1.0, 0, None);
+        r.take_scene_events();
+        r.input("touch-down", 10.0, 120.0, 0, None);
+        let shape = r.take_scene_events();
+        assert!(shape[0].payload.get("index").is_none(), "control: a shape press carries no index: {:?}", shape[0].payload);
     }
 
     #[test]
@@ -2536,5 +2715,108 @@ mod tests {
             ring_alpha(&r.frame_packet().unwrap()),
             "t=0 either way"
         );
+    }
+
+    fn wheel_scene(declared: bool) -> serde_json::Value {
+        let mut scene = moves_scene("all");
+        if declared {
+            scene["wheelEvent"] = serde_json::json!("WHEEL");
+        }
+        scene
+    }
+
+    #[test]
+    fn the_wheel_over_a_hit_region_sends_its_target_and_deltas() {
+        let mut r = SceneHost::new();
+        r.set_scene(wheel_scene(true)).unwrap();
+        assert!(r.wheel(10.0, 10.0, 3.0, -40.0), "a declared wheel is the canvas's");
+        let sent = r.take_scene_events();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].event, "WHEEL");
+        assert_eq!(sent[0].payload, serde_json::json!({"target": "b", "x": 10.0, "y": 10.0, "dx": 3.0, "dy": -40.0}));
+    }
+
+    #[test]
+    fn the_wheel_off_every_region_targets_the_canvas() {
+        let mut r = SceneHost::new();
+        r.set_scene(wheel_scene(true)).unwrap();
+        r.wheel(150.0, 90.0, 0.0, 16.0);
+        let sent = r.take_scene_events();
+        assert_eq!(sent[0].payload["target"], serde_json::json!(""), "{:?}", sent[0].payload);
+        assert_eq!(sent[0].payload["dy"], serde_json::json!(16.0));
+    }
+
+    #[test]
+    fn control_a_canvas_without_wheel_event_sends_nothing_and_leaves_the_wheel_alone() {
+        let mut r = SceneHost::new();
+        r.set_scene(wheel_scene(false)).unwrap();
+        assert!(!r.wheel(10.0, 10.0, 0.0, 40.0), "an undeclared wheel is not the canvas's");
+        assert!(events(&mut r).is_empty());
+    }
+
+    fn touch(r: &mut SceneHost, kind: &str, x: f32, y: f32, id: i64) -> Vec<mappers::scene::Emit> {
+        r.input_pointer(kind, x, y, 0, None, id);
+        r.take_scene_events()
+    }
+
+    fn pairs(touches: &[(i64, f32, f32)]) -> serde_json::Value {
+        serde_json::Value::Array(
+            touches
+                .iter()
+                .map(|(id, x, y)| serde_json::json!({"pointerId": id, "x": x, "y": y}))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_second_finger_reaches_the_capturing_region_with_every_touch() {
+        let mut r = pointer_host(vec![region("a", 0.0, 0.0, 100.0, 100.0, 0.0)]);
+        let first = touch(&mut r, "touch-down", 10.0, 10.0, 1);
+        assert_eq!(first.iter().map(|e| e.event.as_str()).collect::<Vec<_>>(), vec!["ENTER_a", "DOWN_a"]);
+        assert!(first[1].payload.get("touches").is_none(), "a single pointer carries no touches");
+        let second = touch(&mut r, "touch-down", 60.0, 50.0, 2);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].event, "DOWN_a");
+        assert_eq!(second[0].payload["target"], "a");
+        assert_eq!((second[0].payload["x"].clone(), second[0].payload["y"].clone()), (serde_json::json!(60.0), serde_json::json!(50.0)));
+        assert_eq!(second[0].payload["touches"], pairs(&[(1, 10.0, 10.0), (2, 60.0, 50.0)]));
+        let moved = touch(&mut r, "touch-move", 70.0, 50.0, 2);
+        assert_eq!(moved[0].event, "MOVE_a");
+        assert_eq!(moved[0].payload["touches"], pairs(&[(1, 10.0, 10.0), (2, 70.0, 50.0)]));
+        let primary = touch(&mut r, "touch-move", 5.0, 10.0, 1);
+        assert_eq!(primary[0].payload["touches"], pairs(&[(1, 5.0, 10.0), (2, 70.0, 50.0)]));
+        let lifted = touch(&mut r, "touch-up", 70.0, 50.0, 2);
+        assert_eq!(lifted.len(), 1);
+        assert_eq!(lifted[0].event, "MOVE_a", "a further release is a move that shows the remaining touches");
+        assert_eq!(lifted[0].payload["touches"], pairs(&[(1, 5.0, 10.0)]));
+        let alone = touch(&mut r, "touch-move", 6.0, 10.0, 1);
+        assert!(alone[0].payload.get("touches").is_none(), "control: one pointer again, no touches: {:?}", alone[0].payload);
+        let up = touch(&mut r, "touch-up", 6.0, 10.0, 1);
+        assert_eq!(up[0].event, "UP_a");
+        assert!(up[0].payload.get("touches").is_none());
+    }
+
+    #[test]
+    fn the_primary_lifting_first_reports_the_pointer_still_down_and_then_goes_quiet() {
+        let mut r = pointer_host(vec![region("a", 0.0, 0.0, 100.0, 100.0, 0.0)]);
+        touch(&mut r, "touch-down", 10.0, 10.0, 1);
+        touch(&mut r, "touch-down", 60.0, 50.0, 2);
+        let up = touch(&mut r, "touch-up", 10.0, 10.0, 1);
+        assert_eq!(up[0].event, "UP_a");
+        assert_eq!(up[0].payload["touches"], pairs(&[(2, 60.0, 50.0)]));
+        assert!(touch(&mut r, "touch-move", 65.0, 50.0, 2).is_empty(), "a leftover pointer sends nothing");
+        assert!(touch(&mut r, "touch-up", 65.0, 50.0, 2).is_empty());
+        let fresh = touch(&mut r, "touch-down", 20.0, 20.0, 3);
+        assert!(fresh.iter().any(|e| e.event == "DOWN_a"), "a new press is primary again");
+        assert!(fresh[fresh.len() - 1].payload.get("touches").is_none(), "{:?}", fresh);
+    }
+
+    #[test]
+    fn a_second_finger_with_no_capture_sends_nothing_and_starts_no_tap() {
+        let mut r = pointer_host(vec![region("a", 0.0, 0.0, 100.0, 100.0, 0.0)]);
+        assert!(touch(&mut r, "touch-down", 300.0, 300.0, 1).is_empty(), "the first press hit no region");
+        assert!(touch(&mut r, "touch-down", 10.0, 10.0, 2).is_empty(), "a further finger starts no press");
+        assert!(touch(&mut r, "touch-up", 10.0, 10.0, 2).is_empty());
+        assert!(r.touch_down == Some((300.0, 300.0)), "the primary's tap anchor is unchanged");
     }
 }

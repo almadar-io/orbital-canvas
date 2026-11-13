@@ -92,6 +92,18 @@ impl WebSceneCanvas {
         self.host.input(kind, x, y, button, None);
     }
 
+    /// [`Self::input`] from one of several pointers (`PointerEvent.pointerId`): a further finger reaches the
+    /// region that holds capture, and a multi-touch gesture's events carry `touches`.
+    pub fn input_pointer(&mut self, kind: &str, x: f32, y: f32, button: i32, pointer_id: i32) {
+        self.host.input_pointer(kind, x, y, button, None, i64::from(pointer_id));
+    }
+
+    /// The wheel at a point in CSS pixels with its pixel deltas; true when the canvas declares `wheelEvent`
+    /// (the page must not take the wheel).
+    pub fn wheel(&mut self, x: f32, y: f32, dx: f32, dy: f32) -> bool {
+        self.host.wheel(x, y, dx, dy)
+    }
+
     pub fn zoom(&mut self, factor: f32, x: f32, y: f32) -> bool {
         self.host.zoom(factor, x, y)
     }

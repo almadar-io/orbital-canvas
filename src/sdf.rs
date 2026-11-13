@@ -88,6 +88,47 @@ impl SdfInstance {
     }
 }
 
+impl SdfInstance {
+    /// The two instances of an [`DrawCommand::SdfBlend`] and the first one's material: the lead carries the blend
+    /// radius in slot 11, the partner (the very next instance) is marked so its own quad is not drawn.
+    pub(crate) fn from_blend(command: &DrawCommand) -> Option<([Self; 2], Option<&SdfMaterial>)> {
+        let DrawCommand::SdfBlend {
+            first,
+            second,
+            radius,
+        } = command
+        else {
+            return None;
+        };
+        let (mut lead, material) = Self::from_command(first)?;
+        let (mut partner, _) = Self::from_command(second)?;
+        lead.0[11][1] = *radius;
+        partner.0[11][2] = 1.0;
+        Some(([lead, partner], material))
+    }
+
+    /// Whether this instance leads a blended pair.
+    fn leads_pair(&self) -> bool {
+        self.0[11][1] > 0.0
+    }
+}
+
+/// Split instances into uniform-buffer batches of at most [`MAX_INSTANCES`], never between a blended pair's lead
+/// and its partner.
+pub(crate) fn batches(instances: &[SdfInstance]) -> Vec<&[SdfInstance]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < instances.len() {
+        let mut end = (start + MAX_INSTANCES).min(instances.len());
+        if end < instances.len() && instances[end - 1].leads_pair() {
+            end -= 1;
+        }
+        out.push(&instances[start..end]);
+        start = end;
+    }
+    out
+}
+
 /// The pipeline key of a material's WGSL; the plain pass is [`PLAIN_KEY`].
 pub(crate) fn pipeline_key(wgsl: Option<&str>) -> u64 {
     match wgsl {
@@ -296,6 +337,7 @@ impl SdfPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packet::SdfKind;
 
     #[test]
     fn the_plain_module_checks_and_a_missing_shade_does_not() {
@@ -308,6 +350,64 @@ mod tests {
     fn a_material_reading_time_and_pointer_checks() {
         let wgsl = "fn shade(px: Pixel) -> vec4<f32> { return vec4<f32>(px.uv, sin(px.time) + px.pointer.x * 0.0, 1.0); }";
         assert_eq!(check_material(wgsl), Ok(()));
+    }
+
+    fn shape(kind: SdfKind, x: f32) -> DrawCommand {
+        DrawCommand::Sdf {
+            kind,
+            rect: crate::packet::Rect { x, y: 0.0, w: 10.0, h: 10.0 },
+            corners: [0.0; 4],
+            corner_kind: 0,
+            arc: [0.0; 3],
+            polygon: [0.0; 2],
+            fill: [1.0, 0.0, 0.0, 1.0],
+            stroke: None,
+            shadow: None,
+            rotation: 0.0,
+            opacity: 1.0,
+            material: None,
+        }
+    }
+
+    fn blend(radius: f32) -> DrawCommand {
+        DrawCommand::SdfBlend {
+            first: Box::new(shape(SdfKind::Ellipse, 0.0)),
+            second: Box::new(shape(SdfKind::Ellipse, 20.0)),
+            radius,
+        }
+    }
+
+    #[test]
+    fn a_blend_packs_a_lead_with_the_radius_and_a_marked_partner() {
+        let command = blend(6.0);
+        let ([lead, partner], material) = SdfInstance::from_blend(&command).expect("a blend");
+        assert!(material.is_none());
+        assert_eq!(lead.0[11][1], 6.0, "the lead carries the radius");
+        assert_eq!(lead.0[11][2], 0.0);
+        assert_eq!(partner.0[11][2], 1.0, "the partner is marked");
+        assert_eq!(partner.0[11][1], 0.0);
+        assert_eq!(lead.0[0][0], 0.0);
+        assert_eq!(partner.0[0][0], 20.0, "the partner keeps its own rect");
+        let plain_shape = shape(SdfKind::Rect, 0.0);
+        assert!(SdfInstance::from_blend(&plain_shape).is_none(), "control: a plain shape is no blend");
+    }
+
+    #[test]
+    fn batches_never_split_a_blended_pair() {
+        let ([lead, partner], _) = SdfInstance::from_blend(&blend(4.0)).unwrap();
+        let (plain, _) = SdfInstance::from_command(&shape(SdfKind::Rect, 0.0)).unwrap();
+        let mut all = vec![plain; MAX_INSTANCES - 1];
+        all.push(lead);
+        all.push(partner);
+        let split = batches(&all);
+        assert_eq!(split.iter().map(|b| b.len()).collect::<Vec<_>>(), vec![MAX_INSTANCES - 1, 2]);
+        assert!(split[1][0].leads_pair(), "the pair starts the next batch whole");
+        let plains = vec![plain; MAX_INSTANCES + 1];
+        assert_eq!(
+            batches(&plains).iter().map(|b| b.len()).collect::<Vec<_>>(),
+            vec![MAX_INSTANCES, 1],
+            "control: plain shapes fill a batch"
+        );
     }
 
     #[test]

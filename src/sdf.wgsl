@@ -4,7 +4,9 @@
 //   0 rect (x y w h)            1 corner radii (tl tr br bl)     2 (shape, corner kind, rotation, opacity)
 //   3 (arc start, sweep, thickness, polygon sides)               4 (star ratio, stroke width, dash on, dash off)
 //   5 (dash offset, shadow sigma, shadow dx, shadow dy)          6 fill   7 stroke colour   8 shadow colour
-//   9 material params 0..4      10 material params 4..8          11 (since, 0, 0, 0)
+//   9 material params 0..4      10 material params 4..8          11 (since, blend radius, partner flag, 0)
+// A blended pair is two consecutive instances: the lead has a blend radius above zero and paints both shapes as one
+// smooth union; the partner (flag 1) draws nothing of its own.
 
 struct Pixel {
   local: vec2<f32>,
@@ -218,6 +220,93 @@ fn sdf_shape(kind: u32, p: vec2<f32>, hs: vec2<f32>, radii: vec4<f32>, corner_ki
   return SdfShape(sdf_rect(p, hs, radii, corner_kind), sdf_rect_s(p, hs));
 }
 
+// The axis-aligned bounds (min xy, max xy) of a rect turned about its centre.
+fn sdf_rot_bounds(rect: vec4<f32>, rot: f32) -> vec4<f32> {
+  let hs = rect.zw * 0.5;
+  let c = rect.xy + hs;
+  let cs = abs(cos(rot));
+  let sn = abs(sin(rot));
+  let ext = vec2<f32>(hs.x * cs + hs.y * sn, hs.x * sn + hs.y * cs);
+  return vec4<f32>(c - ext, c + ext);
+}
+
+// One instance's signed distance at a point in packet pixels.
+fn sdf_world_shape(wp: vec2<f32>, i: u32) -> SdfShape {
+  let rect = sdf_inst(i, 0u);
+  let radii = sdf_inst(i, 1u);
+  let misc = sdf_inst(i, 2u);
+  let arcv = sdf_inst(i, 3u);
+  let p4 = sdf_inst(i, 4u);
+  let hs = max(rect.zw, vec2<f32>(0.001)) * 0.5;
+  let d = wp - (rect.xy + hs);
+  let cs = cos(misc.z);
+  let sn = sin(misc.z);
+  let p = vec2<f32>(d.x * cs + d.y * sn, -d.x * sn + d.y * cs);
+  return sdf_shape(u32(misc.x + 0.5), p, hs, radii, u32(misc.y + 0.5), arcv.xyz, vec2<f32>(arcv.w, p4.x));
+}
+
+// The polynomial smooth minimum of two distances: (distance, weight of the first).
+fn sdf_smooth_union(da: f32, db: f32, k: f32) -> vec2<f32> {
+  let h = clamp(0.5 + 0.5 * (db - da) / k, 0.0, 1.0);
+  return vec2<f32>(mix(db, da, h) - k * h * (1.0 - h), h);
+}
+
+fn sdf_blend_fragment(in: SdfVsOut, aa: f32) -> vec4<f32> {
+  let i = in.index;
+  let j = i + 1u;
+  let rect = sdf_inst(i, 0u);
+  let misc = sdf_inst(i, 2u);
+  let p4 = sdf_inst(i, 4u);
+  let p5 = sdf_inst(i, 5u);
+  let fill_a = sdf_inst(i, 6u);
+  let fill_b = sdf_inst(j, 6u);
+  let stroke_c = sdf_inst(i, 7u);
+  let shadow_c = sdf_inst(i, 8u);
+  let k = sdf_inst(i, 11u).y;
+  let wp = in.local;
+  let u = sdf_smooth_union(sdf_world_shape(wp, i).d, sdf_world_shape(wp, j).d, k);
+  let size = max(rect.zw, vec2<f32>(0.001));
+  let hs = size * 0.5;
+  let cs = cos(misc.z);
+  let sn = sin(misc.z);
+  let from_a = wp - (rect.xy + hs);
+  let local = vec2<f32>(from_a.x * cs + from_a.y * sn, -from_a.x * sn + from_a.y * cs) + hs;
+  var pointer = vec2<f32>(-100000.0);
+  if (sdf_params.frame.w > 0.5) {
+    let dd = sdf_params.pointer.xy - (rect.xy + hs);
+    pointer = vec2<f32>(dd.x * cs + dd.y * sn, -dd.x * sn + dd.y * cs) + hs;
+  }
+  let color = mix(fill_b, fill_a, u.y);
+  let px = Pixel(local, size, local / size, u.x, sdf_params.frame.z, sdf_inst(i, 11u).x, pointer, color, sdf_inst(i, 9u), sdf_inst(i, 10u));
+  let base = shade(px);
+  let opacity = misc.w;
+  let fill_cov = clamp(0.5 - u.x / aa, 0.0, 1.0);
+  let base_a = base.a * fill_cov * opacity;
+
+  var acc = vec4<f32>(0.0);
+  if (shadow_c.a > 0.0) {
+    let moved = wp - p5.zw;
+    let sd = sdf_smooth_union(sdf_world_shape(moved, i).d, sdf_world_shape(moved, j).d, k).x;
+    let sigma = max(p5.y, aa * 0.5);
+    let cov = 0.5 * (1.0 - sdf_erf(sd / (sigma * 1.41421356)));
+    let a = shadow_c.a * cov * opacity;
+    acc = vec4<f32>(shadow_c.rgb * a, a);
+  }
+  acc = vec4<f32>(base.rgb * base_a, base_a) + acc * (1.0 - base_a);
+
+  if (p4.y > 0.0 && stroke_c.a > 0.0) {
+    let ds = abs(u.x) - p4.y * 0.5;
+    let cov = clamp(0.5 - ds / aa, 0.0, 1.0);
+    let a = stroke_c.a * cov * opacity;
+    acc = vec4<f32>(stroke_c.rgb * a, a) + acc * (1.0 - a);
+  }
+
+  if (acc.a <= 0.0) {
+    return vec4<f32>(0.0);
+  }
+  return vec4<f32>(acc.rgb / acc.a, acc.a);
+}
+
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> SdfVsOut {
   let rect = sdf_inst(ii, 0u);
@@ -234,6 +323,27 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
   );
   let c = corners[vi];
+  let slot = sdf_inst(ii, 11u);
+  if (slot.z > 0.5) {
+    var hidden: SdfVsOut;
+    hidden.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+    hidden.local = vec2<f32>(0.0);
+    hidden.index = ii;
+    return hidden;
+  }
+  if (slot.y > 0.0) {
+    let ba = sdf_rot_bounds(rect, misc.z);
+    let bb = sdf_rot_bounds(sdf_inst(ii + 1u, 0u), sdf_inst(ii + 1u, 2u).z);
+    let m = margin + slot.y;
+    let lo = min(ba.xy, bb.xy) - vec2<f32>(m);
+    let hi = max(ba.zw, bb.zw) + vec2<f32>(m);
+    let at = mix(lo, hi, c);
+    var blended: SdfVsOut;
+    blended.clip = vec4<f32>(at.x / sdf_params.frame.x * 2.0 - 1.0, 1.0 - at.y / sdf_params.frame.y * 2.0, 0.0, 1.0);
+    blended.local = at;
+    blended.index = ii;
+    return blended;
+  }
   let local = mix(vec2<f32>(-margin), size + vec2<f32>(margin), c);
   let cs = cos(misc.z);
   let sn = sin(misc.z);
@@ -250,6 +360,9 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
 fn fs_main(in: SdfVsOut) -> @location(0) vec4<f32> {
   let aa = max(max(length(dpdx(in.local)), length(dpdy(in.local))), 0.0001);
   let i = in.index;
+  if (sdf_inst(i, 11u).y > 0.0) {
+    return sdf_blend_fragment(in, aa);
+  }
   let rect = sdf_inst(i, 0u);
   let radii = sdf_inst(i, 1u);
   let misc = sdf_inst(i, 2u);
