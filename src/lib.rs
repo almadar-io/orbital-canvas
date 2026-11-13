@@ -700,8 +700,21 @@ impl SceneHost {
         }
     }
 
+    /// A pointer in logical points as packet units: a scene laid out in its declared world (an orbital-painter
+    /// canvas) is stretched onto the surface, so its regions sit at packet size over the viewport's points.
+    fn to_packet_units(&self, x: f32, y: f32) -> (f32, f32) {
+        match (&self.packet, self.viewport) {
+            (Some(packet), Some((vw, vh))) if packet.width > 0.0 && packet.height > 0.0 => {
+                let (cw, ch) = (vw as f32 / self.density, vh as f32 / self.density);
+                (x * packet.width / cw, y * packet.height / ch)
+            }
+            _ => (x, y),
+        }
+    }
+
     /// A double tap (the host's recognizer) at a point: the events of the region under it.
     pub fn double_tap(&mut self, x: f32, y: f32) {
+        let (x, y) = self.to_packet_units(x, y);
         let emits = mappers::scene::emits_in(&self.double_hits, x, y).to_vec();
         self.scene_events.extend(emits);
     }
@@ -759,6 +772,7 @@ impl SceneHost {
         if self.view3d.is_some() {
             return self.input_3d(event_type, x, y, button);
         }
+        let (x, y) = self.to_packet_units(x, y);
         if matches!(event_type, "hover" | "leave") {
             self.pointer_input(event_type, x, y);
             return true;
@@ -1318,6 +1332,37 @@ mod tests {
         r.input("hover", 10.0, 10.0, 0, None);
         r.input("hover", 20.0, 10.0, 0, None);
         assert_eq!(events(&mut r), vec!["ENTER", "MOVE", "MOVE"]);
+    }
+
+    fn scaled_world_scene() -> serde_json::Value {
+        serde_json::json!({
+            "type": "canvas", "mode": "2d", "projection": "free", "painter": "orbital", "camera": {"zoom": 1},
+            "worldWidth": 1280, "worldHeight": 800, "pointerDownEvent": "DOWN",
+            "drawables": [{"type": "draw-shape", "id": "far", "shape": "rect", "anchor": "top-left",
+                "position": {"x": 1000, "y": 600}, "width": 100, "height": 100, "fill": "#000000", "hit": true}]
+        })
+    }
+
+    #[test]
+    fn a_press_on_a_world_scaled_canvas_hits_the_region_where_it_is_shown_and_reports_world_units() {
+        let mut r = SceneHost::new();
+        r.set_viewport(640, 400);
+        r.set_scale(1.0).unwrap();
+        r.set_scene(scaled_world_scene()).unwrap();
+        r.input("touch-down", 525.0, 325.0, 0, None);
+        let got = r.take_scene_events();
+        assert_eq!(got.iter().map(|e| e.event.as_str()).collect::<Vec<_>>(), vec!["DOWN"]);
+        assert_eq!(got[0].payload, serde_json::json!({ "target": "far", "x": 1050.0, "y": 650.0 }));
+    }
+
+    #[test]
+    fn control_a_press_at_the_raw_world_numbers_on_a_world_scaled_canvas_hits_nothing() {
+        let mut r = SceneHost::new();
+        r.set_viewport(640, 400);
+        r.set_scale(1.0).unwrap();
+        r.set_scene(scaled_world_scene()).unwrap();
+        r.input("touch-down", 30.0, 30.0, 0, None);
+        assert!(events(&mut r).is_empty(), "the top-left corner is not the far region");
     }
 
     #[test]
