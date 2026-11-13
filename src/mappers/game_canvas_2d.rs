@@ -80,6 +80,10 @@ pub struct Gathered {
     pub measured: Vec<Measured>,
     pub text_hits: Vec<super::scene::TextHit>,
     pub semantic: Vec<super::scene::SemanticNode>,
+    /// Each `draw-text` id's painted text, and each semantic node a `labelledBy` names: resolved once every node is
+    /// walked, so a label painted after its control still names it.
+    texts: std::collections::HashMap<String, String>,
+    labelled: Vec<(usize, String)>,
 }
 
 fn invalid(field: &str, detail: impl Into<String>) -> CanvasSceneError {
@@ -230,6 +234,12 @@ pub fn from_props_mapped(
             &mut gathered,
             &mut draw_commands,
         )?;
+    }
+    for (index, target) in std::mem::take(&mut gathered.labelled) {
+        let Some(text) = gathered.texts.get(&target) else {
+            return Err(invalid("semantic.labelledBy", format!("names `{target}`, which is no draw-text with an id")));
+        };
+        gathered.semantic[index].name = text.clone();
     }
 
     let packet = GameRenderPacket {
@@ -423,6 +433,11 @@ fn walk(
     let Some(id) = node.get("id").and_then(Value::as_str) else {
         return Ok(());
     };
+    if node.get("type").and_then(Value::as_str) == Some("draw-text") {
+        if let Some(text) = node.get("text").and_then(Value::as_str) {
+            gathered.texts.insert(id.to_owned(), text.to_owned());
+        }
+    }
     let Some(semantic) = node.get("semantic").filter(|v| v.is_object()) else {
         return Ok(());
     };
@@ -439,6 +454,12 @@ fn walk(
     let flag = |k: &str| semantic.get(k).and_then(Value::as_bool);
     let index = |k: &str| semantic.get(k).and_then(Value::as_u64).map(|n| n as usize);
     let paint_order = gathered.semantic.len() as f32;
+    if let Some(target) = text("labelledBy") {
+        if semantic.get("name").is_some() {
+            return Err(invalid("semantic.labelledBy", "a semantic node takes its name from `name` or `labelledBy`, not both"));
+        }
+        gathered.labelled.push((gathered.semantic.len(), target));
+    }
     gathered.semantic.push(super::scene::SemanticNode {
         id: id.to_owned(),
         role: text("role").ok_or_else(|| invalid("semantic.role", "a semantic node needs a role"))?,
@@ -4365,6 +4386,38 @@ mod tests {
             matches!(&bad, CanvasSceneError::InvalidProp { field, .. } if field == "material.anchor"),
             "{bad:?}"
         );
+    }
+
+    #[test]
+    fn a_semantic_node_labelled_by_a_text_takes_that_text_as_its_name() {
+        let button = |sem: Value| {
+            json!({"type": "draw-shape", "shape": "rect", "id": "begin", "hit": true, "anchor": "top-left",
+                "position": {"x": 0, "y": 0}, "width": 40, "height": 20, "fill": "#000000", "semantic": sem})
+        };
+        let label = json!({"type": "draw-text", "id": "begin:label", "text": "ابدأ", "anchor": "top-left",
+            "position": {"x": 0, "y": 0}, "color": "#ffffff"});
+        let (_, gathered) = from_props_mapped(
+            &free_props(json!([button(json!({"role": "button", "labelledBy": "begin:label"})), label.clone()])),
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(gathered.semantic[0].name, "ابدأ", "the text painted after the node still names it");
+        let (_, plain) =
+            from_props_mapped(&free_props(json!([button(json!({"role": "button", "name": "Begin"})), label.clone()])), 0.0)
+                .unwrap();
+        assert_eq!(plain.semantic[0].name, "Begin", "control: a literal name is kept");
+        let missing = from_props_mapped(
+            &free_props(json!([button(json!({"role": "button", "labelledBy": "nowhere"})), label.clone()])),
+            0.0,
+        )
+        .unwrap_err();
+        assert!(matches!(&missing, CanvasSceneError::InvalidProp { field, .. } if field == "semantic.labelledBy"), "{missing:?}");
+        let both = from_props_mapped(
+            &free_props(json!([button(json!({"role": "button", "name": "Begin", "labelledBy": "begin:label"})), label])),
+            0.0,
+        )
+        .unwrap_err();
+        assert!(matches!(&both, CanvasSceneError::InvalidProp { field, .. } if field == "semantic.labelledBy"), "{both:?}");
     }
 
     #[test]
