@@ -68,6 +68,8 @@ pub(crate) struct ParticleDraw {
     pub vertices: wgpu::Buffer,
     pub count: u32,
     pub bind_group: wgpu::BindGroup,
+    /// Buffers made for this draw alone, destroyed once its frame is submitted.
+    pub transient: Vec<wgpu::Buffer>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -179,15 +181,17 @@ impl ParticlePass {
         if palette.is_empty() || palette.len() > MAX_PALETTE {
             return Err(ParticleError::Palette);
         }
+        let mut transient = Vec::new();
         let (vertices, bytes) = match source {
-            ParticleSource::Bytes { data } => (
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            ParticleSource::Bytes { data } => {
+                let words = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("particle words"),
                     contents: if data.is_empty() { &[0, 0, 0, 0] } else { data },
                     usage: wgpu::BufferUsages::VERTEX,
-                }),
-                data.len() as u64,
-            ),
+                });
+                transient.push(words.clone());
+                (words, data.len() as u64)
+            }
             ParticleSource::Gpu { id, device: owner } => {
                 match crate::gpu::drawable::resolve(*id, *owner) {
                     Ok(crate::gpu::drawable::DrawableGpu::Buffer {
@@ -225,6 +229,7 @@ impl ParticlePass {
             contents: bytemuck::bytes_of(&uniform),
             usage: wgpu::BufferUsages::UNIFORM,
         });
+        transient.push(params.clone());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("particles"),
             layout: &self.layout,
@@ -239,6 +244,7 @@ impl ParticlePass {
             vertices,
             count,
             bind_group,
+            transient,
         })
     }
 }

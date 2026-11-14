@@ -875,6 +875,7 @@ fn paint_group(
     let radians = get_f32(node, "rotate", 0.0) + rotation_z + animated_number("rotateZ", 0.0);
     let start = out.len();
     let (region_start, measured_start, hits_start) = (gathered.regions.len(), gathered.measured.len(), gathered.text_hits.len());
+    let semantic_start = gathered.semantic.len();
     for child in items(node) {
         walk(
             child,
@@ -983,6 +984,17 @@ fn paint_group(
         if let DrawCommand::Sprite { dst, rotation, .. } = carrier {
             region.rect = *dst;
             region.rotation = *rotation;
+        }
+    }
+    // a semantic node's overlay rect rides the same transform as its hit region
+    let mut boxes: Vec<DrawCommand> = gathered.semantic[semantic_start..]
+        .iter()
+        .map(|node| DrawCommand::Sprite { texture: String::new(), src: Rect::default(), dst: node.rect, rotation: 0.0, opacity: 1.0, flip_x: false, flip_y: false })
+        .collect();
+    crate::animate::transform_group_commands(&mut boxes, origin, translation, scale, radians, 1.0);
+    for (node, carrier) in gathered.semantic[semantic_start..].iter_mut().zip(&boxes) {
+        if let DrawCommand::Sprite { dst, .. } = carrier {
+            node.rect = *dst;
         }
     }
     // a text hit's lines ride the same transform (text in a rotated group is refused above, so it only scales and moves)
@@ -4755,6 +4767,20 @@ mod tests {
             matches!(&bad, CanvasSceneError::InvalidProp { field, .. } if field == "material.anchor"),
             "{bad:?}"
         );
+    }
+
+    #[test]
+    fn a_semantic_node_in_a_scaled_group_sits_where_the_group_draws_it() {
+        let button = json!({"type": "draw-shape", "shape": "rect", "id": "go", "hit": true, "anchor": "top-left",
+            "position": {"x": 20, "y": 40}, "width": 40, "height": 20, "fill": "#000000",
+            "semantic": {"role": "button", "name": "Go"}});
+        let group = json!({"type": "draw-group", "id": "g", "position": {"x": 100, "y": 50}, "scale": 0.5, "items": [button.clone()]});
+        let (_, gathered) = from_props_mapped(&free_props(json!([group])), 0.0).unwrap();
+        let r = gathered.semantic[0].rect;
+        assert!((r.x - 110.0).abs() < 1e-3 && (r.y - 70.0).abs() < 1e-3 && (r.w - 20.0).abs() < 1e-3 && (r.h - 10.0).abs() < 1e-3, "{r:?}");
+        assert_eq!(gathered.semantic[0].rect, gathered.regions[0].rect, "the overlay node and the hit region agree");
+        let (_, plain) = from_props_mapped(&free_props(json!([button])), 0.0).unwrap();
+        assert_eq!(plain.semantic[0].rect, Rect { x: 20.0, y: 40.0, w: 40.0, h: 20.0 }, "control: an ungrouped node keeps its rect");
     }
 
     #[test]

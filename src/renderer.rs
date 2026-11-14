@@ -498,6 +498,8 @@ pub struct SharedDeviceRenderer {
     blur: Option<crate::backdrop::BlurPass>,
     targets: crate::render_target::TargetStore,
     target_sprite_pipeline: wgpu::RenderPipeline,
+    /// Buffers made for one frame's draws; destroyed after that frame's submit (wgpu's web backend never frees on drop).
+    transient: std::sync::Mutex<Vec<wgpu::Buffer>>,
 }
 
 impl SharedDeviceRenderer {
@@ -568,6 +570,32 @@ impl SharedDeviceRenderer {
             blur: None,
             targets: Default::default(),
             target_sprite_pipeline,
+            transient: Default::default(),
+        }
+    }
+
+    fn keep(&self, buffer: &wgpu::Buffer) {
+        self.transient
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(buffer.clone());
+    }
+
+    fn transient_len(&self) -> usize {
+        self.transient
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// Destroy the buffers kept since `mark`; their frame has been submitted.
+    fn release_transient(&self, mark: usize) {
+        let mut kept = self
+            .transient
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for buffer in kept.drain(mark..) {
+            buffer.destroy();
         }
     }
 
@@ -702,9 +730,10 @@ impl SharedDeviceRenderer {
         self.sprites.get(&key).map(|s| (key, s))
     }
 
-    /// Rasterize a run of consecutive vector commands (paths, lines, text)
-    /// into one target-sized texture and queue it as a full-surface sprite.
-    /// The layer is cached by the run's content and target size.
+    /// Rasterize a run of consecutive vector commands (paths, lines, text) into
+    /// a texture the size of the run's box ([`crate::vector::run_bounds`]) and
+    /// queue it as a sprite over that box; a run of unknown reach covers the
+    /// whole target. The layer is cached by the run's content, box and scale.
     fn flush_vector_run(
         &mut self,
         run: &mut Vec<&DrawCommand>,
@@ -734,7 +763,26 @@ impl SharedDeviceRenderer {
             tracing::warn!(target: "almadar::game_renderer", tw, th, "vector layer exceeds the device texture limit — skipped");
             return;
         }
+        let width = packet.width.max(1.0);
+        let height = packet.height.max(1.0);
+        let sx = tw as f32 / width;
+        let sy = th as f32 / height;
+        let (px0, py0, px1, py1) = match crate::vector::run_bounds(&commands) {
+            crate::vector::RunBounds::Empty => return,
+            crate::vector::RunBounds::Anywhere => (0, 0, tw, th),
+            crate::vector::RunBounds::Box { x0, y0, x1, y1 } => (
+                (x0 * sx).floor().clamp(0.0, tw as f32) as u32,
+                (y0 * sy).floor().clamp(0.0, th as f32) as u32,
+                (x1 * sx).ceil().clamp(0.0, tw as f32) as u32,
+                (y1 * sy).ceil().clamp(0.0, th as f32) as u32,
+            ),
+        };
+        if px1 <= px0 || py1 <= py0 {
+            return;
+        }
+        let (lw, lh) = (px1 - px0, py1 - py0);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&(px0, py0, sx.to_bits(), sy.to_bits()), &mut hasher);
         if commands
             .iter()
             .any(|command| crate::vector::uses_text(command))
@@ -761,46 +809,43 @@ impl SharedDeviceRenderer {
                 "{VECTOR_LAYER_PREFIX}{:016x}",
                 std::hash::Hasher::finish(&hasher)
             ),
-            raster: Some((tw, th)),
+            raster: Some((lw, lh)),
         };
         self.use_clock += 1;
         let now = self.use_clock;
         if let Some(sprite) = self.sprites.get_mut(&key) {
             sprite.last_used = now;
         } else {
-            let sx = tw as f32 / packet.width.max(1.0);
-            let sy = th as f32 / packet.height.max(1.0);
-            let Some(rgba) = crate::vector::rasterize(&commands, tw, th, sx, sy) else {
-                tracing::warn!(target: "almadar::game_renderer", tw, th, "vector layer surface not allocatable — skipped");
+            let (ox, oy) = (px0 as f32 / sx, py0 as f32 / sy);
+            let Some(rgba) = crate::vector::rasterize_box(&commands, lw, lh, sx, sy, ox, oy) else {
+                tracing::warn!(target: "almadar::game_renderer", lw, lh, "vector layer surface not allocatable — skipped");
                 return;
             };
             self.evict_stale_vector_layers();
-            let sprite = self.upload_rgba(&rgba, tw, th, now);
+            let sprite = self.upload_rgba(&rgba, lw, lh, now);
             self.sprites.insert(key.clone(), sprite);
         }
-        let width = packet.width.max(1.0) as u32;
-        let height = packet.height.max(1.0) as u32;
         let verts = sprite_vertices(
             &Rect {
                 x: 0.0,
                 y: 0.0,
-                w: tw as f32,
-                h: th as f32,
+                w: lw as f32,
+                h: lh as f32,
             },
             &Rect {
-                x: 0.0,
-                y: 0.0,
-                w: width as f32,
-                h: height as f32,
+                x: px0 as f32 / sx,
+                y: py0 as f32 / sy,
+                w: lw as f32 / sx,
+                h: lh as f32 / sy,
             },
-            tw,
-            th,
+            lw,
+            lh,
             0.0,
             1.0,
             false,
             false,
-            width,
-            height,
+            width as u32,
+            height as u32,
         );
         draws.push(Draw::Sprite {
             key,
@@ -834,6 +879,16 @@ impl SharedDeviceRenderer {
                 None => return,
             }
         }
+    }
+
+    /// The pixel sizes of the cached vector layers (cache observability for tests).
+    #[cfg(test)]
+    fn vector_layer_sizes(&self) -> Vec<(u32, u32)> {
+        self.sprites
+            .keys()
+            .filter(|k| k.url.starts_with(VECTOR_LAYER_PREFIX))
+            .filter_map(|k| k.raster)
+            .collect()
     }
 
     /// Vector layer textures currently cached (cache observability for tests).
@@ -1089,20 +1144,25 @@ impl SharedDeviceRenderer {
             return;
         }
         let aux = pass.aux_group(&device, None, run.target.as_ref().map(|t| &t.view));
+        let mut kept = Vec::new();
         for chunk in crate::sdf::batches(&run.instances) {
-            let bind_group = pass.bind_group(
+            let (bind_group, buffer) = pass.bind_group(
                 &device,
                 chunk,
                 (packet.width, packet.height),
                 packet.time_ms,
                 packet.pointer,
             );
+            kept.push(buffer);
             out.push(Draw::Sdf {
                 key: run.key,
                 bind_group,
                 aux: aux.clone(),
                 count: chunk.len() as u32,
             });
+        }
+        for buffer in &kept {
+            self.keep(buffer);
         }
     }
 
@@ -1156,7 +1216,7 @@ impl SharedDeviceRenderer {
             return None;
         }
         pass.ensure_backdrop(&device);
-        let bind_group = pass.bind_group(
+        let (bind_group, buffer) = pass.bind_group(
             &device,
             &[instance],
             (packet.width, packet.height),
@@ -1165,6 +1225,7 @@ impl SharedDeviceRenderer {
         );
         let behind = set.b.create_view(&wgpu::TextureViewDescriptor::default());
         let aux = pass.aux_group(&device, Some(&behind), target.as_ref().map(|t| &t.view));
+        self.keep(&buffer);
         Some(Draw::Backdrop(Box::new(BackdropDraw {
             job: crate::backdrop::BackdropJob {
                 frame: set.frame.clone(),
@@ -1193,7 +1254,11 @@ impl SharedDeviceRenderer {
         let (Some((cut, add)), Some(fill)) = (sdf.backdrop_pipelines(), sdf.pipeline(draw.key)) else {
             return;
         };
-        blur.encode(&self.device, encoder, &draw.job);
+        let mut kept = Vec::new();
+        blur.encode(&self.device, encoder, &draw.job, &mut kept);
+        for buffer in &kept {
+            self.keep(buffer);
+        }
         let view = draw
             .job
             .frame
@@ -1289,9 +1354,11 @@ impl SharedDeviceRenderer {
         let flush = |pending: Option<(u64, Vec<crate::glyph_atlas::GlyphInstance>)>,
                      out: &mut Vec<Draw>| {
             if let Some((page, instances)) = pending {
+                let buffer = crate::glyph_atlas::GlyphPass::instance_buffer(&self.device, &instances);
+                self.keep(&buffer);
                 out.push(Draw::Glyphs {
                     page,
-                    buffer: crate::glyph_atlas::GlyphPass::instance_buffer(&self.device, &instances),
+                    buffer,
                     count: instances.len() as u32,
                 });
             }
@@ -1339,6 +1406,7 @@ impl SharedDeviceRenderer {
             self.targets.begin_frame();
         }
         self.render_depth += 1;
+        let transient_mark = self.transient_len();
         let final_target = target;
         let layer_set = packet
             .draw_commands
@@ -1430,7 +1498,12 @@ impl SharedDeviceRenderer {
                         *origin,
                         (width as f32, height as f32),
                     ) {
-                        Ok(prepared) => draws.push(Draw::Particles(prepared)),
+                        Ok(prepared) => {
+                            for buffer in &prepared.transient {
+                                self.keep(buffer);
+                            }
+                            draws.push(Draw::Particles(prepared))
+                        }
                         Err(error) => {
                             tracing::error!(target: "almadar::game_renderer", %error, "particles not drawn")
                         }
@@ -1724,6 +1797,7 @@ impl SharedDeviceRenderer {
                                     contents: bytemuck::cast_slice(vertices),
                                     usage: wgpu::BufferUsages::VERTEX,
                                 });
+                        self.keep(&buffer);
                         pass.set_pipeline(&self.pipeline);
                         pass.set_vertex_buffer(0, buffer.slice(..));
                         pass.draw(0..vertices.len() as u32, 0..1);
@@ -1744,6 +1818,7 @@ impl SharedDeviceRenderer {
                                     contents: bytemuck::cast_slice(verts),
                                     usage: wgpu::BufferUsages::VERTEX,
                                 });
+                        self.keep(&buffer);
                         pass.set_pipeline(if *additive {
                             &self.additive_sprite_pipeline
                         } else {
@@ -1763,6 +1838,7 @@ impl SharedDeviceRenderer {
                                     contents: bytemuck::cast_slice(verts),
                                     usage: wgpu::BufferUsages::VERTEX,
                                 });
+                        self.keep(&buffer);
                         pass.set_pipeline(&self.target_sprite_pipeline);
                         pass.set_bind_group(0, bind_group, &[]);
                         pass.set_vertex_buffer(0, buffer.slice(..));
@@ -1810,6 +1886,7 @@ impl SharedDeviceRenderer {
                                     contents: bytemuck::cast_slice(verts),
                                     usage: wgpu::BufferUsages::VERTEX,
                                 });
+                        self.keep(&buffer);
                         pass.set_pipeline(&self.masked_sprite_pipeline);
                         pass.set_bind_group(0, bind_group, &[]);
                         pass.set_vertex_buffer(0, buffer.slice(..));
@@ -1834,6 +1911,7 @@ impl SharedDeviceRenderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+        self.release_transient(transient_mark);
         self.render_depth -= 1;
         drew
     }
@@ -2830,6 +2908,65 @@ mod vector_layer_tests {
     }
 
     #[test]
+    fn a_vector_run_is_rasterized_into_its_box_not_the_whole_target() {
+        let Some(mut r) = renderer() else { return };
+        let packet = GameRenderPacket {
+            pattern: "learning-canvas".into(),
+            width: 128.0,
+            height: 128.0,
+            draw_commands: vec![DrawCommand::Path { segments: rect(100.0, 100.0, 8.0, 8.0), fill: Some(RED), stroke: None }],
+            ..Default::default()
+        };
+        let Some(rgba) = draw(&mut r, &packet, 128) else { return };
+        assert_eq!(px(&rgba, 128, 104, 104), [255, 0, 0, 255]);
+        assert_eq!(px(&rgba, 128, 96, 104)[3], 0);
+        assert_eq!(px(&rgba, 128, 104, 96)[3], 0);
+        let sizes = r.vector_layer_sizes();
+        assert_eq!(sizes.len(), 1);
+        assert!(sizes[0].0 <= 10 && sizes[0].1 <= 10, "the layer is the run's box, got {:?}", sizes[0]);
+    }
+
+    #[test]
+    fn a_stroke_paints_past_its_outline_inside_the_box() {
+        let Some(mut r) = renderer() else { return };
+        let stroke = Stroke { color: RED, width: 4.0, dash: Vec::new(), dash_offset: 0.0, cap: crate::packet::LineCap::Butt, join: crate::packet::LineJoin::Miter };
+        let packet = GameRenderPacket {
+            pattern: "learning-canvas".into(),
+            width: 64.0,
+            height: 64.0,
+            draw_commands: vec![DrawCommand::Path { segments: rect(20.0, 20.0, 20.0, 20.0), fill: None, stroke: Some(stroke) }],
+            ..Default::default()
+        };
+        let Some(rgba) = draw(&mut r, &packet, 64) else { return };
+        assert_eq!(px(&rgba, 64, 19, 30)[3], 255, "the stroke's outer half is drawn");
+        assert_eq!(px(&rgba, 64, 30, 30)[3], 0, "the inside of an unfilled path stays clear");
+    }
+
+    #[test]
+    fn control_a_run_spanning_the_target_still_covers_it() {
+        let Some(mut r) = renderer() else { return };
+        let Some(rgba) = draw(&mut r, &packet(vec![DrawCommand::Path { segments: rect(0.0, 0.0, 16.0, 16.0), fill: Some(RED), stroke: None }]), 16) else {
+            return;
+        };
+        assert_eq!(px(&rgba, 16, 0, 0), [255, 0, 0, 255]);
+        assert_eq!(px(&rgba, 16, 15, 15), [255, 0, 0, 255]);
+        assert_eq!(r.vector_layer_sizes(), vec![(16, 16)]);
+    }
+
+    #[test]
+    fn a_cached_layer_is_not_reused_once_the_world_size_changes_under_the_same_target() {
+        let Some(mut r) = renderer() else { return };
+        let path = || DrawCommand::Path { segments: rect(0.0, 4.0, 16.0, 4.0), fill: Some(RED), stroke: None };
+        let tall = GameRenderPacket { pattern: "learning-canvas".into(), width: 16.0, height: 16.0, draw_commands: vec![path()], ..Default::default() };
+        let short = GameRenderPacket { pattern: "learning-canvas".into(), width: 16.0, height: 8.0, draw_commands: vec![path()], ..Default::default() };
+        let _ = draw(&mut r, &tall, 16);
+        let Some(rgba) = draw(&mut r, &short, 16) else { return };
+        assert_eq!(r.vector_layer_count(), 2, "a new world scale is a new layer");
+        assert_eq!(px(&rgba, 16, 8, 9)[3], 255, "world y 4..8 of 8 fills target rows 8..16");
+        assert_eq!(px(&rgba, 16, 8, 6)[3], 0);
+    }
+
+    #[test]
     fn vector_layers_are_bounded() {
         let Some(mut r) = renderer() else { return };
         for i in 0..(MAX_VECTOR_LAYERS + 4) {
@@ -3413,6 +3550,38 @@ mod sdf_tests {
         };
         assert!(!painted(&apart, 32, 32), "control: two separate circles leave the gap empty");
         assert!(painted(&apart, 16, 32) && painted(&apart, 48, 32));
+    }
+
+    #[test]
+    fn a_frames_transient_buffers_are_released_after_its_submit_and_the_next_frame_still_draws() {
+        let Some(mut r) = renderer() else { return };
+        let frame = packet(vec![shape(SdfKind::Rect, full())], 0.0, None);
+        let Some(first) = draw(&mut r, &frame, 64) else { return };
+        assert_eq!(r.transient_len(), 0, "every per-frame buffer is destroyed once submitted");
+        let Some(second) = draw(&mut r, &frame, 64) else { return };
+        assert_eq!(r.transient_len(), 0);
+        assert_eq!(px(&first, 64, 32, 32), px(&second, 64, 32, 32), "a released frame does not disturb the next");
+        assert!(px(&second, 64, 32, 32)[0] > 200);
+    }
+
+    #[test]
+    fn releasing_from_a_mark_keeps_the_buffers_an_outer_frame_still_needs() {
+        let Some(r) = renderer() else { return };
+        let buffer = |label| {
+            r.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: 16,
+                usage: wgpu::BufferUsages::VERTEX,
+                mapped_at_creation: false,
+            })
+        };
+        r.keep(&buffer("outer"));
+        let mark = r.transient_len();
+        r.keep(&buffer("inner"));
+        r.release_transient(mark);
+        assert_eq!(r.transient_len(), 1, "the nested frame releases only its own");
+        r.release_transient(0);
+        assert_eq!(r.transient_len(), 0);
     }
 }
 

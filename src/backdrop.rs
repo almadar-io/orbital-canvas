@@ -282,6 +282,7 @@ impl BlurPass {
         job: &BackdropJob,
         last: bool,
         scissor: [u32; 4],
+        kept: &mut Vec<wgpu::Buffer>,
     ) {
         let (taps, stride) = kernel(job.sigma);
         let tint = job.tint.unwrap_or([0.0; 4]);
@@ -304,6 +305,7 @@ impl BlurPass {
             contents: bytemuck::cast_slice(&params),
             usage: wgpu::BufferUsages::UNIFORM,
         });
+        kept.push(buffer.clone());
         let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("backdrop blur bind group"),
@@ -352,6 +354,7 @@ impl BlurPass {
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         job: &BackdropJob,
+        kept: &mut Vec<wgpu::Buffer>,
     ) {
         let (taps, stride) = kernel(job.sigma);
         let reach = (taps as f32 * stride).ceil() as u32 + 1;
@@ -367,6 +370,7 @@ impl BlurPass {
             job,
             false,
             [x, top, w, bottom - top],
+            kept,
         );
         self.blur_pass(
             device,
@@ -377,6 +381,7 @@ impl BlurPass {
             job,
             true,
             job.region,
+            kept,
         );
     }
 

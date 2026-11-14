@@ -63,6 +63,23 @@ pub struct TraitData {
     pub transitions: Vec<TransitionInfo>,
     pub emitted: Vec<String>,
     pub listened: Vec<String>,
+    /// The std registry glyph of each effect operator, as the data carries it (`glyphs`, or an effect's `glyph`).
+    pub glyphs: std::collections::HashMap<String, String>,
+}
+
+/// The `glyphs` map a trait's data carries, plus the `glyph` of each AVL effect object.
+fn glyphs_of(v: &Value, transitions: Option<&Value>) -> std::collections::HashMap<String, String> {
+    let mut out: std::collections::HashMap<String, String> = v
+        .get("glyphs")
+        .and_then(Value::as_object)
+        .map(|m| m.iter().filter_map(|(k, d)| Some((k.clone(), d.as_str()?.to_string()))).collect())
+        .unwrap_or_default();
+    for e in transitions.and_then(Value::as_array).into_iter().flatten().filter_map(|t| t.get("effects")?.as_array()).flatten() {
+        if let (Some(op), Some(d)) = (e.get("type").and_then(Value::as_str), e.get("glyph").and_then(Value::as_str)) {
+            out.insert(op.to_string(), d.to_string());
+        }
+    }
+    out
 }
 
 fn strings(v: Option<&Value>) -> Vec<String> {
@@ -164,7 +181,9 @@ impl TraitData {
                     .collect()
             })
             .unwrap_or_default();
+        let glyphs = glyphs_of(v, v.get("transitions"));
         Some(Self {
+            glyphs,
             name: v
                 .get("name")
                 .and_then(Value::as_str)
@@ -262,7 +281,9 @@ impl TraitData {
                 })
                 .unwrap_or_default()
         };
+        let glyphs = glyphs_of(t, sm.get("transitions"));
         Some(Self {
+            glyphs,
             name: t
                 .get("name")
                 .and_then(Value::as_str)
@@ -776,7 +797,7 @@ impl Diagram<'_> {
             let mut cx = tx + mono_text_width(&tr.event, LABEL_PX) + EFFECT_GAP;
             for fx in &tr.effects {
                 let (mx, my) = (cx + EFFECT_CHIP / 2.0, py + PILL_H / 2.0);
-                effect_glyph::chip(pen, fx, mx, my, EFFECT_CHIP);
+                effect_glyph::chip(pen, fx, self.trait_data.glyphs.get(fx).map(String::as_str), mx, my, EFFECT_CHIP);
                 cx += EFFECT_CHIP + EFFECT_GAP;
             }
             if let Some(g) = &tr.guard {

@@ -425,7 +425,7 @@ impl SdfPass {
         packet_size: (f32, f32),
         time_ms: f64,
         pointer: Option<Vec2>,
-    ) -> wgpu::BindGroup {
+    ) -> (wgpu::BindGroup, wgpu::Buffer) {
         let mut floats = vec![0.0f32; HEADER_FLOATS + MAX_INSTANCES * FIELDS * 4];
         floats[0] = packet_size.0.max(1.0);
         floats[1] = packet_size.1.max(1.0);
@@ -446,14 +446,15 @@ impl SdfPass {
             contents: bytemuck::cast_slice(&floats),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sdf bind group"),
             layout: &self.layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: buffer.as_entire_binding(),
             }],
-        })
+        });
+        (group, buffer)
     }
 }
 

@@ -206,6 +206,15 @@ impl<'a> Pen<'a> {
         }
     }
 
+    /// A glyph's unit path (-1..1, y down) drawn `half` scene units each side of (`x`, `y`).
+    pub fn unit_path(&mut self, d: &str, x: f32, y: f32, half: f32, ink: &Ink) {
+        let xf = Xf { s: self.xf.s * half, ox: self.xf.ox + x * self.xf.s, oy: self.xf.oy + y * self.xf.s };
+        match parse_path_data(d, xf) {
+            Some(segments) => self.path(segments, None, Some(ink)),
+            None => gap_once("glyph-path-data", "malformed glyph path — skipped"),
+        }
+    }
+
     pub fn line(&mut self, a: (f32, f32), b: (f32, f32), ink: &Ink) {
         self.polyline(&[a, b], false, None, Some(ink));
     }

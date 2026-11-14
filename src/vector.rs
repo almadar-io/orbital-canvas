@@ -1266,6 +1266,89 @@ pub fn rasterize_clip_mask(
     Some(rgba)
 }
 
+/// Where a run of vector commands can paint, in packet units.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RunBounds {
+    /// Nothing in the run paints.
+    Empty,
+    /// Everything the run paints lies inside `x0..x1` by `y0..y1`.
+    Box { x0: f32, y0: f32, x1: f32, y1: f32 },
+    /// A command whose reach is not known: the run may paint anywhere.
+    Anywhere,
+}
+
+impl RunBounds {
+    fn union(self, other: RunBounds) -> RunBounds {
+        match (self, other) {
+            (RunBounds::Anywhere, _) | (_, RunBounds::Anywhere) => RunBounds::Anywhere,
+            (RunBounds::Empty, b) | (b, RunBounds::Empty) => b,
+            (RunBounds::Box { x0, y0, x1, y1 }, RunBounds::Box { x0: a0, y0: b0, x1: a1, y1: b1 }) => RunBounds::Box {
+                x0: x0.min(a0),
+                y0: y0.min(b0),
+                x1: x1.max(a1),
+                y1: y1.max(b1),
+            },
+        }
+    }
+
+    fn grow(self, by: f32) -> RunBounds {
+        match self {
+            RunBounds::Box { x0, y0, x1, y1 } => RunBounds::Box { x0: x0 - by, y0: y0 - by, x1: x1 + by, y1: y1 + by },
+            other => other,
+        }
+    }
+}
+
+fn path_bounds(segments: &[PathSegment], stroke: Option<&Stroke>) -> RunBounds {
+    let Some(path) = build_path(segments) else {
+        return RunBounds::Empty;
+    };
+    let b = path.bounds();
+    let reach = stroke.map(|s| s.width * 2.0).unwrap_or(0.0);
+    RunBounds::Box { x0: b.left(), y0: b.top(), x1: b.right(), y1: b.bottom() }.grow(reach)
+}
+
+/// The box a vector command paints into, from the same path and text outlines [`draw_command`] fills: a stroke
+/// reaches twice its width past the outline (a mitre), a blur and a shadow three times their spread.
+pub fn command_bounds(command: &DrawCommand) -> RunBounds {
+    match command {
+        DrawCommand::Path { segments, stroke, .. }
+        | DrawCommand::GradientPath { segments, stroke, .. }
+        | DrawCommand::ClippedPath { segments, stroke, .. } => path_bounds(segments, stroke.as_ref()),
+        DrawCommand::PatternPath { segments, .. } => path_bounds(segments, None),
+        DrawCommand::Line { from, to, width, .. } => RunBounds::Box {
+            x0: from.x.min(to.x),
+            y0: from.y.min(to.y),
+            x1: from.x.max(to.x),
+            y1: from.y.max(to.y),
+        }
+        .grow(*width * 2.0),
+        DrawCommand::Text { text, pos, size, align, weight, halo, family, .. } => {
+            match text_path(text, *pos, *size, *align, *weight >= 600, *family) {
+                Some(paths) => {
+                    let b = paths.all.bounds();
+                    let reach = halo.as_ref().map(|h| h.width).unwrap_or(0.0) + size * 0.05 + 1.0;
+                    RunBounds::Box { x0: b.left(), y0: b.top(), x1: b.right(), y1: b.bottom() }.grow(reach)
+                }
+                None => RunBounds::Empty,
+            }
+        }
+        DrawCommand::Blurred { command, radius } => command_bounds(command).grow(radius * 3.0),
+        DrawCommand::Shadow { commands, sigma, .. } => commands
+            .iter()
+            .fold(RunBounds::Empty, |acc, c| acc.union(command_bounds(c)))
+            .grow(sigma * 3.0),
+        _ => RunBounds::Anywhere,
+    }
+}
+
+/// The union of [`command_bounds`] over a run.
+pub fn run_bounds(commands: &[&DrawCommand]) -> RunBounds {
+    commands
+        .iter()
+        .fold(RunBounds::Empty, |acc, c| acc.union(command_bounds(c)))
+}
+
 /// Rasterize `commands` (vector commands only; others are ignored) onto a
 /// transparent `px_w` x `px_h` surface, scaling packet units by `sx`/`sy`.
 /// Returns straight-alpha RGBA8, or `None` when the surface cannot be allocated.
@@ -1276,8 +1359,22 @@ pub fn rasterize(
     sx: f32,
     sy: f32,
 ) -> Option<Vec<u8>> {
+    rasterize_box(commands, px_w, px_h, sx, sy, 0.0, 0.0)
+}
+
+/// [`rasterize`] of the part of packet space whose top-left corner is (`ox`, `oy`): the surface's pixel (0, 0)
+/// is that corner, so a run is drawn into its own box instead of the whole canvas.
+pub fn rasterize_box(
+    commands: &[&DrawCommand],
+    px_w: u32,
+    px_h: u32,
+    sx: f32,
+    sy: f32,
+    ox: f32,
+    oy: f32,
+) -> Option<Vec<u8>> {
     let mut pixmap = Pixmap::new(px_w.max(1), px_h.max(1))?;
-    let ts = Transform::from_scale(sx, sy);
+    let ts = Transform::from_scale(sx, sy).pre_translate(-ox, -oy);
     for command in commands {
         draw_command(&mut pixmap, command, ts);
     }
@@ -1312,6 +1409,64 @@ mod tests {
             PathSegment::LineTo { x, y: y + h },
             PathSegment::Close,
         ]
+    }
+
+    #[test]
+    fn a_stroked_path_reaches_past_its_outline_by_its_stroke() {
+        let path = DrawCommand::Path {
+            segments: rect(10.0, 20.0, 30.0, 5.0),
+            fill: None,
+            stroke: Some(Stroke { color: RED, width: 4.0, dash: Vec::new(), dash_offset: 0.0, cap: LineCap::Butt, join: LineJoin::Miter }),
+        };
+        assert_eq!(command_bounds(&path), RunBounds::Box { x0: 2.0, y0: 12.0, x1: 48.0, y1: 33.0 });
+    }
+
+    #[test]
+    fn control_a_filled_path_is_bounded_by_its_outline() {
+        let path = DrawCommand::Path { segments: rect(10.0, 20.0, 30.0, 5.0), fill: Some(RED), stroke: None };
+        assert_eq!(command_bounds(&path), RunBounds::Box { x0: 10.0, y0: 20.0, x1: 40.0, y1: 25.0 });
+    }
+
+    #[test]
+    fn a_shadow_reaches_three_spreads_past_its_shapes_and_a_run_is_their_union() {
+        let a = DrawCommand::Path { segments: rect(0.0, 0.0, 10.0, 10.0), fill: Some(RED), stroke: None };
+        let b = DrawCommand::Path { segments: rect(50.0, 60.0, 10.0, 10.0), fill: Some(RED), stroke: None };
+        let shadow = DrawCommand::Shadow { commands: vec![a.clone()], color: RED, sigma: 2.0 };
+        assert_eq!(command_bounds(&shadow), RunBounds::Box { x0: -6.0, y0: -6.0, x1: 16.0, y1: 16.0 });
+        assert_eq!(run_bounds(&[&a, &b]), RunBounds::Box { x0: 0.0, y0: 0.0, x1: 60.0, y1: 70.0 });
+    }
+
+    #[test]
+    fn text_is_bounded_by_its_glyph_outlines_and_a_command_of_unknown_reach_spans_anywhere() {
+        let word = DrawCommand::Text {
+            text: "Orb".into(),
+            pos: Vec2 { x: 100.0, y: 50.0 },
+            size: 20.0,
+            color: RED,
+            align: TextAlign::Left,
+            weight: 400,
+            halo: None,
+            family: crate::packet::TextFamily::Sans,
+        };
+        let RunBounds::Box { x0, y0, x1, y1 } = command_bounds(&word) else {
+            panic!("text has a box");
+        };
+        assert!(x0 >= 96.0 && x0 <= 102.0 && x1 > 120.0 && x1 < 160.0, "{x0}..{x1}");
+        assert!(y0 > 30.0 && y0 < 50.0 && y1 > 50.0 && y1 < 70.0, "{y0}..{y1}");
+        let quad = DrawCommand::Quad { rect: crate::packet::Rect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 }, color: RED };
+        assert_eq!(run_bounds(&[&word, &quad]), RunBounds::Anywhere);
+    }
+
+    #[test]
+    fn a_box_raster_draws_the_same_pixels_as_the_whole_surface_at_its_offset() {
+        let path = DrawCommand::Path { segments: rect(20.0, 30.0, 6.0, 4.0), fill: Some(RED), stroke: None };
+        let whole = rasterize(&[&path], 40, 40, 1.0, 1.0).unwrap();
+        let part = rasterize_box(&[&path], 10, 10, 1.0, 1.0, 18.0, 28.0).unwrap();
+        for y in 0..10 {
+            for x in 0..10 {
+                assert_eq!(at(&part, 10, x, y), at(&whole, 40, x + 18, y + 28), "pixel {x},{y}");
+            }
+        }
     }
 
     #[test]

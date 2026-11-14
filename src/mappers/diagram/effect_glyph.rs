@@ -60,7 +60,7 @@ pub(crate) fn category_color(pen: &Pen, category: &str) -> Rgba {
 }
 
 /// A chip `size` wide centered on (`x`, `y`): tinted disc, faint ring, then the glyph.
-pub fn chip(pen: &mut Pen, op: &str, x: f32, y: f32, size: f32) {
+pub fn chip(pen: &mut Pen, op: &str, registry: Option<&str>, x: f32, y: f32, size: f32) {
     let s = size / 2.0 / 1.2 - 0.5;
     let category = effect_category(op);
     let c = category.map_or_else(|| pen.tone("label"), |cat| category_color(pen, cat));
@@ -74,11 +74,16 @@ pub fn chip(pen: &mut Pen, op: &str, x: f32, y: f32, size: f32) {
             Some(&Ink::new(with_alpha(c, 0.3), 0.5)),
         );
     }
-    glyph(pen, op, x, y, s, c);
+    glyph(pen, op, registry, x, y, s, c);
 }
 
-/// The glyph alone, `s` its half-size.
-pub fn glyph(pen: &mut Pen, op: &str, x: f32, y: f32, s: f32, c: Rgba) {
+/// The glyph alone, `s` its half-size: the std registry's glyph for `op` when the data carries it, else a mark kept
+/// here for operators the registry gives none (its category's, else the dashed unknown).
+pub fn glyph(pen: &mut Pen, op: &str, registry: Option<&str>, x: f32, y: f32, s: f32, c: Rgba) {
+    if let Some(d) = registry {
+        pen.unit_path(d, x, y, s, &Ink::new(c, 1.2));
+        return;
+    }
     if !own_glyph(pen, op, x, y, s, c) {
         match effect_category(op) {
             Some("ui") => own(pen, "render-ui", x, y, s, c),
@@ -119,25 +124,6 @@ fn own_glyph(pen: &mut Pen, op: &str, x: f32, y: f32, s: f32, c: Rgba) -> bool {
             None,
             Some(&w15),
         ),
-        "persist" => {
-            pen.ellipse(x, y - s * 0.6, s, s * 0.4, 0.0, None, Some(&w15));
-            pen.line((x - s, y - s * 0.6), (x - s, y + s * 0.4), &w15);
-            pen.line((x + s, y - s * 0.6), (x + s, y + s * 0.4), &w15);
-            pen.ellipse(x, y + s * 0.4, s, s * 0.4, 0.0, None, Some(&w15));
-        }
-        "fetch" => {
-            pen.line((x, y - s), (x, y + s * 0.6), &w15);
-            pen.polyline(
-                &[
-                    (x - s * 0.5, y + s * 0.1),
-                    (x, y + s),
-                    (x + s * 0.5, y + s * 0.1),
-                ],
-                false,
-                None,
-                Some(&w15),
-            );
-        }
         "emit" => {
             pen.circle(x, y, s * 0.3, Some(c), None);
             pen.svg_path(
@@ -156,43 +142,6 @@ fn own_glyph(pen: &mut Pen, op: &str, x: f32, y: f32, s: f32, c: Rgba) -> bool {
                 &format!("M{},{} A{r},{r} 0 0,1 {},{}", x - s, y - s, x + s, y - s),
                 None,
                 Some(&Ink::new(with_alpha(c, 0.6), 1.0)),
-            );
-        }
-        "navigate" => {
-            pen.line((x - s, y), (x + s * 0.6, y), &w15);
-            pen.polyline(
-                &[
-                    (x + s * 0.1, y - s * 0.5),
-                    (x + s, y),
-                    (x + s * 0.1, y + s * 0.5),
-                ],
-                false,
-                None,
-                Some(&w15),
-            );
-        }
-        "call-service" => {
-            pen.line((x - s, y - s * 0.3), (x + s, y - s * 0.3), &w15);
-            pen.polyline(
-                &[
-                    (x + s * 0.5, y - s * 0.7),
-                    (x + s, y - s * 0.3),
-                    (x + s * 0.5, y + s * 0.1),
-                ],
-                false,
-                None,
-                Some(&w15),
-            );
-            pen.line((x + s, y + s * 0.3), (x - s, y + s * 0.3), &w15);
-            pen.polyline(
-                &[
-                    (x - s * 0.5, y - s * 0.1),
-                    (x - s, y + s * 0.3),
-                    (x - s * 0.5, y + s * 0.7),
-                ],
-                false,
-                None,
-                Some(&w15),
             );
         }
         "spawn" => {
@@ -275,7 +224,7 @@ mod tests {
     fn draw(op: &str) -> Vec<DrawCommand> {
         let theme = DiagramTheme::heritage(false);
         let mut pen = Pen::new(&theme, Xf::identity());
-        glyph(&mut pen, op, 10.0, 10.0, 6.0, theme.tone("info").unwrap());
+        glyph(&mut pen, op, None, 10.0, 10.0, 6.0, theme.tone("info").unwrap());
         pen.cmds
     }
 
@@ -284,11 +233,7 @@ mod tests {
         let ops = [
             "render-ui",
             "set",
-            "persist",
-            "fetch",
             "emit",
-            "navigate",
-            "call-service",
             "spawn",
             "despawn",
             "do",
@@ -302,6 +247,45 @@ mod tests {
                 assert_ne!(a, b, "{} and {} share a glyph", ops[i], ops[j]);
             }
         }
+    }
+
+    #[test]
+    fn the_registry_glyph_the_data_carries_is_drawn_in_place_of_any_mark_kept_here() {
+        let theme = DiagramTheme::heritage(false);
+        let mut pen = Pen::new(&theme, Xf::identity());
+        glyph(&mut pen, "persist", Some("M-1 0 L1 0"), 10.0, 10.0, 6.0, theme.tone("info").unwrap());
+        let ends: Vec<(f32, f32)> = pen
+            .cmds
+            .iter()
+            .flat_map(|c| match c {
+                DrawCommand::Path { segments, .. } => segments
+                    .iter()
+                    .filter_map(|seg| match seg {
+                        crate::packet::PathSegment::MoveTo { x, y } | crate::packet::PathSegment::LineTo { x, y } => Some((*x, *y)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(ends, vec![(4.0, 10.0), (16.0, 10.0)], "the unit path scaled by the half-size about the point");
+        assert_eq!(format!("{:?}", draw("persist")), format!("{:?}", draw("set")), "control: without data, its category's mark");
+    }
+
+    #[test]
+    fn a_trait_carries_the_registry_glyphs_its_data_names() {
+        let t = super::super::state_machine::TraitData::from_level(&serde_json::json!({
+            "name": "T", "linkedEntity": "E",
+            "states": [{ "name": "a", "isInitial": true }],
+            "transitions": [{ "from": "a", "to": "a", "event": "GO", "index": 0,
+                "effects": [{ "type": "emit", "glyph": "M1 1 L0 0", "args": [] }, { "type": "log", "args": [] }] }],
+            "glyphs": { "set": "M0 0 L1 1" },
+            "emittedEvents": [], "listenedEvents": []
+        }))
+        .unwrap();
+        assert_eq!(t.glyphs.get("set").map(String::as_str), Some("M0 0 L1 1"));
+        assert_eq!(t.glyphs.get("emit").map(String::as_str), Some("M1 1 L0 0"));
+        assert!(!t.glyphs.contains_key("log"), "control: an effect with no glyph carries none");
     }
 
     #[test]
