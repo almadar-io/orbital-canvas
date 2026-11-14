@@ -204,6 +204,8 @@ pub(crate) struct ShapedCluster {
     pub x0: f32,
     pub x1: f32,
     pub rtl: bool,
+    /// The indices into [`Shaped::glyphs`] of the glyphs this cluster shaped to.
+    pub glyphs: Range<usize>,
 }
 
 /// The face for `c` in `script`: the mono face when asked and it covers `c`, bundled Arabic, the bundled face when its cmap covers the
@@ -308,12 +310,21 @@ pub(crate) fn shape_in(text: &str, size: f32, bold: bool, family: Family) -> Sha
                 let shaped = rustybuzz::shape(face, &[], buffer);
                 let piece_len = range.len();
                 let piece_start = range.start;
-                let mut groups: Vec<(u32, f32, f32)> = Vec::new();
+                let mut groups: Vec<(u32, f32, f32, usize, usize)> = Vec::new();
                 for (info, pos) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
                     let advance = pos.x_advance as f32 * scale;
                     match groups.last_mut() {
-                        Some((c, _, x1)) if *c == info.cluster => *x1 = pen + advance,
-                        _ => groups.push((info.cluster, pen, pen + advance)),
+                        Some((c, _, x1, _, end)) if *c == info.cluster => {
+                            *x1 = pen + advance;
+                            *end = out.glyphs.len() + 1;
+                        }
+                        _ => groups.push((
+                            info.cluster,
+                            pen,
+                            pen + advance,
+                            out.glyphs.len(),
+                            out.glyphs.len() + 1,
+                        )),
                     }
                     out.glyphs.push(PlacedGlyph {
                         font,
@@ -325,13 +336,14 @@ pub(crate) fn shape_in(text: &str, size: f32, bold: bool, family: Family) -> Sha
                 }
                 let mut starts: Vec<u32> = groups.iter().map(|g| g.0).collect();
                 starts.sort_unstable();
-                for (cluster, x0, x1) in groups {
+                for (cluster, x0, x1, first, last) in groups {
                     let end = starts.iter().copied().find(|s| *s > cluster).map_or(piece_len, |s| s as usize);
                     out.clusters.push(ShapedCluster {
                         bytes: piece_start + cluster as usize..piece_start + end,
                         x0: x0.min(x1),
                         x1: x0.max(x1),
                         rtl,
+                        glyphs: first..last,
                     });
                 }
             }

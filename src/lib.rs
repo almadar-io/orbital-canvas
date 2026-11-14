@@ -669,6 +669,16 @@ impl SceneHost {
                 && self.scene.as_ref().is_some_and(|scene| {
                     mappers::emitter::any_live(scene, self.epoch_clock_ms)
                 }))
+            || (self.motion
+                && self.epoch_clock_ms > 0.0
+                && self.scene.as_ref().is_some_and(|scene| {
+                    mappers::text_reveal::any_live(scene, self.epoch_clock_ms)
+                }))
+            || (self.motion
+                && self.epoch_clock_ms > 0.0
+                && self.scene.as_ref().is_some_and(|scene| {
+                    mappers::game_canvas_2d::started_animation_live(scene, self.epoch_clock_ms)
+                }))
             || asset::pending() > 0
             || asset::generation() != self.asset_generation
     }
@@ -677,7 +687,10 @@ impl SceneHost {
     pub fn frame_packet(&self) -> Option<GameRenderPacket> {
         if self.motion && self.epoch_clock_ms > 0.0 {
             if let Some(scene) = self.scene.as_ref().filter(|scene| {
-                (mappers::game_canvas_2d::has_active_fx(scene) || mappers::emitter::has_emitter(scene))
+                (mappers::game_canvas_2d::has_active_fx(scene)
+                    || mappers::emitter::has_emitter(scene)
+                    || mappers::text_reveal::has_reveal(scene)
+                    || mappers::game_canvas_2d::has_started_animation(scene))
                     && matches!(
                         scene.get("type").and_then(serde_json::Value::as_str),
                         Some("canvas" | "canvas-2d")
@@ -766,15 +779,17 @@ impl SceneHost {
         }
     }
 
-    /// The wheel turned at a point (logical points): queues `wheelEvent` for the topmost region under it, or for
-    /// the canvas (`target` empty). Returns whether the canvas declares `wheelEvent`, the host's cue to keep the
-    /// wheel from the page.
+    /// The wheel turned at a point (logical points): when the canvas declares `wheelEvent` and the topmost region
+    /// under the point declared `wheel: true`, queues `wheelEvent` for it and returns true, the host's cue to keep
+    /// the wheel from the page. Anywhere else the wheel is the page's and nothing is sent.
     pub fn wheel(&mut self, x: f32, y: f32, dx: f32, dy: f32) -> bool {
         if self.canvas_event("wheelEvent").is_none() {
             return false;
         }
         let (x, y) = self.to_packet_units(x, y);
-        let target = self.region_at(x, y).map(|r| r.id.clone()).unwrap_or_default();
+        let Some(target) = self.region_at(x, y).filter(|r| r.wheel).map(|r| r.id.clone()) else {
+            return false;
+        };
         self.queue_canvas_event(
             "wheelEvent",
             serde_json::json!({ "target": target, "x": x, "y": y, "dx": dx, "dy": dy }),
@@ -1471,6 +1486,7 @@ mod tests {
                 leave: name("LEAVE"),
                 moved: name("MOVE"),
             },
+            wheel: false,
         }
     }
 
@@ -2648,6 +2664,97 @@ mod tests {
         );
     }
 
+    fn reveal_host(at: f64, motion: bool) -> Canvas {
+        let mut renderer = Canvas::new_headless().unwrap();
+        renderer.set_motion(motion);
+        renderer
+            .set_scene(serde_json::json!({
+                "type": "canvas", "mode": "2d", "projection": "free", "scale": 1,
+                "drawables": [{"type": "draw-text", "text": "abcdef", "color": "#000000",
+                    "font": "12px sans-serif", "anchor": "top-left", "position": {"x": 5, "y": 5},
+                    "reveal": {"startMs": 1000, "perGlyphMs": 100, "durationMs": 100}}]
+            }))
+            .unwrap();
+        renderer.set_epoch_clock(at);
+        renderer
+    }
+
+    fn painted_glyphs(renderer: &Canvas) -> Vec<String> {
+        renderer
+            .frame_packet()
+            .unwrap()
+            .draw_commands
+            .iter()
+            .filter_map(|c| match c {
+                packet::DrawCommand::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_text_reveal_wants_frames_while_it_runs_and_not_after() {
+        assert!(painted_glyphs(&reveal_host(500.0, true)).is_empty());
+        assert!(reveal_host(500.0, true).wants_frames(), "it has not started");
+        let mid = reveal_host(1250.0, true);
+        assert_eq!(painted_glyphs(&mid), ["a", "b", "c"]);
+        assert!(mid.wants_frames());
+        let done = reveal_host(1600.0, true);
+        assert_eq!(painted_glyphs(&done), ["abcdef"]);
+        assert!(!done.wants_frames(), "the reveal has ended");
+    }
+
+    #[test]
+    fn reduced_motion_draws_a_text_reveal_complete_and_asks_for_no_frames() {
+        let off = reveal_host(1050.0, false);
+        assert_eq!(painted_glyphs(&off), ["abcdef"]);
+        assert!(!off.wants_frames());
+        assert_eq!(painted_glyphs(&reveal_host(1050.0, true)), ["a"], "control: motion on reveals");
+    }
+
+    fn started_host(at: f64, motion: bool, looping: bool) -> Canvas {
+        let mut renderer = Canvas::new_headless().unwrap();
+        renderer.set_motion(motion);
+        renderer
+            .set_scene(serde_json::json!({
+                "type": "canvas", "mode": "2d", "projection": "free", "scale": 1,
+                "drawables": [{"type": "draw-text", "text": "hi", "color": "#000000",
+                    "font": "12px sans-serif", "position": {"x": 5, "y": 5},
+                    "animation": {"startMs": 5000, "durationMs": 1000, "loop": looping,
+                        "keyframes": [{"at": 0, "opacity": 1}, {"at": 1, "opacity": 0.25}]}}]
+            }))
+            .unwrap();
+        renderer.set_epoch_clock(at);
+        renderer
+    }
+
+    fn text_alpha(renderer: &Canvas) -> f32 {
+        renderer
+            .frame_packet()
+            .unwrap()
+            .draw_commands
+            .iter()
+            .find_map(|c| match c {
+                packet::DrawCommand::Text { color, .. } => Some(color[3]),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_start_ms_animation_wants_frames_until_it_ends_and_reduced_motion_shows_its_end() {
+        assert!(started_host(4000.0, true, false).wants_frames(), "it has not started");
+        let mid = started_host(5500.0, true, false);
+        assert!(mid.wants_frames() && (text_alpha(&mid) - 0.625).abs() < 1e-3);
+        let done = started_host(7000.0, true, false);
+        assert!(!done.wants_frames(), "it has ended");
+        assert!((text_alpha(&done) - 0.25).abs() < 1e-3);
+        assert!(started_host(7000.0, true, true).wants_frames(), "control: a loop never ends");
+        let off = started_host(4000.0, false, false);
+        assert!(!off.wants_frames());
+        assert!((text_alpha(&off) - 0.25).abs() < 1e-3, "reduced motion shows the end state");
+    }
+
     #[test]
     fn world_fx_remaps_at_the_epoch_clock_without_changing_kernel_ttl() {
         let mut renderer = Canvas::new_headless().unwrap();
@@ -2767,6 +2874,10 @@ mod tests {
 
     fn wheel_scene(declared: bool) -> serde_json::Value {
         let mut scene = moves_scene("all");
+        scene["drawables"][0]["wheel"] = serde_json::json!(true);
+        scene["drawables"].as_array_mut().unwrap().push(serde_json::json!({"type": "draw-shape", "id": "c",
+            "shape": "rect", "anchor": "top-left", "position": {"x": 0, "y": 50}, "width": 100, "height": 40,
+            "fill": "#000000", "hit": true}));
         if declared {
             scene["wheelEvent"] = serde_json::json!("WHEEL");
         }
@@ -2774,10 +2885,10 @@ mod tests {
     }
 
     #[test]
-    fn the_wheel_over_a_hit_region_sends_its_target_and_deltas() {
+    fn the_wheel_over_a_region_that_takes_it_sends_its_target_and_deltas() {
         let mut r = SceneHost::new();
         r.set_scene(wheel_scene(true)).unwrap();
-        assert!(r.wheel(10.0, 10.0, 3.0, -40.0), "a declared wheel is the canvas's");
+        assert!(r.wheel(10.0, 10.0, 3.0, -40.0), "a region declaring wheel keeps it from the page");
         let sent = r.take_scene_events();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].event, "WHEEL");
@@ -2785,13 +2896,19 @@ mod tests {
     }
 
     #[test]
-    fn the_wheel_off_every_region_targets_the_canvas() {
+    fn control_the_wheel_over_a_hit_region_without_wheel_is_the_pages() {
         let mut r = SceneHost::new();
         r.set_scene(wheel_scene(true)).unwrap();
-        r.wheel(150.0, 90.0, 0.0, 16.0);
-        let sent = r.take_scene_events();
-        assert_eq!(sent[0].payload["target"], serde_json::json!(""), "{:?}", sent[0].payload);
-        assert_eq!(sent[0].payload["dy"], serde_json::json!(16.0));
+        assert!(!r.wheel(10.0, 60.0, 0.0, 40.0), "a plain hit region leaves the wheel to the page");
+        assert!(r.take_scene_events().is_empty());
+    }
+
+    #[test]
+    fn control_the_wheel_off_every_region_is_the_pages() {
+        let mut r = SceneHost::new();
+        r.set_scene(wheel_scene(true)).unwrap();
+        assert!(!r.wheel(150.0, 120.0, 0.0, 16.0), "empty canvas leaves the wheel to the page");
+        assert!(r.take_scene_events().is_empty());
     }
 
     #[test]

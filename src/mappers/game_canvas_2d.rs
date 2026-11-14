@@ -50,6 +50,19 @@ fn gap_once(key: &'static str, detail: &str) {
     }
 }
 
+static FAILED_IMAGES: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
+
+/// An image that failed to load paints nothing and the rest of the scene paints; the failure is logged once per url.
+fn skip_failed_image(url: &str) {
+    let mut set = FAILED_IMAGES
+        .get_or_init(Default::default)
+        .write()
+        .expect("failed image log poisoned");
+    if set.insert(url.to_string()) {
+        tracing::warn!(target: NS, url = %url, "draw-sprite image failed to load; the sprite paints nothing");
+    }
+}
+
 /// `Canvas2D.tsx` `effectiveZoom` under `fit`: the grid's pixel extent (tile
 /// space) fitted into 85% of the viewport on the tighter axis.
 fn fit_zoom(projection: Projection, w: f32, h: f32, vw: f32, vh: f32) -> f32 {
@@ -71,6 +84,8 @@ pub struct Region {
     pub id: String,
     pub rect: Rect,
     pub rotation: f32,
+    /// The drawable declared `wheel: true`: the wheel over it is the canvas's, not the page's.
+    pub wheel: bool,
 }
 
 /// What the drawable walk gathers besides display commands: regions and measured texts, both in paint order.
@@ -100,6 +115,10 @@ fn hit_id(node: &Value) -> Option<&str> {
         .and_then(Value::as_bool)
         .filter(|hit| *hit)?;
     node.get("id").and_then(Value::as_str)
+}
+
+fn takes_wheel(node: &Value) -> bool {
+    node.get("wheel").and_then(Value::as_bool).unwrap_or(false)
 }
 
 /// Build a display-list packet from `canvas-2d` props (kernel-resolved).
@@ -504,6 +523,9 @@ fn walk_paint(
     gathered: &mut Gathered,
     out: &mut Vec<DrawCommand>,
 ) -> Result<(), CanvasSceneError> {
+    if let Some(animation) = node.get("animation") {
+        crate::animate::start_ms(animation).map_err(|detail| invalid("animation", detail))?;
+    }
     match node.get("type").and_then(Value::as_str) {
         Some("draw-sprite") => paint_sprite_gathering(
             node,
@@ -690,6 +712,55 @@ fn items(node: &Value) -> &[Value] {
         .unwrap_or(&[])
 }
 
+fn has_start(animation: &Value) -> bool {
+    matches!(crate::animate::start_ms(animation), Ok(Some(_)))
+}
+
+fn started_animations(node: &Value, f: &mut dyn FnMut(&Value)) {
+    if matches!(
+        node.get("type").and_then(Value::as_str),
+        Some("draw-shape" | "draw-group" | "draw-text")
+    ) {
+        if let Some(animation) = node.get("animation").filter(|a| has_start(a)) {
+            let plays = animation.get("durationMs").and_then(Value::as_f64).is_some_and(|v| v > 0.0)
+                && animation.get("keyframes").and_then(Value::as_array).is_some_and(|v| !v.is_empty());
+            if plays {
+                f(animation);
+            }
+        }
+    }
+    for key in ["props", "drawables", "children", "items"] {
+        match node.get(key) {
+            Some(Value::Array(items)) => items.iter().for_each(|i| started_animations(i, f)),
+            Some(child @ Value::Object(_)) => started_animations(child, f),
+            _ => {}
+        }
+    }
+}
+
+/// Whether any drawable under `node` declares an animation with a `startMs`.
+pub(crate) fn has_started_animation(node: &Value) -> bool {
+    let mut found = false;
+    started_animations(node, &mut |_| found = true);
+    found
+}
+
+/// Whether any `startMs` animation under `node` has yet to start, still plays or loops at the clock.
+pub(crate) fn started_animation_live(node: &Value, epoch_now_ms: f64) -> bool {
+    let mut live = false;
+    started_animations(node, &mut |animation| {
+        let (Ok(Some(start)), Some(duration)) = (
+            crate::animate::start_ms(animation),
+            animation.get("durationMs").and_then(Value::as_f64),
+        ) else {
+            return;
+        };
+        let looping = animation.get("loop").and_then(Value::as_bool) != Some(false);
+        live |= looping || epoch_now_ms < start + duration;
+    });
+    live
+}
+
 /// A live world FX layer needs the host's paint clock even when no authored
 /// packet keyframe animation is present.
 pub fn has_active_fx(node: &Value) -> bool {
@@ -721,7 +792,8 @@ pub fn has_active_fx(node: &Value) -> bool {
         node.get("type").and_then(Value::as_str),
         Some("draw-shape" | "draw-group" | "draw-text")
     ) && node.get("animation").is_some_and(|animation| {
-        animation
+        !has_start(animation)
+            && animation
             .get("durationMs")
             .and_then(Value::as_f64)
             .is_some_and(|v| v > 0.0)
@@ -768,9 +840,9 @@ fn paint_group(
     };
     let (gx, gy) = projector.project(position);
     let (zero_x, zero_y) = to_screen(0.0, 0.0);
-    let animation = (epoch_now_ms > 0.0)
-        .then(|| node.get("animation"))
-        .flatten();
+    let animation = node
+        .get("animation")
+        .filter(|a| crate::animate::plays_at(a, epoch_now_ms));
     let animated_number = |key: &str, default: f32| {
         animation
             .and_then(|animation| crate::animate::drawable_track(animation, epoch_now_ms, key))
@@ -1120,6 +1192,7 @@ fn paint_sprite_gathering(
                 id: id.to_string(),
                 rect,
                 rotation,
+                wheel: takes_wheel(node),
             });
         }
     }
@@ -1202,10 +1275,10 @@ fn commands_bounds(commands: &[DrawCommand]) -> Option<Rect> {
 
 /// The text with its keyframe `animation` resolved at the paint clock: `opacity`, `offsetX` and `offsetY`.
 fn animated_text(node: &Value, epoch_now_ms: f64) -> Option<Value> {
-    if epoch_now_ms <= 0.0 {
+    let animation = node.get("animation")?;
+    if !crate::animate::plays_at(animation, epoch_now_ms) {
         return None;
     }
-    let animation = node.get("animation")?;
     let mut animated = node.clone();
     let object = animated.as_object_mut()?;
     for key in ["opacity", "offsetX", "offsetY"] {
@@ -1376,6 +1449,7 @@ fn paint_text(
 ) -> Result<(), CanvasSceneError> {
     let animated = animated_text(node, epoch_now_ms);
     let node = animated.as_ref().unwrap_or(node);
+    let reveal = super::text_reveal::parse(node).map_err(|detail| invalid("reveal", detail))?;
     let Some(position) = node.get("position").and_then(parse_scene_pos) else {
         gap_once("text-position", "draw-text without position");
         return Ok(());
@@ -1467,28 +1541,49 @@ fn paint_text(
         );
         let line_px = size * line_height;
         let text_start = out.len();
-        for (i, line) in paragraph.lines.iter().enumerate() {
-            if line.is_empty() {
-                continue;
+        let revealed = reveal.as_ref().and_then(|reveal| {
+            let lines: Vec<super::text_reveal::Line> = paragraph
+                .lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| !line.is_empty())
+                .map(|(i, line)| {
+                    let w = crate::vector::shape(line, size, bold, family).width;
+                    super::text_reveal::Line {
+                        text: line,
+                        left: super::text_reveal::left_edge(align, sx, width, w),
+                        y: sy + (i as f32 + 0.5) * line_px,
+                    }
+                })
+                .collect();
+            super::text_reveal::paint(reveal, epoch_now_ms, &lines, size, bold, family, color, weight)
+        });
+        if let Some(commands) = revealed {
+            out.extend(commands);
+        } else {
+            for (i, line) in paragraph.lines.iter().enumerate() {
+                if line.is_empty() {
+                    continue;
+                }
+                let x = match align {
+                    TextAlign::Left => sx,
+                    TextAlign::Center => sx + width / 2.0,
+                    TextAlign::Right => sx + width,
+                };
+                out.push(DrawCommand::Text {
+                    text: line.clone(),
+                    pos: Vec2 {
+                        x,
+                        y: sy + (i as f32 + 0.5) * line_px,
+                    },
+                    size,
+                    color,
+                    align,
+                    weight,
+                    halo: None,
+                    family,
+                });
             }
-            let x = match align {
-                TextAlign::Left => sx,
-                TextAlign::Center => sx + width / 2.0,
-                TextAlign::Right => sx + width,
-            };
-            out.push(DrawCommand::Text {
-                text: line.clone(),
-                pos: Vec2 {
-                    x,
-                    y: sy + (i as f32 + 0.5) * line_px,
-                },
-                size,
-                color,
-                align,
-                weight,
-                halo: None,
-                family,
-            });
         }
         if let Some(positions) = editing.active().then(|| caret_positions(&paragraph.lines, text, size, bold, family)) {
             match positions {
@@ -1524,6 +1619,7 @@ fn paint_text(
                         h: height,
                     },
                     rotation: 0.0,
+                    wheel: takes_wheel(node),
                 });
                 if text == original {
                     if let Some(positions) = caret_positions(&paragraph.lines, text, size, bold, family) {
@@ -1615,6 +1711,7 @@ fn paint_text(
                         h,
                     },
                     rotation: 0.0,
+                    wheel: takes_wheel(node),
                 });
                 if text == original {
                     if let Some(mut positions) = caret_positions(&[text.to_string()], text, size, bold, family) {
@@ -1643,16 +1740,29 @@ fn paint_text(
         }
     }
     let text_start = out.len();
-    out.push(DrawCommand::Text {
-        text: text.to_owned(),
-        pos: Vec2 { x: sx, y: sy },
-        size,
-        color,
-        align,
-        weight,
-        halo: None,
-        family,
+    let revealed = reveal.as_ref().and_then(|reveal| {
+        let w = crate::vector::shape(text, size, bold, family).width;
+        let line = super::text_reveal::Line {
+            text,
+            left: super::text_reveal::left_edge(align, sx, 0.0, w),
+            y: sy,
+        };
+        super::text_reveal::paint(reveal, epoch_now_ms, &[line], size, bold, family, color, weight)
     });
+    if let Some(commands) = revealed {
+        out.extend(commands);
+    } else {
+        out.push(DrawCommand::Text {
+            text: text.to_owned(),
+            pos: Vec2 { x: sx, y: sy },
+            size,
+            color,
+            align,
+            weight,
+            halo: None,
+            family,
+        });
+    }
     if editing.active() {
         match caret_positions(&[text.to_string()], text, size, bold, family) {
             Some(mut positions) => {
@@ -1913,9 +2023,8 @@ fn paint_sprite(
     };
     let _ = asset::image_info(url);
     if asset::image_failed(url) {
-        return Err(CanvasSceneError::UnresolvedSprite(format!(
-            "image `{url}` failed to load"
-        )));
+        skip_failed_image(url);
+        return Ok(());
     }
     if node.get("shadow").is_some_and(|shadow| !shadow.is_null()) {
         gap_once(
@@ -1993,9 +2102,7 @@ fn paint_sprite(
     } else {
         let Some((w, h)) = asset::image_info(url) else {
             if asset::image_failed(url) {
-                return Err(CanvasSceneError::UnresolvedSprite(format!(
-                    "image `{url}` failed to load"
-                )));
+                skip_failed_image(url);
             }
             return Ok(());
         };
@@ -2067,10 +2174,10 @@ fn sprite_dst(
 }
 
 fn animated_shape(node: &Value, epoch_now_ms: f64) -> Option<Value> {
-    if epoch_now_ms <= 0.0 {
+    let animation = node.get("animation")?;
+    if !crate::animate::plays_at(animation, epoch_now_ms) {
         return None;
     }
-    let animation = node.get("animation")?;
     let mut animated = node.clone();
     let object = animated.as_object_mut()?;
     for key in [
@@ -2590,6 +2697,7 @@ fn paint_sdf_shape(
             id: id.to_string(),
             rect,
             rotation,
+            wheel: takes_wheel(node),
         });
     }
     out.push(DrawCommand::Sdf {
@@ -3013,6 +3121,7 @@ fn paint_vector_shape(
                 id: id.to_string(),
                 rect,
                 rotation: 0.0,
+                wheel: takes_wheel(node),
             });
         }
     }
@@ -3794,6 +3903,30 @@ mod tests {
                 "asset": {"url": "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2230%22%20height%3D%2210%22%2F%3E"}}]
         });
         assert!(from_props(&resolved).is_ok());
+    }
+
+    #[test]
+    fn an_image_that_fails_to_load_paints_nothing_and_the_rest_of_the_scene_paints() {
+        let bad = "data:image/png;base64,@@@";
+        crate::asset::ensure_asset(bad);
+        let scene = json!({
+            "projection": "free", "scale": 1.0,
+            "drawables": [
+                {"type": "draw-sprite", "id": "photo", "position": {"x": 0, "y": 0}, "anchor": "top-left",
+                    "width": 40, "height": 40, "asset": {"url": bad}, "semantic": {"role": "img", "name": "A portrait"}},
+                {"type": "draw-shape", "shape": "rect", "id": "card", "anchor": "top-left",
+                    "position": {"x": 0, "y": 50}, "width": 40, "height": 20, "fill": "#ff0000"}]
+        });
+        let packet = from_props(&scene).expect("one failed image does not refuse the scene");
+        assert!(
+            !packet.draw_commands.iter().any(|c| matches!(c, DrawCommand::Sprite { .. })),
+            "the failed image paints nothing"
+        );
+        assert!(
+            packet.draw_commands.iter().any(|c| matches!(c, DrawCommand::Quad { .. })),
+            "the rest of the scene paints: {:?}",
+            packet.draw_commands
+        );
     }
 
     #[test]
@@ -4889,6 +5022,233 @@ mod tests {
             !has_active_fx(&plain),
             "control: a plain text needs no frames"
         );
+    }
+
+    fn reveal_text(extra: Value, reveal: Value) -> Value {
+        let mut node = json!({"type": "draw-text", "text": "abcdef", "color": "#000000",
+            "font": "12px sans-serif", "anchor": "top-left", "position": {"x": 5, "y": 5}});
+        for (key, value) in extra.as_object().unwrap() {
+            node[key] = value.clone();
+        }
+        if !reveal.is_null() {
+            node["reveal"] = reveal;
+        }
+        free_props(json!([node]))
+    }
+
+    fn six_reveal() -> Value {
+        json!({"startMs": 1000, "perGlyphMs": 100, "durationMs": 100})
+    }
+
+    fn revealed_texts(props: &Value, at: f64) -> Vec<(String, f32, f32, f32)> {
+        from_props_at(props, at)
+            .unwrap()
+            .draw_commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::Text { text, color, pos, .. } => Some((text.clone(), color[3], pos.x, pos.y)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_reveal_draws_no_glyph_before_its_start_and_the_leading_glyphs_midway() {
+        let props = reveal_text(json!({}), six_reveal());
+        assert!(revealed_texts(&props, 500.0).is_empty(), "before the start nothing shows");
+        let mid = revealed_texts(&props, 1250.0);
+        let shown: Vec<&str> = mid.iter().map(|t| t.0.as_str()).collect();
+        assert_eq!(shown, ["a", "b", "c"], "the fourth glyph starts at 1300");
+        assert_eq!(mid[0].1, 1.0);
+        assert_eq!(mid[1].1, 1.0);
+        let eased = mid[2].1;
+        assert!(eased > 0.5 && eased < 1.0, "ease-out is past the linear half at t=0.5: {eased}");
+        let rest = revealed_texts(&reveal_text(json!({}), Value::Null), 1250.0);
+        assert!(mid[2].3 > rest[0].3, "an unfinished glyph sits lower than its place");
+        assert_eq!(mid[0].3, rest[0].3, "a finished glyph is at its place");
+    }
+
+    #[test]
+    fn a_finished_reveal_equals_the_text_without_reveal() {
+        let control = reveal_text(json!({}), Value::Null);
+        let done = reveal_text(json!({}), six_reveal());
+        assert_eq!(revealed_texts(&done, 1600.0), revealed_texts(&control, 1600.0));
+        assert_eq!(revealed_texts(&done, 0.0), revealed_texts(&control, 0.0), "no clock is the end state");
+        assert_ne!(revealed_texts(&done, 1250.0), revealed_texts(&control, 1250.0));
+    }
+
+    #[test]
+    fn a_reveal_offset_y_moves_unfinished_glyphs_and_defaults_to_six() {
+        let lift = |reveal: Value| {
+            let props = reveal_text(json!({}), reveal);
+            let rest = revealed_texts(&reveal_text(json!({}), Value::Null), 1000.0);
+            let first = revealed_texts(&props, 1000.0 + 1e-3);
+            first[0].3 - rest[0].3
+        };
+        assert!((lift(six_reveal()) - 6.0).abs() < 0.01);
+        assert!((lift(json!({"startMs": 1000, "perGlyphMs": 100, "durationMs": 100, "offsetY": 20})) - 20.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn an_invalid_reveal_is_a_scene_error_naming_reveal() {
+        for reveal in [
+            json!({"perGlyphMs": 100, "durationMs": 100}),
+            json!({"startMs": 1000, "durationMs": 100}),
+            json!({"startMs": 1000, "perGlyphMs": 100}),
+            json!({"startMs": -1, "perGlyphMs": 100, "durationMs": 100}),
+            json!({"startMs": 1000, "perGlyphMs": -5, "durationMs": 100}),
+            json!({"startMs": 1000, "perGlyphMs": 100, "durationMs": -1}),
+            json!({"startMs": 1000, "perGlyphMs": 100, "durationMs": 100, "offsetY": "up"}),
+            json!(7),
+        ] {
+            let bad = from_props(&reveal_text(json!({}), reveal.clone())).unwrap_err();
+            assert!(
+                matches!(&bad, CanvasSceneError::InvalidProp { field, .. } if field == "reveal"),
+                "{reveal}: {bad:?}"
+            );
+        }
+        assert!(from_props(&reveal_text(json!({}), six_reveal())).is_ok(), "control: a valid one maps");
+    }
+
+    #[test]
+    fn a_wrapped_paragraph_counts_glyphs_across_lines() {
+        let width = crate::vector::text_width("alpha beta", 12.0) + 0.5;
+        let extra = json!({"text": "alpha beta go on", "width": width});
+        let control = revealed_texts(&reveal_text(extra.clone(), Value::Null), 1000.0);
+        assert_eq!(control.len(), 2);
+        let first_line = control[0].0.chars().count();
+        let reveal = json!({"startMs": 1000, "perGlyphMs": 100, "durationMs": 100});
+        let props = reveal_text(extra, reveal);
+        let at = 1000.0 + first_line as f64 * 100.0 + 50.0;
+        let mid = revealed_texts(&props, at);
+        let second: Vec<&(String, f32, f32, f32)> = mid.iter().filter(|t| t.3 > control[1].3 - 1.0).collect();
+        assert_eq!(second.len(), 1, "only the first glyph of line two has started: {mid:?}");
+        assert_eq!(second[0].0, control[1].0.chars().next().unwrap().to_string());
+        let inked = control[0].0.chars().filter(|c| !c.is_whitespace()).count();
+        assert_eq!(mid.len(), inked + 1, "every inked glyph of line one shows: {mid:?}");
+        assert_eq!(revealed_texts(&props, 60_000.0), control);
+    }
+
+    #[test]
+    fn a_reveal_keeps_the_text_opacity_and_animation_and_starts_the_rightmost_unit_first_for_rtl() {
+        let dim = reveal_text(json!({"opacity": 0.5, "animation": {"durationMs": 1000, "keyframes": [
+            {"at": 0, "offsetX": 10}, {"at": 1, "offsetX": 10}]}}), six_reveal());
+        let plain = reveal_text(json!({"opacity": 0.5, "animation": {"durationMs": 1000, "keyframes": [
+            {"at": 0, "offsetX": 10}, {"at": 1, "offsetX": 10}]}}), Value::Null);
+        let shown = revealed_texts(&dim, 1150.0);
+        let rest = revealed_texts(&plain, 1150.0);
+        assert_eq!(shown[0].1, 0.5, "the glyph is at the text's own opacity once done");
+        assert!((shown[0].2 - rest[0].2).abs() < 1e-3, "offsetX of the animation applies");
+        let arabic = reveal_text(json!({"text": "الربيع"}), six_reveal());
+        let control = revealed_texts(&reveal_text(json!({"text": "الربيع"}), Value::Null), 1000.0);
+        let widest = |texts: &[(String, f32, f32, f32)]| texts.iter().map(|t| t.2).fold(f32::MIN, f32::max);
+        let first = revealed_texts(&arabic, 1050.0);
+        assert_eq!(first.len(), 1, "one unit has started: {first:?}");
+        assert!("الربيع".contains(first[0].0.as_str()));
+        let later = revealed_texts(&arabic, 1250.0);
+        assert!(later.len() >= 2, "more than one unit by then: {later:?}");
+        assert_eq!(widest(&later), first[0].2, "the first unit is the rightmost; later ones come in to its left");
+        assert!(first[0].2 > control[0].2, "reading starts right of the line's left edge");
+        assert_eq!(revealed_texts(&arabic, 60_000.0), control);
+        let latin = revealed_texts(&dim, 1250.0);
+        assert!(latin[0].2 < latin[1].2 && latin[1].2 < latin[2].2, "control: Latin starts leftmost and moves right");
+    }
+
+    fn started(extra: Value) -> Value {
+        let mut animation = json!({"durationMs": 1000, "loop": false, "keyframes": [
+            {"at": 0, "offsetX": 0, "opacity": 1}, {"at": 1, "offsetX": 20, "opacity": 0.25}]});
+        for (key, value) in extra.as_object().unwrap() {
+            animation[key] = value.clone();
+        }
+        animation
+    }
+
+    fn started_text(animation: Value) -> Value {
+        animated_text_props(animation)
+    }
+
+    #[test]
+    fn a_start_ms_text_animation_runs_from_its_start_and_without_it_runs_from_the_scene_clock() {
+        let props = started_text(started(json!({"startMs": 5000})));
+        let at = |t: f64| text_alpha_and_x(&from_props_at(&props, t).unwrap());
+        let (a0, x0) = at(4000.0);
+        assert_eq!(a0, 1.0, "before the start the first keyframe shows");
+        let (a1, x1) = at(5500.0);
+        assert!((a1 - 0.625).abs() < 1e-3 && (x1 - x0 - 10.0).abs() < 1e-3, "{a1} {x1}");
+        assert!((at(9000.0).0 - 0.25).abs() < 1e-3, "loop false clamps at the end");
+        assert!((at(0.0).0 - 0.25).abs() < 1e-3, "no clock is the end state");
+        let plain = started_text(started(json!({})));
+        let (control, _) = text_alpha_and_x(&from_props_at(&plain, 5500.0).unwrap());
+        assert!((control - 0.25).abs() < 1e-3, "control: without startMs it has long ended");
+        let (rest, _) = text_alpha_and_x(&from_props_at(&plain, 0.0).unwrap());
+        assert_eq!(rest, 1.0, "control: without startMs no clock draws the rest frame");
+    }
+
+    #[test]
+    fn a_looping_start_ms_animation_cycles_from_its_start() {
+        let props = started_text(started(json!({"startMs": 5000, "loop": true})));
+        let (alpha, _) = text_alpha_and_x(&from_props_at(&props, 6250.0).unwrap());
+        assert!((alpha - 0.8125).abs() < 1e-3, "a quarter into the second cycle: {alpha}");
+        let (before, _) = text_alpha_and_x(&from_props_at(&props, 4500.0).unwrap());
+        assert_eq!(before, 1.0);
+    }
+
+    fn debug_of(props: &Value, t: f64) -> String {
+        format!("{:?}", from_props_at(props, t).unwrap().draw_commands)
+    }
+
+    #[test]
+    fn a_start_ms_shape_and_group_animation_start_at_their_instant() {
+        let shape = |extra: Value, animation: Option<Value>| {
+            let mut node = rect_shape(extra);
+            if let Some(a) = animation {
+                node["animation"] = a;
+            }
+            free_props(json!([node]))
+        };
+        let slide = json!({"startMs": 5000, "keyframes": [{"at": 0, "offsetX": 0}, {"at": 1, "offsetX": 20}]});
+        let animated = shape(json!({}), Some(started(slide.clone())));
+        for (t, offset) in [(4000.0, 0), (5500.0, 10), (9000.0, 20)] {
+            assert_eq!(
+                debug_of(&animated, t),
+                debug_of(&shape(json!({"offsetX": offset}), None), 0.0),
+                "shape at {t}"
+            );
+        }
+        assert_eq!(
+            debug_of(&animated, 0.0),
+            debug_of(&shape(json!({"offsetX": 20}), None), 0.0),
+            "no clock is the end state"
+        );
+        let grouped = free_props(json!([{"type": "draw-group", "position": {"x": 0, "y": 0},
+            "items": [rect_shape(json!({}))], "animation": started(slide)}]));
+        let quad_x = |t: f64| match from_props_at(&grouped, t).unwrap().draw_commands.as_slice() {
+            [_, DrawCommand::Quad { rect, .. }] => rect.x,
+            other => panic!("one quad: {other:?}"),
+        };
+        assert_eq!(quad_x(4000.0), 10.0, "before the start the group rests at the first keyframe");
+        assert_eq!(quad_x(5500.0), 20.0);
+        assert_eq!(quad_x(9000.0), 30.0);
+        assert_eq!(quad_x(0.0), 30.0, "no clock is the end state");
+    }
+
+    #[test]
+    fn an_invalid_animation_start_ms_is_a_scene_error_naming_animation() {
+        for start in [json!(-1), json!("soon"), json!(true)] {
+            let animation = started(json!({"startMs": start}));
+            let mut shape = rect_shape(json!({}));
+            shape["animation"] = animation.clone();
+            let mut group = json!({"type": "draw-group", "position": {"x": 0, "y": 0}, "items": []});
+            group["animation"] = animation.clone();
+            for props in [free_props(json!([shape])), free_props(json!([group])), started_text(animation.clone())] {
+                let bad = from_props(&props).unwrap_err();
+                assert!(
+                    matches!(&bad, CanvasSceneError::InvalidProp { field, .. } if field == "animation"),
+                    "{start}: {bad:?}"
+                );
+            }
+        }
+        assert!(from_props(&started_text(started(json!({"startMs": 0})))).is_ok(), "control");
     }
 
     fn clipped_group(clip: Value) -> Value {

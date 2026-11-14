@@ -13,17 +13,46 @@ use std::f32::consts::TAU;
 
 /// One authored drawable animation track at the host paint clock. Shape,
 /// group, and mesh descriptors use the same keyframe contract.
+/// The epoch-ms instant a drawable animation starts at, when it declares one.
+pub fn start_ms(animation: &Value) -> Result<Option<f64>, String> {
+    match animation.get("startMs").filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(v) => v
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .map(Some)
+            .ok_or_else(|| "startMs must be a non-negative finite number".to_owned()),
+    }
+}
+
+/// Whether the animation plays at the paint clock: any running clock, or a `startMs` animation at no clock, which
+/// shows its end state.
+pub fn plays_at(animation: &Value, epoch_now_ms: f64) -> bool {
+    epoch_now_ms > 0.0 || matches!(start_ms(animation), Ok(Some(_)))
+}
+
 pub fn drawable_track(animation: &Value, time_ms: f64, key: &str) -> Option<Value> {
     let duration = animation.get("durationMs")?.as_f64()?;
     let frames = animation.get("keyframes")?.as_array()?;
     if !duration.is_finite() || duration <= 0.0 || frames.is_empty() {
         return None;
     }
-    let cycle = time_ms / duration;
-    let progress = if animation.get("loop").and_then(Value::as_bool) == Some(false) {
-        cycle.min(1.0)
-    } else {
-        cycle - cycle.floor()
+    let looping = animation.get("loop").and_then(Value::as_bool) != Some(false);
+    let local = match start_ms(animation).ok().flatten() {
+        None => Some(time_ms),
+        Some(_) if time_ms <= 0.0 => None,
+        Some(start) => Some((time_ms - start).max(0.0)),
+    };
+    let progress = match local {
+        None => 1.0,
+        Some(local) => {
+            let cycle = local / duration;
+            if looping {
+                cycle - cycle.floor()
+            } else {
+                cycle.min(1.0)
+            }
+        }
     };
     let mut defined: Vec<_> = frames
         .iter()

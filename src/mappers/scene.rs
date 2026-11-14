@@ -116,6 +116,8 @@ pub struct PointerRegion {
     pub rect: Rect,
     pub rotation: f32,
     pub events: PointerEvents,
+    /// The drawable declared `wheel: true`.
+    pub wheel: bool,
 }
 
 /// One node of a canvas's semantic tree: a drawable with `semantic` and `id`, at its pointer region
@@ -310,6 +312,7 @@ pub fn map_scene(
                 rect: region.rect,
                 rotation: region.rotation,
                 events: events.clone(),
+                wheel: region.wheel,
             })
             .collect(),
         measured: gathered.measured,
