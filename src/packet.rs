@@ -140,6 +140,10 @@ pub enum TextFamily {
     Sans,
     Mono,
     Serif,
+    /// Reem Kufi, the osama site's display face.
+    Display,
+    /// Cairo, the osama site's text face.
+    Body,
 }
 
 /// Horizontal text alignment against the anchor x.

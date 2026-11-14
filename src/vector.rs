@@ -33,6 +33,10 @@ static ARABIC_BOLD_BYTES: &[u8] = include_bytes!("../assets/fonts/NotoSansArabic
 static MONO_BYTES: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono-subset.ttf");
 static SERIF_REGULAR_BYTES: &[u8] = include_bytes!("../assets/fonts/Amiri-Regular.ttf");
 static SERIF_BOLD_BYTES: &[u8] = include_bytes!("../assets/fonts/Amiri-Bold.ttf");
+static DISPLAY_REGULAR_BYTES: &[u8] = include_bytes!("../assets/fonts/ReemKufi-Regular.ttf");
+static DISPLAY_BOLD_BYTES: &[u8] = include_bytes!("../assets/fonts/ReemKufi-Bold.ttf");
+static BODY_REGULAR_BYTES: &[u8] = include_bytes!("../assets/fonts/Cairo-Regular.ttf");
+static BODY_BOLD_BYTES: &[u8] = include_bytes!("../assets/fonts/Cairo-Bold.ttf");
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum FontId {
@@ -45,6 +49,12 @@ pub(crate) enum FontId {
     Serif,
     /// Amiri Bold.
     SerifBold,
+    /// Reem Kufi Regular: the family `Display` (Latin and Arabic).
+    Display,
+    DisplayBold,
+    /// Cairo Regular: the family `Body` (Latin and Arabic).
+    Body,
+    BodyBold,
     /// A face the host supplied for a script no bundled face covers (`add_font_face`).
     Host(u16),
 }
@@ -54,7 +64,14 @@ impl FontId {
     pub(crate) fn faux_bold(self) -> bool {
         !matches!(
             self,
-            FontId::ArabicRegular | FontId::ArabicBold | FontId::Serif | FontId::SerifBold
+            FontId::ArabicRegular
+                | FontId::ArabicBold
+                | FontId::Serif
+                | FontId::SerifBold
+                | FontId::Display
+                | FontId::DisplayBold
+                | FontId::Body
+                | FontId::BodyBold
         )
     }
 }
@@ -62,7 +79,7 @@ impl FontId {
 pub(crate) use crate::packet::TextFamily as Family;
 
 fn font_for(id: FontId) -> Option<&'static rustybuzz::Face<'static>> {
-    static FACES: OnceLock<[Option<rustybuzz::Face<'static>>; 6]> = OnceLock::new();
+    static FACES: OnceLock<[Option<rustybuzz::Face<'static>>; 10]> = OnceLock::new();
     let faces = FACES.get_or_init(|| {
         [
             rustybuzz::Face::from_slice(LATIN_BYTES, 0),
@@ -71,6 +88,10 @@ fn font_for(id: FontId) -> Option<&'static rustybuzz::Face<'static>> {
             rustybuzz::Face::from_slice(MONO_BYTES, 0),
             rustybuzz::Face::from_slice(SERIF_REGULAR_BYTES, 0),
             rustybuzz::Face::from_slice(SERIF_BOLD_BYTES, 0),
+            rustybuzz::Face::from_slice(DISPLAY_REGULAR_BYTES, 0),
+            rustybuzz::Face::from_slice(DISPLAY_BOLD_BYTES, 0),
+            rustybuzz::Face::from_slice(BODY_REGULAR_BYTES, 0),
+            rustybuzz::Face::from_slice(BODY_BOLD_BYTES, 0),
         ]
     });
     match id {
@@ -80,6 +101,10 @@ fn font_for(id: FontId) -> Option<&'static rustybuzz::Face<'static>> {
         FontId::Mono => faces[3].as_ref(),
         FontId::Serif => faces[4].as_ref(),
         FontId::SerifBold => faces[5].as_ref(),
+        FontId::Display => faces[6].as_ref(),
+        FontId::DisplayBold => faces[7].as_ref(),
+        FontId::Body => faces[8].as_ref(),
+        FontId::BodyBold => faces[9].as_ref(),
         FontId::Host(i) => host_fonts().read().ok()?.get(i as usize).map(|(_, f)| *f),
     }
 }
@@ -224,6 +249,16 @@ fn char_font(c: char, script: Script, bold: bool, family: Family) -> FontId {
         if font_for(serif).is_some_and(|f| f.glyph_index(c).is_some()) {
             return serif;
         }
+    }
+    let named = match (family, bold) {
+        (Family::Display, false) => Some(FontId::Display),
+        (Family::Display, true) => Some(FontId::DisplayBold),
+        (Family::Body, false) => Some(FontId::Body),
+        (Family::Body, true) => Some(FontId::BodyBold),
+        _ => None,
+    };
+    if let Some(named) = named.filter(|id| font_for(*id).is_some_and(|f| f.glyph_index(c).is_some())) {
+        return named;
     }
     if script == Script::Arabic {
         return if bold {
@@ -2003,5 +2038,49 @@ mod tests {
             .collect();
         let gids: Vec<u16> = shaped.glyphs.iter().rev().map(|g| g.gid).collect();
         assert_ne!(gids, nominal, "cursive forms, not the isolated letters");
+    }
+
+    #[test]
+    fn the_display_and_body_families_shape_in_their_own_faces_and_bold_takes_the_bold_file() {
+        for (family, regular, bold) in [
+            (Family::Display, FontId::Display, FontId::DisplayBold),
+            (Family::Body, FontId::Body, FontId::BodyBold),
+        ] {
+            for text in ["Hello", "مرحبا بك"] {
+                let ids = char_fonts(text, false, family);
+                assert!(ids.iter().all(|f| *f == regular), "{family:?} {text}: {ids:?}");
+                let ids = char_fonts(text, true, family);
+                assert!(ids.iter().all(|f| *f == bold), "{family:?} bold {text}: {ids:?}");
+                let sans = shape(text, 20.0, false, Family::Sans).width;
+                let own = shape(text, 20.0, false, family).width;
+                assert!((sans - own).abs() > 0.5, "{family:?} {text} is a different width from sans: {sans} {own}");
+            }
+            let outline = |id: FontId| {
+                let face = font_for(id).unwrap();
+                let bbox = face.glyph_bounding_box(face.glyph_index('H').unwrap()).unwrap();
+                (bbox.x_min, bbox.x_max, bbox.y_max)
+            };
+            assert_ne!(outline(regular), outline(bold), "the bold file draws its own shapes");
+            assert!(!regular.faux_bold() && !bold.faux_bold(), "a real bold file is not emboldened by stroking");
+        }
+        assert_eq!(
+            char_fonts("Hello", false, Family::Sans),
+            vec![FontId::Latin; 5],
+            "control: sans stays in the sans face"
+        );
+    }
+
+    #[test]
+    fn display_and_body_cover_latin_and_the_arabic_letters() {
+        for id in [FontId::Display, FontId::DisplayBold, FontId::Body, FontId::BodyBold] {
+            let face = font_for(id).unwrap();
+            let covered = |range: std::ops::RangeInclusive<u32>| {
+                range.filter(|c| char::from_u32(*c).is_some_and(|c| face.glyph_index(c).is_some())).count()
+            };
+            assert!("AZaz09 .,".chars().all(|c| face.glyph_index(c).is_some()), "{id:?} Latin");
+            let letters = covered(0x621..=0x64A);
+            println!("{id:?}: arabic letters {letters}/37, marks 064B-0652 {}/8, digits 0660-0669 {}/10, lam-alef U+FEFB {}", covered(0x64B..=0x652), covered(0x660..=0x669), covered(0xFEFB..=0xFEFB));
+            assert_eq!(letters, 37, "{id:?} carries every assigned Arabic letter (U+063B-063F are unassigned)");
+        }
     }
 }

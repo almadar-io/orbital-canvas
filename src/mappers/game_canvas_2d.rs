@@ -526,6 +526,18 @@ fn walk_paint(
     if let Some(animation) = node.get("animation") {
         crate::animate::start_ms(animation).map_err(|detail| invalid("animation", detail))?;
     }
+    if node.get("type").and_then(Value::as_str) == Some("draw-shape")
+        && node.get("shape").and_then(Value::as_str) == Some("path")
+    {
+        match node.get("scale") {
+            None | Some(Value::Null) => {}
+            Some(scale) => {
+                if !scale.as_f64().is_some_and(|n| n.is_finite() && n > 0.0) {
+                    return Err(invalid("scale", "must be a number above zero"));
+                }
+            }
+        }
+    }
     match node.get("type").and_then(Value::as_str) {
         Some("draw-sprite") => paint_sprite_gathering(
             node,
@@ -1499,6 +1511,27 @@ fn paint_text(
     let original = text;
     let shown = editing.shown(text);
     let text = shown.as_str();
+    let max_width = match node.get("maxWidth") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_f64() {
+            Some(w) if w.is_finite() && w > 0.0 => Some(w as f32 * zoom),
+            _ => return Err(invalid("maxWidth", "must be a number above zero")),
+        },
+    };
+    if max_width.is_some() && node.get("width").is_some_and(|w| !w.is_null()) {
+        return Err(invalid(
+            "maxWidth",
+            "a paragraph with a width wraps or truncates in its own box; maxWidth is for one line",
+        ));
+    }
+    // like Canvas2D fillText's maxWidth: one line wider than it is drawn smaller, so it fits
+    let size = match max_width {
+        Some(limit) => {
+            let natural = crate::vector::shape(text, size, bold, family).width;
+            if natural > limit { size * limit / natural } else { size }
+        }
+        None => size,
+    };
     let id = node.get("id").and_then(Value::as_str);
     let measure = node
         .get("measure")
@@ -1934,13 +1967,22 @@ pub(crate) fn parse_text_font(
     if !size.is_finite() || size <= 0.0 {
         return None;
     }
-    let family = tokens.collect::<Vec<_>>().join(" ");
-    match family.as_str() {
-        "sans-serif" | "system-ui" | "system-ui, sans-serif" => {
-            Some((size, weight, TextFamily::Sans))
-        }
-        "monospace" => Some((size, weight, TextFamily::Mono)),
-        "serif" => Some((size, weight, TextFamily::Serif)),
+    let list = tokens.collect::<Vec<_>>().join(" ");
+    list.split(',')
+        .find_map(|name| named_family(name.trim()))
+        .map(|family| (size, weight, family))
+}
+
+/// The family of the pack that a CSS family name is, or `None` for a name the pack does not carry.
+fn named_family(name: &str) -> Option<crate::packet::TextFamily> {
+    use crate::packet::TextFamily;
+    let name = name.trim_matches(|c| c == '\'' || c == '"').to_ascii_lowercase();
+    match name.as_str() {
+        "sans-serif" | "system-ui" => Some(TextFamily::Sans),
+        "monospace" => Some(TextFamily::Mono),
+        "serif" => Some(TextFamily::Serif),
+        "reem kufi" => Some(TextFamily::Display),
+        "cairo" => Some(TextFamily::Body),
         _ => None,
     }
 }
@@ -3031,7 +3073,7 @@ fn paint_vector_shape(
             let Some(segments) = parse_path_data(
                 d,
                 Xf {
-                    s: tw * zoom,
+                    s: tw * zoom * get_f32(node, "scale", 1.0),
                     ox,
                     oy,
                 },
@@ -3756,6 +3798,20 @@ mod tests {
     }
 
     #[test]
+    fn a_css_family_list_takes_the_first_family_the_pack_carries() {
+        let family = |font: &str| parse_text_font(Some(font)).map(|f| (f.1, f.2));
+        assert_eq!(family("700 26px 'Reem Kufi', serif"), Some((700, TextFamily::Display)));
+        assert_eq!(family("16px \"Cairo\", sans-serif"), Some((400, TextFamily::Body)));
+        assert_eq!(family("16px cairo"), Some((400, TextFamily::Body)));
+        assert_eq!(family("16px REEM KUFI"), Some((400, TextFamily::Display)));
+        assert_eq!(family("16px Foo, sans-serif"), Some((400, TextFamily::Sans)));
+        assert_eq!(family("16px Foo, Bar, monospace"), Some((400, TextFamily::Mono)));
+        assert_eq!(family("16px system-ui, sans-serif"), Some((400, TextFamily::Sans)));
+        assert_eq!(family("16px Foo"), None, "control: no family the pack carries");
+        assert_eq!(family("16px Foo, Bar"), None);
+    }
+
+    #[test]
     fn unsupported_text_font_and_baseline_do_not_silently_change_contract() {
         let p = packet_for(json!({
             "projection": "free",
@@ -3927,6 +3983,58 @@ mod tests {
             "the rest of the scene paints: {:?}",
             packet.draw_commands
         );
+    }
+
+    fn text_size(scene: &Value) -> f32 {
+        let packet = from_props(scene).expect("scene maps");
+        packet
+            .draw_commands
+            .iter()
+            .find_map(|c| match c {
+                DrawCommand::Text { size, .. } => Some(*size),
+                _ => None,
+            })
+            .expect("a text command")
+    }
+
+    fn label(extra: Value) -> Value {
+        let mut node = json!({"type": "draw-text", "id": "t", "text": "The Bootloader of Knowledge",
+            "position": {"x": 100, "y": 20}, "anchor": "top-left", "align": "center", "baseline": "middle",
+            "color": "#ffffff", "font": "600 20px sans-serif"});
+        for (k, v) in extra.as_object().unwrap() {
+            node[k] = v.clone();
+        }
+        json!({"projection": "free", "scale": 1.0, "drawables": [node]})
+    }
+
+    #[test]
+    fn a_single_line_text_wider_than_its_max_width_is_drawn_smaller_to_fit() {
+        let natural = crate::vector::shape("The Bootloader of Knowledge", 20.0, true, crate::packet::TextFamily::Sans).width;
+        assert!(natural > 120.0, "the label is wider than the box: {natural}");
+        let size = text_size(&label(json!({"maxWidth": 120})));
+        assert!(size < 20.0, "drawn smaller: {size}");
+        let fitted = crate::vector::shape("The Bootloader of Knowledge", size, true, crate::packet::TextFamily::Sans).width;
+        assert!(fitted <= 120.5, "fits its max width: {fitted}");
+    }
+
+    #[test]
+    fn control_a_text_narrower_than_its_max_width_keeps_its_size() {
+        assert_eq!(text_size(&label(json!({"maxWidth": 900}))), 20.0);
+        assert_eq!(text_size(&label(json!({}))), 20.0, "no max width");
+    }
+
+    #[test]
+    fn an_invalid_max_width_is_a_scene_error_naming_it() {
+        for bad in [json!(0), json!(-4), json!("wide")] {
+            assert!(matches!(
+                from_props(&label(json!({"maxWidth": bad}))),
+                Err(CanvasSceneError::InvalidProp { ref field, .. }) if field == "maxWidth"
+            ), "{bad}");
+        }
+        assert!(matches!(
+            from_props(&label(json!({"maxWidth": 100, "width": 200}))),
+            Err(CanvasSceneError::InvalidProp { ref field, .. }) if field == "maxWidth"
+        ), "a paragraph box has its own width");
     }
 
     #[test]
@@ -5249,6 +5357,48 @@ mod tests {
             }
         }
         assert!(from_props(&started_text(started(json!({"startMs": 0})))).is_ok(), "control");
+    }
+
+    #[test]
+    fn a_path_scale_multiplies_its_coordinates_and_an_invalid_one_is_a_scene_error() {
+        let path = |extra: Value| {
+            let mut node = json!({"type": "draw-shape", "shape": "path", "d": "M0 0 L24 0",
+                "position": {"x": 10, "y": 10}, "stroke": "#000000", "strokeWidth": 1});
+            for (key, value) in extra.as_object().unwrap() {
+                node[key] = value.clone();
+            }
+            free_props(json!([node]))
+        };
+        let length = |props: &Value| {
+            let packet = from_props(props).unwrap();
+            let points: Vec<Vec2> = packet
+                .draw_commands
+                .iter()
+                .find_map(|c| match c {
+                    DrawCommand::Path { segments, .. } | DrawCommand::GradientPath { segments, .. } => Some(
+                        segments
+                            .iter()
+                            .filter_map(|s| match s {
+                                PathSegment::MoveTo { x, y } | PathSegment::LineTo { x, y } => Some(Vec2 { x: *x, y: *y }),
+                                _ => None,
+                            })
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .expect("a path");
+            points[1].x - points[0].x
+        };
+        assert!((length(&path(json!({}))) - 24.0).abs() < 1e-3, "control: scale 1");
+        assert!((length(&path(json!({"scale": 1}))) - 24.0).abs() < 1e-3);
+        assert!((length(&path(json!({"scale": 0.5}))) - 12.0).abs() < 1e-3);
+        for bad in [json!(0), json!(-1), json!("big")] {
+            let err = from_props(&path(json!({"scale": bad.clone()}))).unwrap_err();
+            assert!(
+                matches!(&err, CanvasSceneError::InvalidProp { field, .. } if field == "scale"),
+                "{bad}: {err:?}"
+            );
+        }
     }
 
     fn clipped_group(clip: Value) -> Value {
