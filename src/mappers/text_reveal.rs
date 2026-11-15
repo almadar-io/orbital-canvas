@@ -207,6 +207,7 @@ pub(crate) fn paint(
             let mut tint = color;
             tint[3] *= factor;
             out.push(DrawCommand::Text {
+                color_runs: Vec::new(),
                 text: text.to_owned(),
                 pos: Vec2 {
                     x: line.left + unit.x0,

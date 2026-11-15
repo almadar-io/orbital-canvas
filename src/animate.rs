@@ -4,7 +4,7 @@
 //! not elapsed and a finished animation all draw it unchanged.
 
 use crate::packet::{
-    Animation, DrawCommand, Easing, FillPattern, GameRenderPacket, Gradient, Halo, PathSegment,
+    Animation, ColorRun, DrawCommand, Easing, FillPattern, GameRenderPacket, Gradient, Halo, PathSegment,
     Stroke, Vec2,
 };
 use serde_json::Value;
@@ -519,6 +519,7 @@ impl Xform {
                 weight,
                 halo,
                 family,
+                color_runs,
             } => DrawCommand::Text {
                 text: text.clone(),
                 pos: self.point(*pos),
@@ -527,6 +528,10 @@ impl Xform {
                 align: *align,
                 weight: *weight,
                 family: *family,
+                color_runs: color_runs
+                    .iter()
+                    .map(|run| ColorRun { color: self.color(run.color), ..*run })
+                    .collect(),
                 halo: halo.map(|h| Halo {
                     color: self.color(h.color),
                     width: h.width * self.scale,
@@ -1168,6 +1173,7 @@ mod tests {
     fn text_and_lines_scale_and_fade_with_the_group() {
         let cmds = vec![
             DrawCommand::Text {
+                color_runs: Vec::new(),
                 text: "x".into(),
                 pos: Vec2 { x: 70.0, y: 40.0 },
                 size: 10.0,

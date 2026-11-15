@@ -1009,6 +1009,7 @@ pub fn paint(shape: &Shape, ctx: &PaintCtx, out: &mut Vec<DrawCommand>) {
             });
             let (tx, ty) = xf.p(x, y);
             out.push(DrawCommand::Text {
+                color_runs: Vec::new(),
                 text,
                 pos: Vec2 { x: tx, y: ty },
                 size: px * xf.s,

@@ -416,6 +416,7 @@ impl GlyphPass {
             weight,
             halo: None,
             family,
+            color_runs,
         } = command
         else {
             return None;
@@ -424,14 +425,15 @@ impl GlyphPass {
         let layout = vector::text_layout(text, *pos, *size, *align, bold, *family)?;
         let px = *size * (scale.0 + scale.1) / 2.0;
         let size_q = (px * QUARTERS).round().max(1.0) as u32;
-        let color = color.map(|c| c.clamp(0.0, 1.0));
+        let clamp = |c: [f32; 4]| c.map(|v| v.clamp(0.0, 1.0));
+        let colors = vector::glyph_colors(text, &layout.shaped, *color, color_runs);
         let (tw, th) = (target.0 as f32, target.1 as f32);
         let quarter = |v: f32| {
             let q = (v * QUARTERS).round() as i64;
             (q.div_euclid(4) as i32, q.rem_euclid(4) as u8)
         };
         let mut runs: Vec<(u64, Vec<GlyphInstance>)> = Vec::new();
-        for g in &layout.shaped.glyphs {
+        for (g, color) in layout.shaped.glyphs.iter().zip(colors) {
             let (ix, qx) = quarter((layout.x0 + g.x) * scale.0);
             let (iy, qy) = quarter((layout.baseline + g.y) * scale.1);
             let key = GlyphKey {
@@ -460,7 +462,7 @@ impl GlyphPass {
                     (entry.x + entry.width) as f32 / ps,
                     (entry.y + entry.height) as f32 / ps,
                 ],
-                color,
+                color: clamp(color),
             };
             match runs.iter_mut().find(|(p, _)| *p == page) {
                 Some((_, list)) => list.push(instance),

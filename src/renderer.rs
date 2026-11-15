@@ -2989,6 +2989,7 @@ mod vector_layer_tests {
 
     fn word(text: &str, x: f32, y: f32, size: f32) -> DrawCommand {
         DrawCommand::Text {
+            color_runs: Vec::new(),
             text: text.into(),
             pos: Vec2 { x, y },
             size,
@@ -3082,6 +3083,37 @@ mod vector_layer_tests {
             hidden.chunks_exact(4).all(|p| p[0] == 0 && p[2] == 255),
             "control: the quad last covers the text"
         );
+    }
+
+    #[test]
+    fn atlas_glyph_instances_carry_their_runs_colour() {
+        let Some(mut r) = renderer() else { return };
+        let cell = crate::vector::shape("W", 40.0, false, crate::vector::Family::Sans).width;
+        let run = |runs: Vec<crate::packet::ColorRun>| match word("WWW", 4.0, 60.0, 40.0) {
+            DrawCommand::Text { text, pos, size, color, align, weight, halo, family, .. } => {
+                DrawCommand::Text { text, pos, size, color, align, weight, halo, family, color_runs: runs }
+            }
+            other => other,
+        };
+        let ink = |rgba: &[u8], k: u32| -> Vec<[u8; 4]> {
+            let x0 = (4.0 + cell * (k as f32 + 0.25)) as u32;
+            let x1 = (4.0 + cell * (k as f32 + 0.75)) as u32;
+            (0..SIDE).flat_map(|y| (x0..x1).map(move |x| (x, y))).map(|(x, y)| px(rgba, SIDE, x, y)).filter(|p| p[3] > 240).collect()
+        };
+        let Some(striped) = draw(&mut r, &text_packet(vec![run(vec![crate::packet::ColorRun { from: 1, to: 2, color: BLUE }])]), SIDE) else {
+            return;
+        };
+        let red = |p: &[u8; 4]| p[0] > 240 && p[2] < 15;
+        let blue = |p: &[u8; 4]| p[2] > 240 && p[0] < 15;
+        for (k, want_blue) in [(0, false), (1, true), (2, false)] {
+            let pixels = ink(&striped, k);
+            assert!(!pixels.is_empty(), "glyph {k} inks");
+            assert!(pixels.iter().all(|p| if want_blue { blue(p) } else { red(p) }), "glyph {k}");
+        }
+        let Some(plain) = draw(&mut r, &text_packet(vec![run(Vec::new())]), SIDE) else {
+            return;
+        };
+        assert!(ink(&plain, 1).iter().all(red), "control: without runs the middle glyph is the base colour");
     }
 
     #[test]
@@ -3204,6 +3236,7 @@ mod vector_layer_tests {
             }),
         };
         let text = DrawCommand::Text {
+            color_runs: Vec::new(),
             text: "W".into(),
             pos: Vec2 { x: 8.0, y: 8.0 },
             size: 12.0,

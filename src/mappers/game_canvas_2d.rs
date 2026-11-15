@@ -22,7 +22,7 @@ use crate::atlas;
 use crate::mappers::learning::shape::parse_path_data;
 use crate::mappers::learning::Xf;
 use crate::packet::{
-    DrawCommand, FillPattern, GameRenderPacket, Gradient, GradientStop, LineCap, LineJoin,
+    ColorRun, DrawCommand, FillPattern, GameRenderPacket, Gradient, GradientStop, LineCap, LineJoin,
     PathSegment, Rect, SdfKind, SdfMaterial, SdfShadow, SdfStroke, Stroke, TextAlign, Vec2,
 };
 use crate::projector::{Anchor, Projection, Projector, ScenePos, TILE_WIDTH};
@@ -1462,6 +1462,55 @@ fn paint_editing(
     }
 }
 
+/// A `draw-text`'s `colorRuns`: character ranges `[from, to)` of `text`, sorted and apart, each with its own colour
+/// (its alpha scaled by `opacity`, as the node's own colour is).
+fn read_color_runs(node: &Value, text: &str, opacity: f32) -> Result<Vec<ColorRun>, CanvasSceneError> {
+    let items = match node.get("colorRuns") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(items)) => items,
+        Some(_) => return Err(invalid("colorRuns", "must be a list of { from, to, color }")),
+    };
+    let length = text.chars().count();
+    let mut runs: Vec<ColorRun> = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let index = |field: &str| match item.get(field).and_then(Value::as_f64) {
+            Some(v) if v.is_finite() && v >= 0.0 && v.fract() == 0.0 => Ok(v as usize),
+            _ => Err(invalid("colorRuns", format!("run {i}: `{field}` must be a whole number of zero or more"))),
+        };
+        let (from, to) = (index("from")?, index("to")?);
+        if from >= to {
+            return Err(invalid("colorRuns", format!("run {i}: `from` ({from}) must be below `to` ({to})")));
+        }
+        if to > length {
+            return Err(invalid("colorRuns", format!("run {i}: `to` ({to}) is past the text's {length} characters")));
+        }
+        if let Some(previous) = runs.last() {
+            if from < previous.from {
+                return Err(invalid("colorRuns", format!("run {i}: runs must be sorted by `from`")));
+            }
+            if from < previous.to {
+                return Err(invalid("colorRuns", format!("run {i}: overlaps the run before it")));
+            }
+        }
+        let Some(mut color) = item.get("color").and_then(Value::as_str).and_then(parse_css_color) else {
+            return Err(invalid("colorRuns", format!("run {i}: `color` is not a supported CSS color")));
+        };
+        color[3] *= opacity;
+        runs.push(ColorRun { from, to, color });
+    }
+    Ok(runs)
+}
+
+/// The runs that fall on the line of `len` characters starting at index `start` of the text, as indices of that line.
+fn runs_on_line(runs: &[ColorRun], start: usize, len: usize) -> Vec<ColorRun> {
+    runs.iter()
+        .filter_map(|run| {
+            let (from, to) = (run.from.max(start), run.to.min(start + len));
+            (from < to).then_some(ColorRun { from: from - start, to: to - start, color: run.color })
+        })
+        .collect()
+}
+
 fn paint_text(
     node: &Value,
     projector: &Projector,
@@ -1520,6 +1569,13 @@ fn paint_text(
     };
     let bold = weight >= 600;
     let editing = TextEditing::read(node)?;
+    let color_runs: Vec<ColorRun> = read_color_runs(node, text, get_f32(node, "opacity", 1.0))?
+        .into_iter()
+        .map(|run| ColorRun { from: editing.shown_index(run.from), to: editing.shown_index(run.to), color: run.color })
+        .collect();
+    if reveal.is_some() && !color_runs.is_empty() {
+        return Err(invalid("colorRuns", "a text with a reveal paints one colour; colorRuns cannot combine with reveal"));
+    }
     let original = text;
     let shown = editing.shown(text);
     let text = shown.as_str();
@@ -1627,6 +1683,7 @@ fn paint_text(
                     weight,
                     halo: None,
                     family,
+                    color_runs: runs_on_line(&color_runs, paragraph.starts[i], line.chars().count()),
                 });
             }
         }
@@ -1806,6 +1863,7 @@ fn paint_text(
             weight,
             halo: None,
             family,
+            color_runs: color_runs.clone(),
         });
     }
     if editing.active() {
@@ -1832,6 +1890,8 @@ fn paint_text(
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Paragraph {
     pub lines: Vec<String>,
+    /// The index in the text of each line's first character.
+    pub starts: Vec<usize>,
     pub widths: Vec<f32>,
 }
 
@@ -1862,27 +1922,40 @@ pub(crate) fn layout_paragraph(
     } = frame;
     let measure = |s: &str| crate::vector::shape(s, size, bold, family).width;
     let mut lines: Vec<String> = Vec::new();
+    let mut starts: Vec<usize> = Vec::new();
+    let mut hard_start = 0;
     for hard in text.split('\n') {
+        let hard_chars = hard.chars().count();
         if !wrap {
             lines.push(hard.trim_end().to_string());
+            starts.push(hard_start);
+            hard_start += hard_chars + 1;
             continue;
         }
         let mut line = String::new();
+        let mut line_start = hard_start;
+        let mut segment_start = hard_start;
         for segment in break_segments(hard) {
             let candidate = format!("{line}{segment}");
             if line.is_empty() || measure(candidate.trim_end()) <= width {
                 line = candidate;
             } else {
                 lines.push(line.trim_end().to_string());
+                starts.push(line_start);
                 line = segment.to_string();
+                line_start = segment_start;
             }
+            segment_start += segment.chars().count();
         }
         lines.push(line.trim_end().to_string());
+        starts.push(line_start);
+        hard_start += hard_chars + 1;
     }
     let mut cut = false;
     if let Some(max) = max_lines {
         if lines.len() > max {
             lines.truncate(max);
+            starts.truncate(max);
             cut = true;
         }
     }
@@ -1895,7 +1968,7 @@ pub(crate) fn layout_paragraph(
         }
     }
     let widths = lines.iter().map(|line| measure(line.as_str())).collect();
-    Paragraph { lines, widths }
+    Paragraph { lines, starts, widths }
 }
 
 /// `line` with its tail replaced by an ellipsis so that it fits `width`.
@@ -3681,6 +3754,125 @@ mod tests {
         let w = crate::vector::shape("ab", 20.0, false, TextFamily::Sans).width;
         assert!((quads(&p)[0].w - w).abs() < 0.01);
         assert!(quads(&packet_for(editable(json!({ "selectionStart": 1, "selectionEnd": 1 })))).is_empty(), "control: an empty selection paints no band");
+    }
+
+    const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+    fn text_commands(p: &GameRenderPacket) -> Vec<(String, [f32; 4], Vec<ColorRun>)> {
+        p.draw_commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::Text { text, color, color_runs, .. } => Some((text.clone(), *color, color_runs.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn colour_run_error(extra: Value) -> String {
+        match from_props(&editable(extra)).unwrap_err() {
+            CanvasSceneError::InvalidProp { field, detail } => {
+                assert_eq!(field, "colorRuns", "{detail}");
+                detail
+            }
+            other => panic!("not an invalid prop: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_colour_run_colours_exactly_its_characters_and_the_rest_keeps_the_base_colour() {
+        let p = packet_for(editable(json!({ "text": "abcd", "colorRuns": [{ "from": 1, "to": 3, "color": "#ff0000" }] })));
+        let cmds = text_commands(&p);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].1, WHITE, "the node's own colour stays the base");
+        assert_eq!(cmds[0].2, vec![ColorRun { from: 1, to: 3, color: RED }]);
+        let shaped = crate::vector::shape("abcd", 20.0, false, TextFamily::Sans);
+        assert_eq!(crate::vector::glyph_colors("abcd", &shaped, WHITE, &cmds[0].2), vec![WHITE, RED, RED, WHITE]);
+    }
+
+    #[test]
+    fn control_a_text_without_colour_runs_is_the_packet_it_was_and_serializes_no_runs() {
+        let plain = packet_for(editable(json!({ "text": "abcd" })));
+        let empty = packet_for(editable(json!({ "text": "abcd", "colorRuns": [] })));
+        let null = packet_for(editable(json!({ "text": "abcd", "colorRuns": null })));
+        assert_eq!(format!("{:?}", plain.draw_commands), format!("{:?}", empty.draw_commands));
+        assert_eq!(format!("{:?}", plain.draw_commands), format!("{:?}", null.draw_commands));
+        assert!(text_commands(&plain)[0].2.is_empty());
+        let wire = serde_json::to_value(&plain.draw_commands).unwrap();
+        assert!(wire.to_string().find("color_runs").is_none(), "{wire}");
+    }
+
+    #[test]
+    fn adjacent_colour_runs_each_take_their_own_colour() {
+        let p = packet_for(editable(json!({ "text": "abcd", "colorRuns": [
+            { "from": 0, "to": 2, "color": "#ff0000" }, { "from": 2, "to": 3, "color": "#0000ff" }] })));
+        let runs = &text_commands(&p)[0].2;
+        assert_eq!(runs, &vec![ColorRun { from: 0, to: 2, color: RED }, ColorRun { from: 2, to: 3, color: BLUE }]);
+        let shaped = crate::vector::shape("abcd", 20.0, false, TextFamily::Sans);
+        assert_eq!(crate::vector::glyph_colors("abcd", &shaped, WHITE, runs), vec![RED, RED, BLUE, WHITE]);
+    }
+
+    #[test]
+    fn a_colour_run_across_a_wrapped_line_break_splits_into_each_lines_own_indices() {
+        let wrapped = |extra: Value| {
+            let mut props = json!({ "text": "aaa bbb ccc", "width": 50, "colorRuns": [{ "from": 2, "to": 9, "color": "#ff0000" }] });
+            for (k, v) in extra.as_object().unwrap() {
+                props[k] = v.clone();
+            }
+            text_commands(&packet_for(editable(props)))
+        };
+        let cmds = wrapped(json!({}));
+        let lines: Vec<&str> = cmds.iter().map(|c| c.0.as_str()).collect();
+        assert_eq!(lines, vec!["aaa", "bbb", "ccc"]);
+        assert_eq!(cmds[0].2, vec![ColorRun { from: 2, to: 3, color: RED }]);
+        assert_eq!(cmds[1].2, vec![ColorRun { from: 0, to: 3, color: RED }]);
+        assert_eq!(cmds[2].2, vec![ColorRun { from: 0, to: 1, color: RED }], "the run ends one character into the last line");
+        let none = wrapped(json!({ "colorRuns": [] }));
+        assert!(none.iter().all(|c| c.2.is_empty()), "control: no runs, no run on any line");
+    }
+
+    #[test]
+    fn a_colour_run_after_a_hard_newline_counts_the_newline_as_a_character() {
+        let p = packet_for(editable(json!({ "text": "ab\ncd", "width": 200, "colorRuns": [{ "from": 3, "to": 4, "color": "#ff0000" }] })));
+        let cmds = text_commands(&p);
+        assert_eq!(cmds[0].0, "ab");
+        assert!(cmds[0].2.is_empty());
+        assert_eq!(cmds[1].0, "cd");
+        assert_eq!(cmds[1].2, vec![ColorRun { from: 0, to: 1, color: RED }]);
+    }
+
+    #[test]
+    fn opacity_applies_to_colour_runs_as_to_the_base_colour() {
+        let p = packet_for(editable(json!({ "text": "abcd", "opacity": 0.5, "colorRuns": [{ "from": 0, "to": 1, "color": "#ff0000" }] })));
+        let cmd = &text_commands(&p)[0];
+        assert_eq!(cmd.1[3], 0.5);
+        assert_eq!(cmd.2[0].color, [1.0, 0.0, 0.0, 0.5]);
+        let opaque = packet_for(editable(json!({ "text": "abcd", "colorRuns": [{ "from": 0, "to": 1, "color": "#ff0000" }] })));
+        assert_eq!(text_commands(&opaque)[0].2[0].color[3], 1.0, "control: full opacity keeps the run's own alpha");
+    }
+
+    #[test]
+    fn a_colour_run_stays_on_its_characters_when_a_preedit_is_shown_before_them() {
+        let p = packet_for(editable(json!({ "caret": 1, "preedit": "X", "colorRuns": [{ "from": 1, "to": 2, "color": "#ff0000" }] })));
+        let cmd = &text_commands(&p)[0];
+        assert_eq!(cmd.0, "aXb");
+        assert_eq!(cmd.2, vec![ColorRun { from: 2, to: 3, color: RED }], "the run covers b, not the preedit");
+    }
+
+    #[test]
+    fn invalid_colour_runs_are_scene_errors_naming_colour_runs() {
+        let run = |from: i64, to: i64, color: &str| json!({ "from": from, "to": to, "color": color });
+        assert!(colour_run_error(json!({ "colorRuns": [run(2, 2, "#f00")] })).contains("below"), "from == to");
+        assert!(colour_run_error(json!({ "colorRuns": [run(3, 1, "#f00")] })).contains("below"), "inverted");
+        assert!(colour_run_error(json!({ "colorRuns": [run(0, 3, "#f00")] })).contains("past"), "out of range");
+        assert!(colour_run_error(json!({ "colorRuns": [run(0, 2, "#f00"), run(1, 2, "#00f")] })).contains("overlap"), "overlapping");
+        assert!(colour_run_error(json!({ "colorRuns": [run(1, 2, "#f00"), run(0, 1, "#00f")] })).contains("sorted"), "unsorted");
+        assert!(colour_run_error(json!({ "colorRuns": [run(0, 1, "not-a-colour")] })).contains("color"), "bad colour");
+        assert!(colour_run_error(json!({ "colorRuns": [{ "from": 0, "to": 1 }] })).contains("color"), "missing colour");
+        assert!(colour_run_error(json!({ "colorRuns": [{ "from": -1, "to": 1, "color": "#f00" }] })).contains("from"), "negative index");
+        assert!(colour_run_error(json!({ "colorRuns": "red" })).contains("list"), "not a list");
+        assert!(from_props(&editable(json!({ "colorRuns": [run(0, 1, "#f00"), run(1, 2, "#00f")] }))).is_ok(), "control: touching runs are valid");
     }
 
     #[test]

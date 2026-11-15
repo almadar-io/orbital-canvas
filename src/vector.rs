@@ -12,7 +12,7 @@
 //! the DejaVu `.notdef` box.
 
 use crate::packet::{
-    DrawCommand, FillPattern, Gradient, GradientStop, LineCap, LineJoin, PathSegment, Stroke,
+    ColorRun, DrawCommand, FillPattern, Gradient, GradientStop, LineCap, LineJoin, PathSegment, Stroke,
     TextAlign, Vec2,
 };
 use rustybuzz::{Direction, UnicodeBuffer};
@@ -937,6 +937,88 @@ fn text_path(
     })
 }
 
+/// The colour of each glyph of `shaped` (shaped from `text`): its cluster's first character's run, else `base`.
+pub(crate) fn glyph_colors(
+    text: &str,
+    shaped: &Shaped,
+    base: [f32; 4],
+    runs: &[ColorRun],
+) -> Vec<[f32; 4]> {
+    let mut colors = vec![base; shaped.glyphs.len()];
+    if runs.is_empty() {
+        return colors;
+    }
+    let offsets: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    for cluster in &shaped.clusters {
+        let index = offsets.partition_point(|o| *o < cluster.bytes.start);
+        if let Some(run) = runs.iter().find(|r| r.from <= index && index < r.to) {
+            for slot in &mut colors[cluster.glyphs.clone()] {
+                *slot = run.color;
+            }
+        }
+    }
+    colors
+}
+
+/// [`text_path`] split by glyph colour: one entry per distinct colour, in first-use order.
+#[allow(clippy::too_many_arguments)]
+fn text_paths_by_color(
+    text: &str,
+    pos: Vec2,
+    size: f32,
+    align: TextAlign,
+    bold: bool,
+    family: Family,
+    base: [f32; 4],
+    runs: &[ColorRun],
+) -> Option<Vec<([f32; 4], TextPaths)>> {
+    let TextLayout {
+        shaped,
+        x0,
+        baseline,
+    } = text_layout(text, pos, size, align, bold, family)?;
+    let colors = glyph_colors(text, &shaped, base, runs);
+    let mut groups: Vec<([f32; 4], PathBuilder, PathBuilder)> = Vec::new();
+    for (g, color) in shaped.glyphs.iter().zip(colors) {
+        let Some(face) = font_for(g.font) else {
+            continue;
+        };
+        let at = match groups.iter().position(|(c, _, _)| *c == color) {
+            Some(at) => at,
+            None => {
+                groups.push((color, PathBuilder::new(), PathBuilder::new()));
+                groups.len() - 1
+            }
+        };
+        let scale = size / face.units_per_em() as f32;
+        let id = ttf_parser::GlyphId(g.gid);
+        face.outline_glyph(
+            id,
+            &mut GlyphOutline::new(&mut groups[at].1, x0 + g.x, baseline + g.y, scale),
+        );
+        if bold && g.font.faux_bold() {
+            face.outline_glyph(
+                id,
+                &mut GlyphOutline::new(&mut groups[at].2, x0 + g.x, baseline + g.y, scale),
+            );
+        }
+    }
+    Some(
+        groups
+            .into_iter()
+            .filter_map(|(color, all, faux)| {
+                Some((
+                    color,
+                    TextPaths {
+                        all: all.finish()?,
+                        faux_bold: faux.finish(),
+                    },
+                ))
+            })
+            .collect(),
+    )
+}
+
 /// One glyph's anti-aliased coverage, `left`/`top` being the bitmap's offset from the glyph origin in pixels.
 pub(crate) struct GlyphBitmap {
     pub left: i32,
@@ -1183,6 +1265,7 @@ fn draw_command(pixmap: &mut Pixmap, command: &DrawCommand, ts: Transform) {
             weight,
             halo,
             family,
+            color_runs,
         } => {
             let bold = *weight >= 600;
             let Some(paths) = text_path(text, *pos, *size, *align, bold, *family) else {
@@ -1200,20 +1283,32 @@ fn draw_command(pixmap: &mut Pixmap, command: &DrawCommand, ts: Transform) {
                 };
                 pixmap.stroke_path(path, &paint(h.color), &sk_stroke(&stroke), ts, None);
             }
-            pixmap.fill_path(path, &paint(*c), FillRule::Winding, ts, None);
-            if let Some(faux) = &paths.faux_bold {
-                let stroke = Stroke {
-                    color: *c,
-                    width: size * 0.045,
-                    dash: Vec::new(),
-                    dash_offset: 0.0,
-                    cap: LineCap::Round,
-                    join: LineJoin::Round,
-                };
-                pixmap.stroke_path(faux, &paint(*c), &sk_stroke(&stroke), ts, None);
+            if color_runs.is_empty() {
+                fill_text(pixmap, &paths, *c, *size, ts);
+            } else if let Some(groups) =
+                text_paths_by_color(text, *pos, *size, *align, bold, *family, *c, color_runs)
+            {
+                for (color, group) in &groups {
+                    fill_text(pixmap, group, *color, *size, ts);
+                }
             }
         }
         _ => {}
+    }
+}
+
+fn fill_text(pixmap: &mut Pixmap, paths: &TextPaths, color: [f32; 4], size: f32, ts: Transform) {
+    pixmap.fill_path(&paths.all, &paint(color), FillRule::Winding, ts, None);
+    if let Some(faux) = &paths.faux_bold {
+        let stroke = Stroke {
+            color,
+            width: size * 0.045,
+            dash: Vec::new(),
+            dash_offset: 0.0,
+            cap: LineCap::Round,
+            join: LineJoin::Round,
+        };
+        pixmap.stroke_path(faux, &paint(color), &sk_stroke(&stroke), ts, None);
     }
 }
 
@@ -1439,6 +1534,7 @@ mod tests {
     #[test]
     fn text_is_bounded_by_its_glyph_outlines_and_a_command_of_unknown_reach_spans_anywhere() {
         let word = DrawCommand::Text {
+            color_runs: Vec::new(),
             text: "Orb".into(),
             pos: Vec2 { x: 100.0, y: 50.0 },
             size: 20.0,
@@ -1508,6 +1604,7 @@ mod tests {
 
     fn ink_top(text: &str, weight: u16) -> Option<u32> {
         let cmd = DrawCommand::Text {
+            color_runs: Vec::new(),
             text: text.into(),
             pos: Vec2 { x: 40.0, y: 40.0 },
             size: 48.0,
@@ -1756,6 +1853,7 @@ mod tests {
 
     fn text(s: &str, x: f32, align: TextAlign) -> DrawCommand {
         DrawCommand::Text {
+            color_runs: Vec::new(),
             text: s.into(),
             pos: Vec2 { x, y: 20.0 },
             size: 14.0,
@@ -1808,6 +1906,7 @@ mod tests {
     fn halo_adds_ink_around_the_glyph() {
         let plain = text("o", 10.0, TextAlign::Left);
         let haloed = DrawCommand::Text {
+            color_runs: Vec::new(),
             text: "o".into(),
             pos: Vec2 { x: 10.0, y: 20.0 },
             size: 14.0,
@@ -2237,5 +2336,59 @@ mod tests {
             println!("{id:?}: arabic letters {letters}/37, marks 064B-0652 {}/8, digits 0660-0669 {}/10, lam-alef U+FEFB {}", covered(0x64B..=0x652), covered(0x660..=0x669), covered(0xFEFB..=0xFEFB));
             assert_eq!(letters, 37, "{id:?} carries every assigned Arabic letter (U+063B-063F are unassigned)");
         }
+    }
+
+    const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+    fn colored(text: &str, runs: Vec<ColorRun>) -> DrawCommand {
+        DrawCommand::Text {
+            text: text.into(),
+            pos: Vec2 { x: 4.0, y: 30.0 },
+            size: 24.0,
+            color: RED,
+            align: TextAlign::Left,
+            weight: 400,
+            halo: None,
+            family: crate::packet::TextFamily::Sans,
+            color_runs: runs,
+        }
+    }
+
+    #[test]
+    fn a_run_inside_right_to_left_text_colours_the_glyphs_of_its_characters() {
+        let text = "aسلمb";
+        let shaped = shape(text, 24.0, false, Family::Sans);
+        let colors = glyph_colors(text, &shaped, RED, &[ColorRun { from: 1, to: 4, color: BLUE }]);
+        let first = shaped.clusters.iter().find(|c| c.bytes.start == 0).unwrap();
+        let last = shaped.clusters.iter().find(|c| c.bytes.end == text.len()).unwrap();
+        let (a, b) = (shaped.glyphs[first.glyphs.start].x, shaped.glyphs[last.glyphs.start].x);
+        let blue: Vec<usize> = (0..colors.len()).filter(|i| colors[*i] == BLUE).collect();
+        assert_eq!(blue.len(), colors.len() - 2, "every glyph but a and b: {colors:?}");
+        assert!(blue.iter().all(|i| shaped.glyphs[*i].x > a && shaped.glyphs[*i].x < b), "the Arabic glyphs sit between a and b");
+        assert_eq!(colors[first.glyphs.start], RED);
+        assert_eq!(colors[last.glyphs.start], RED);
+        let plain = glyph_colors(text, &shaped, RED, &[]);
+        assert!(plain.iter().all(|c| *c == RED), "control: no runs, every glyph in the base colour");
+        let tail = glyph_colors(text, &shaped, RED, &[ColorRun { from: 4, to: 5, color: BLUE }]);
+        assert_eq!(tail.iter().filter(|c| **c == BLUE).count(), 1, "control: a run on b alone colours one glyph");
+    }
+
+    #[test]
+    fn the_cpu_text_layer_fills_each_glyph_in_its_runs_colour() {
+        let cell = shape("W", 24.0, false, Family::Sans).width;
+        let drawn = |runs: Vec<ColorRun>| rasterize(&[&colored("WWW", runs)], 100, 50, 1.0, 1.0).unwrap();
+        let inner = |data: &[u8], k: u32| -> Vec<[u8; 4]> {
+            let x0 = (4.0 + cell * (k as f32 + 0.25)) as u32;
+            let x1 = (4.0 + cell * (k as f32 + 0.75)) as u32;
+            (0..50).flat_map(|y| (x0..x1).map(move |x| (x, y))).map(|(x, y)| at(data, 100, x, y)).filter(|p| p[3] == 255).collect()
+        };
+        let striped = drawn(vec![ColorRun { from: 1, to: 2, color: BLUE }]);
+        for (k, want) in [(0, [255, 0, 0, 255]), (1, [0, 0, 255, 255]), (2, [255, 0, 0, 255])] {
+            let ink = inner(&striped, k);
+            assert!(!ink.is_empty(), "glyph {k} inks");
+            assert!(ink.iter().all(|p| *p == want), "glyph {k} is {want:?}");
+        }
+        let plain = drawn(Vec::new());
+        assert!(inner(&plain, 1).iter().all(|p| *p == [255, 0, 0, 255]), "control: without runs the middle glyph is the base colour");
     }
 }

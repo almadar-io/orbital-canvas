@@ -82,6 +82,7 @@ pub fn label(text: &str, style: &LabelStyle) -> Result<Label, String> {
         .insert(key.clone());
     if fresh {
         let command = DrawCommand::Text {
+            color_runs: Vec::new(),
             text: text.to_owned(),
             pos: Vec2 {
                 x: px_w as f32 / 2.0,

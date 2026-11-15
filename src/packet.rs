@@ -160,6 +160,14 @@ fn default_text_weight() -> u16 {
     400
 }
 
+/// The characters `from..to` (indices into a `Text`'s `text`, half-open) paint in `color`.
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColorRun {
+    pub from: usize,
+    pub to: usize,
+    pub color: [f32; 4],
+}
+
 /// Outline drawn under text.
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct Halo {
@@ -423,6 +431,9 @@ pub enum DrawCommand {
         /// The generic family the text is drawn in; `mono` is the theme's `mono` label font.
         #[serde(default)]
         family: TextFamily,
+        /// Parts of the line that paint in their own colour, by character index into `text`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        color_runs: Vec<ColorRun>,
     },
     /// One signed-distance shape drawn by the SDF pass in z-order with the other commands: anti-aliased by the
     /// distance's screen derivative, stroke centred on the edge, shadow blurred analytically. `corners` run top-left,

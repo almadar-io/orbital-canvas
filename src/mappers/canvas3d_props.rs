@@ -430,6 +430,7 @@ fn label(
     colors: &OverlayColors,
 ) -> DrawCommand {
     DrawCommand::Text {
+        color_runs: Vec::new(),
         text,
         pos,
         size,
