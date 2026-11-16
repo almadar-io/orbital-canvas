@@ -571,6 +571,7 @@ impl Xform {
                 halo,
                 family,
                 color_runs,
+                rotation,
             } => DrawCommand::Text {
                 text: text.clone(),
                 pos: self.point(*pos),
@@ -578,6 +579,7 @@ impl Xform {
                 color: self.color(*color),
                 align: *align,
                 weight: *weight,
+                rotation: *rotation + self.sin.atan2(self.cos),
                 family: *family,
                 color_runs: color_runs
                     .iter()

@@ -366,6 +366,9 @@ fn canvas_node_props(node: &Value) -> Result<serde_json::Map<String, Value>, Can
     }
     let mut props = fields.clone();
     props.remove("type");
+    if let Some(theme) = props.remove("canvasTheme") {
+        crate::theme_refs::apply(&mut props, &theme);
+    }
     if !props.contains_key("drawables") {
         if let Some(children) = props.get("children") {
             props.insert(

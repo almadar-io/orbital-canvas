@@ -525,10 +525,16 @@ pub(super) fn paint_sdf_shape(
                 .and_then(parse_css_color);
             match (color, spec.get("blur").and_then(Value::as_f64)) {
                 (Some(color), Some(blur)) if blur.is_finite() && blur >= 0.0 => {
-                    (blur > 0.0 && color[3] > 0.0).then(|| SdfShadow {
+                    let offset = Vec2 {
+                        x: get_f32(spec, "offsetX", 0.0) * tw * zoom,
+                        y: get_f32(spec, "offsetY", 0.0) * tw * zoom,
+                    };
+                    let moved = offset.x != 0.0 || offset.y != 0.0;
+                    // a hard offset shadow still needs a sigma: half a pixel keeps its edge crisp
+                    ((blur > 0.0 || moved) && color[3] > 0.0).then(|| SdfShadow {
                         color,
-                        sigma: blur as f32 * tw * zoom / 2.0,
-                        offset: Vec2::default(),
+                        sigma: (blur as f32 * tw * zoom / 2.0).max(if moved { 0.5 } else { 0.0 }),
+                        offset,
                     })
                 }
                 _ => {

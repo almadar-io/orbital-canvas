@@ -46,5 +46,7 @@ pub mod shaders;
 pub mod color;
 #[path = "support/diagnostics.rs"]
 pub mod diagnostics;
+#[path = "support/faces.rs"]
+pub mod faces;
 #[path = "support/shader_check.rs"]
 pub mod shader_check;

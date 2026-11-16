@@ -53,11 +53,16 @@ pub enum FontId {
     BodyBold,
     /// A face the host supplied for a script no bundled face covers (`add_font_face`).
     Host(u16),
+    /// A theme family's font file (`orbital_canvas_base::faces`), by its index in the loaded files.
+    Url(u16),
 }
 
 impl FontId {
     /// Only the bundled Arabic has a real bold; every other face is emboldened by stroking.
     pub fn faux_bold(self) -> bool {
+        if let FontId::Url(i) = self {
+            return !url_face_real_bold(i);
+        }
         !matches!(
             self,
             FontId::ArabicRegular
@@ -104,6 +109,11 @@ pub(super) fn font_for(id: FontId) -> Option<&'static rustybuzz::Face<'static>> 
         FontId::Body => faces[8].as_ref(),
         FontId::BodyBold => faces[9].as_ref(),
         FontId::Host(i) => host_fonts().read().ok()?.get(i as usize).map(|(_, f)| *f),
+        FontId::Url(i) => url_faces()
+            .read()
+            .ok()?
+            .get(i as usize)
+            .and_then(|f| f.face),
     }
 }
 
@@ -119,6 +129,80 @@ pub(super) fn features_for(id: FontId) -> &'static [rustybuzz::Feature] {
         }),
         _ => &[],
     }
+}
+
+/// One loaded theme font file at one weight: `bold` asks for weight 700, which a variable font with a `wght` axis
+/// draws itself (`real_bold`); a face without the axis is emboldened by stroking like the other faces.
+pub(super) struct UrlFace {
+    pub(super) url: String,
+    pub(super) bold: bool,
+    pub(super) face: Option<&'static rustybuzz::Face<'static>>,
+    pub(super) real_bold: bool,
+}
+
+/// Theme font files by URL and weight, parsed once when their bytes arrive; `face: None` marks a file that is not a
+/// font.
+pub(super) type UrlFaces = RwLock<Vec<UrlFace>>;
+
+pub(super) fn url_faces() -> &'static UrlFaces {
+    static URL: OnceLock<UrlFaces> = OnceLock::new();
+    URL.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+const WGHT: rustybuzz::ttf_parser::Tag = rustybuzz::ttf_parser::Tag::from_bytes(b"wght");
+
+/// The face of the theme family `id` at regular or bold weight once its file has loaded (the fetch starts on first
+/// ask). A face is keyed by its URL, so a family name pointed at a new file never reuses the old file's glyphs.
+pub(super) fn url_font(id: u16, bold: bool) -> Option<FontId> {
+    let file = orbital_canvas_base::faces::face_file(id)?;
+    let found = |faces: &[UrlFace]| {
+        faces
+            .iter()
+            .position(|f| f.url == file.url && f.bold == bold)
+            .map(|i| (i, faces[i].face.is_some()))
+    };
+    if let Some((i, ok)) = url_faces().read().ok().and_then(|f| found(&f)) {
+        return ok.then_some(FontId::Url(i as u16));
+    }
+    let bytes = crate::asset::asset_bytes(&file.url)?;
+    let mut faces = url_faces().write().ok()?;
+    if let Some((i, ok)) = found(&faces) {
+        return ok.then_some(FontId::Url(i as u16));
+    }
+    let leaked: &'static [u8] = &Box::leak(Box::new(bytes))[..];
+    let mut real_bold = false;
+    let face = rustybuzz::Face::from_slice(leaked, 0).map(|mut f| {
+        let axis = f.variation_axes().into_iter().find(|a| a.tag == WGHT);
+        if let Some(axis) = axis {
+            let weight: f32 = if bold { 700.0 } else { 400.0 };
+            f.set_variations(&[rustybuzz::Variation {
+                tag: WGHT,
+                value: weight.clamp(axis.min_value, axis.max_value),
+            }]);
+            real_bold = bold && axis.max_value >= 600.0;
+        }
+        &*Box::leak(Box::new(f))
+    });
+    if face.is_none() {
+        tracing::warn!(url = %file.url, "theme font file is not a font face");
+    }
+    faces.push(UrlFace {
+        url: file.url,
+        bold,
+        face,
+        real_bold,
+    });
+    FONT_GENERATION.fetch_add(1, Ordering::SeqCst);
+    face.map(|_| FontId::Url((faces.len() - 1) as u16))
+}
+
+/// Whether a theme face draws its own bold (a variable font set to weight 700).
+pub(super) fn url_face_real_bold(i: u16) -> bool {
+    url_faces()
+        .read()
+        .ok()
+        .and_then(|f| f.get(usize::from(i)).map(|u| u.real_bold))
+        .unwrap_or(false)
 }
 
 pub(super) type HostFaces = RwLock<Vec<(Script, &'static rustybuzz::Face<'static>)>>;

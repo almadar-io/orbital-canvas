@@ -30,8 +30,10 @@ pub(super) fn paint_group(
             .unwrap_or(default)
     };
     let (group_x, group_y) = to_screen(
-        gx + animated_number("offsetX", 0.0) * projector.tile_width,
-        gy + animated_number("offsetY", 0.0) * projector.tile_width,
+        gx + (get_f32(node, "offsetX", 0.0) + animated_number("offsetX", 0.0))
+            * projector.tile_width,
+        gy + (get_f32(node, "offsetY", 0.0) + animated_number("offsetY", 0.0))
+            * projector.tile_width,
     );
     let rotation_z = node
         .get("rotation")
@@ -62,21 +64,6 @@ pub(super) fn paint_group(
         gathered.regions.truncate(region_start);
         gathered.text_hits.truncate(hits_start);
         return crate::layer_props::collect_target(spec, (zero_x, zero_y), out, start);
-    }
-    if radians != 0.0
-        && out[start..]
-            .iter()
-            .any(|cmd| matches!(cmd, DrawCommand::Text { .. }))
-    {
-        out.truncate(start);
-        gathered.regions.truncate(region_start);
-        gathered.measured.truncate(measured_start);
-        gathered.text_hits.truncate(hits_start);
-        gap_once(
-            "group-rotated-text",
-            "draw-group rotating text needs a vector glyph path",
-        );
-        return Ok(());
     }
     if let Some(radius) = node.get("smoothUnion").filter(|r| !r.is_null()) {
         blend_group_shapes(radius, projector.tile_width * zoom, out, start)?;
@@ -183,7 +170,7 @@ pub(super) fn paint_group(
             node.rect = *dst;
         }
     }
-    // a text hit's lines ride the same transform (text in a rotated group is refused above, so it only scales and moves)
+    // a text hit's lines ride the same transform; a rotated line's hit box is the bounding box of its rotated rectangle
     for hit in &mut gathered.text_hits[hits_start..] {
         for line in &mut hit.lines {
             let (x0, x1) = (
@@ -196,14 +183,15 @@ pub(super) fn paint_group(
                 w: (x1 - x0).max(f32::EPSILON),
                 h: (line.bottom - line.top).max(f32::EPSILON),
             };
-            let mut carrier = vec![DrawCommand::Sprite {
-                texture: String::new(),
-                src: Rect::default(),
-                dst: before,
-                rotation: 0.0,
-                opacity: 1.0,
-                flip_x: false,
-                flip_y: false,
+            let corner = |x: f32, y: f32| Vec2 { x, y };
+            let mut carrier = vec![DrawCommand::Poly {
+                points: vec![
+                    corner(before.x, before.y),
+                    corner(before.x + before.w, before.y),
+                    corner(before.x + before.w, before.y + before.h),
+                    corner(before.x, before.y + before.h),
+                ],
+                color: [0.0; 4],
             }];
             orbital_canvas_base::animate::transform_group_commands(
                 &mut carrier,
@@ -213,12 +201,19 @@ pub(super) fn paint_group(
                 radians,
                 1.0,
             );
-            if let Some(DrawCommand::Sprite { dst, .. }) = carrier.first() {
+            if let Some(DrawCommand::Poly { points, .. }) = carrier.first() {
+                let low =
+                    |pick: fn(&Vec2) -> f32| points.iter().map(pick).fold(f32::INFINITY, f32::min);
+                let high = |pick: fn(&Vec2) -> f32| {
+                    points.iter().map(pick).fold(f32::NEG_INFINITY, f32::max)
+                };
+                let (x, y) = (low(|p| p.x), low(|p| p.y));
+                let (w, h) = (high(|p| p.x) - x, high(|p| p.y) - y);
                 for edge in &mut line.edges {
-                    *edge = dst.x + (*edge - before.x) * dst.w / before.w;
+                    *edge = x + (*edge - before.x) * w / before.w;
                 }
-                line.top = dst.y;
-                line.bottom = dst.y + dst.h;
+                line.top = y;
+                line.bottom = y + h;
             }
         }
     }

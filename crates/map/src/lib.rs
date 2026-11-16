@@ -29,6 +29,8 @@ pub mod platformer_canvas;
 pub mod skinned_mesh_2d;
 #[path = "canvas2d/text_reveal.rs"]
 pub mod text_reveal;
+#[path = "canvas2d/theme_refs.rs"]
+pub mod theme_refs;
 
 // canvas3d: the 3D canvas
 #[path = "canvas3d/canvas3d_props.rs"]

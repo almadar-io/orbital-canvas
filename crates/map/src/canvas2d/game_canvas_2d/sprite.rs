@@ -168,11 +168,19 @@ pub(super) fn paint_sprite(
             }
             return Ok(());
         };
-        Rect {
+        let whole = Rect {
             x: 0.0,
             y: 0.0,
             w: w as f32,
             h: h as f32,
+        };
+        match node.get("fit").and_then(Value::as_str) {
+            Some("cover") => cover_crop(
+                whole,
+                get_f32(node, "width", 0.0),
+                get_f32(node, "height", 0.0),
+            ),
+            _ => whole,
         }
     };
 
@@ -188,6 +196,29 @@ pub(super) fn paint_sprite(
         flip_y: false,
     });
     Ok(())
+}
+
+/// The centred part of `whole` with the `width : height` aspect, so the image fills its rect without stretching.
+fn cover_crop(whole: Rect, width: f32, height: f32) -> Rect {
+    if width <= 0.0 || height <= 0.0 || whole.w <= 0.0 || whole.h <= 0.0 {
+        return whole;
+    }
+    let aspect = width / height;
+    if whole.w / whole.h > aspect {
+        let w = whole.h * aspect;
+        Rect {
+            x: whole.x + (whole.w - w) / 2.0,
+            w,
+            ..whole
+        }
+    } else {
+        let h = whole.w / aspect;
+        Rect {
+            y: whole.y + (whole.h - h) / 2.0,
+            h,
+            ..whole
+        }
+    }
 }
 
 pub(super) fn sprite_dst(

@@ -522,6 +522,7 @@ fn text_and_lines_scale_and_fade_with_the_group() {
     let cmds = vec![
         DrawCommand::Text {
             color_runs: Vec::new(),
+            rotation: 0.0,
             text: "x".into(),
             pos: Vec2 { x: 70.0, y: 40.0 },
             size: 10.0,

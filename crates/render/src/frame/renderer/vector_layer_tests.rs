@@ -412,6 +412,7 @@ fn text_packet(commands: Vec<DrawCommand>) -> GameRenderPacket {
 fn word(text: &str, x: f32, y: f32, size: f32) -> DrawCommand {
     DrawCommand::Text {
         color_runs: Vec::new(),
+        rotation: 0.0,
         text: text.into(),
         pos: Vec2 { x, y },
         size,
@@ -542,6 +543,7 @@ fn atlas_glyph_instances_carry_their_runs_colour() {
             halo,
             family,
             color_runs: runs,
+            rotation: 0.0,
         },
         other => other,
     };
@@ -785,6 +787,7 @@ fn stroke_and_text_commands_draw() {
     };
     let text = DrawCommand::Text {
         color_runs: Vec::new(),
+        rotation: 0.0,
         text: "W".into(),
         pos: Vec2 { x: 8.0, y: 8.0 },
         size: 12.0,

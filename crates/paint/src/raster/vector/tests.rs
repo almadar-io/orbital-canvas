@@ -101,6 +101,7 @@ fn a_shadow_reaches_three_spreads_past_its_shapes_and_a_run_is_their_union() {
 fn text_is_bounded_by_its_glyph_outlines_and_a_command_of_unknown_reach_spans_anywhere() {
     let word = DrawCommand::Text {
         color_runs: Vec::new(),
+        rotation: 0.0,
         text: "Orb".into(),
         pos: Vec2 { x: 100.0, y: 50.0 },
         size: 20.0,
@@ -193,6 +194,7 @@ fn a_shadow_paints_the_coverage_in_its_color_blurred_past_the_edge() {
 fn ink_top(text: &str, weight: u16) -> Option<u32> {
     let cmd = DrawCommand::Text {
         color_runs: Vec::new(),
+        rotation: 0.0,
         text: text.into(),
         pos: Vec2 { x: 40.0, y: 40.0 },
         size: 48.0,
@@ -442,6 +444,7 @@ fn ink(data: &[u8], w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
 fn text(s: &str, x: f32, align: TextAlign) -> DrawCommand {
     DrawCommand::Text {
         color_runs: Vec::new(),
+        rotation: 0.0,
         text: s.into(),
         pos: Vec2 { x, y: 20.0 },
         size: 14.0,
@@ -495,6 +498,7 @@ fn halo_adds_ink_around_the_glyph() {
     let plain = text("o", 10.0, TextAlign::Left);
     let haloed = DrawCommand::Text {
         color_runs: Vec::new(),
+        rotation: 0.0,
         text: "o".into(),
         pos: Vec2 { x: 10.0, y: 20.0 },
         size: 14.0,
@@ -1021,6 +1025,7 @@ fn colored(text: &str, runs: Vec<ColorRun>) -> DrawCommand {
         halo: None,
         family: orbital_canvas_base::packet::TextFamily::Sans,
         color_runs: runs,
+        rotation: 0.0,
     }
 }
 
@@ -1115,5 +1120,121 @@ fn the_cpu_text_layer_fills_each_glyph_in_its_runs_colour() {
     assert!(
         inner(&plain, 1).iter().all(|p| *p == [255, 0, 0, 255]),
         "control: without runs the middle glyph is the base colour"
+    );
+}
+
+#[test]
+fn a_theme_face_draws_from_its_file_once_loaded_and_from_its_generic_face_before() {
+    let _font = FONT_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let url = "test://fonts/theme-face-mono.ttf";
+    let family =
+        orbital_canvas_base::faces::register_face("Theme Face Test", url, Family::Serif).unwrap();
+    crate::asset::register_asset("test://fonts/theme-face-other.ttf", MONO_BYTES.into(), None);
+    let before = shape("Ab", 16.0, false, family);
+    assert!(
+        before.glyphs.iter().all(|g| g.font == FontId::Serif),
+        "not loaded yet: the generic serif draws, {:?}",
+        fonts_of(&before)
+    );
+    let generation = font_generation();
+    crate::asset::register_asset(url, MONO_BYTES.into(), None);
+    let after = shape("Ab", 16.0, false, family);
+    assert!(
+        after
+            .glyphs
+            .iter()
+            .all(|g| matches!(g.font, FontId::Url(_))),
+        "{:?}",
+        fonts_of(&after)
+    );
+    assert!(
+        font_generation() > generation,
+        "a loaded face repaints text"
+    );
+    let bold = shape("Ab", 16.0, true, family);
+    let (regular_id, bold_id) = (after.glyphs[0].font, bold.glyphs[0].font);
+    assert!(
+        matches!(bold_id, FontId::Url(_)) && bold_id != regular_id,
+        "bold is its own face entry: {regular_id:?} {bold_id:?}"
+    );
+    assert!(
+        bold_id.faux_bold(),
+        "control: a font with no weight axis is emboldened by stroking"
+    );
+    let plain = shape("Ab", 16.0, false, Family::Sans);
+    assert!(
+        plain.glyphs.iter().all(|g| g.font == FontId::Latin),
+        "control: other text keeps the bundled face"
+    );
+}
+
+fn word_turned(rotation: f32) -> DrawCommand {
+    DrawCommand::Text {
+        color_runs: Vec::new(),
+        rotation,
+        text: "Orb".into(),
+        pos: Vec2 { x: 100.0, y: 50.0 },
+        size: 20.0,
+        color: RED,
+        align: TextAlign::Left,
+        weight: 400,
+        halo: None,
+        family: orbital_canvas_base::packet::TextFamily::Sans,
+    }
+}
+
+#[test]
+fn rotated_text_is_bounded_by_its_rotated_outlines_and_an_unrotated_one_is_unchanged() {
+    let RunBounds::Box { x0, y0, x1, y1 } = command_bounds(&word_turned(0.0)) else {
+        panic!("text has a box");
+    };
+    let RunBounds::Box {
+        x0: tx0,
+        y0: ty0,
+        x1: tx1,
+        y1: ty1,
+    } = command_bounds(&word_turned(std::f32::consts::FRAC_PI_2))
+    else {
+        panic!("turned text has a box");
+    };
+    assert!(
+        ((x1 - x0) - (ty1 - ty0)).abs() < 1e-2,
+        "width becomes height"
+    );
+    assert!(
+        ((y1 - y0) - (tx1 - tx0)).abs() < 1e-2,
+        "height becomes width"
+    );
+}
+
+#[test]
+fn rotated_text_paints_ink_where_the_turned_glyphs_fall_and_not_where_they_were() {
+    let paint_at = |rotation: f32| {
+        let mut pixmap = Pixmap::new(200, 120).unwrap();
+        draw_command(&mut pixmap, &word_turned(rotation), Transform::identity());
+        pixmap
+    };
+    let ink = |pixmap: &Pixmap, x0: u32, y0: u32, x1: u32, y1: u32| {
+        (y0..y1).any(|y| (x0..x1).any(|x| pixmap.data()[((y * 200 + x) * 4 + 3) as usize] > 0))
+    };
+    let flat = paint_at(0.0);
+    let turned = paint_at(std::f32::consts::FRAC_PI_2);
+    assert!(
+        ink(&flat, 100, 35, 130, 55),
+        "control: flat text inks to the right of its anchor"
+    );
+    assert!(
+        !ink(&flat, 80, 80, 120, 110),
+        "control: flat text leaves the area below blank"
+    );
+    assert!(
+        ink(&turned, 80, 80, 120, 110),
+        "turned text inks below its anchor"
+    );
+    assert!(
+        !ink(&turned, 125, 35, 140, 55),
+        "turned text leaves the old line blank"
     );
 }

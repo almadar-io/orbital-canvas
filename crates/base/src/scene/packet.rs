@@ -189,6 +189,8 @@ pub enum TextFamily {
     Display,
     /// Cairo, the osama site's text face.
     Body,
+    /// A theme's font file, by its [`crate::faces`] id.
+    Face(u16),
 }
 
 /// Horizontal text alignment against the anchor x.
@@ -203,6 +205,10 @@ pub enum TextAlign {
 
 fn default_text_weight() -> u16 {
     400
+}
+
+fn is_zero_angle(angle: &f32) -> bool {
+    *angle == 0.0
 }
 
 /// The characters `from..to` (indices into a `Text`'s `text`, half-open) paint in `color`.
@@ -479,6 +485,9 @@ pub enum DrawCommand {
         /// Parts of the line that paint in their own colour, by character index into `text`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         color_runs: Vec<ColorRun>,
+        /// Radians the glyph outlines turn about `pos`; a rotated `draw-group` carries its rotation here.
+        #[serde(default, skip_serializing_if = "is_zero_angle")]
+        rotation: f32,
     },
     /// One signed-distance shape drawn by the SDF pass in z-order with the other commands: anti-aliased by the
     /// distance's screen derivative, stroke centred on the edge, shadow blurred analytically. `corners` run top-left,

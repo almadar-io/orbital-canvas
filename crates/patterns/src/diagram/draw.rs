@@ -434,6 +434,7 @@ impl<'a> Pen<'a> {
         let (px, py) = self.p(x, middle_y);
         self.cmds.push(DrawCommand::Text {
             color_runs: Vec::new(),
+            rotation: 0.0,
             text: text.to_string(),
             pos: Vec2 { x: px, y: py },
             size: size * self.xf.s,

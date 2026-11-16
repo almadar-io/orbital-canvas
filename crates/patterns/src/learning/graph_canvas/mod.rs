@@ -1233,6 +1233,7 @@ fn label_tooltip(cmds: &mut Vec<DrawCommand>, n: &Node, xf: Xf, theme: &DiagramT
     for (i, line) in lines.iter().enumerate() {
         cmds.push(DrawCommand::Text {
             color_runs: Vec::new(),
+            rotation: 0.0,
             text: line.clone(),
             pos: Vec2 {
                 x: cx,
@@ -1382,6 +1383,7 @@ pub fn map_with(
                 let (tx, ty) = xf.p(x, y);
                 cmds.push(DrawCommand::Text {
                     color_runs: Vec::new(),
+                    rotation: 0.0,
                     text,
                     pos: Vec2 { x: tx, y: ty },
                     size: theme.text_px(size) * xf.s,

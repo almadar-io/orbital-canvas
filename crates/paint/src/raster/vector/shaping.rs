@@ -34,6 +34,17 @@ pub struct ShapedCluster {
 /// The face for `c` in `script`: the mono face when asked and it covers `c`, bundled Arabic, the bundled face when its cmap covers the
 /// char, a host face for the script, else the bundled face (`.notdef`) with the script noted.
 pub(super) fn char_font(c: char, script: Script, bold: bool, family: Family) -> FontId {
+    let family = match family {
+        Family::Face(id) => {
+            if let Some(url) = url_font(id, bold)
+                .filter(|f| font_for(*f).is_some_and(|f| f.glyph_index(c).is_some()))
+            {
+                return url;
+            }
+            orbital_canvas_base::faces::face_file(id).map_or(Family::Sans, |f| f.fallback)
+        }
+        other => other,
+    };
     if family == Family::Mono {
         let mono = if bold { FontId::MonoBold } else { FontId::Mono };
         if font_for(mono).is_some_and(|f| f.glyph_index(c).is_some()) {

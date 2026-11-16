@@ -217,7 +217,17 @@ fn draw_command(pixmap: &mut Pixmap, command: &DrawCommand, ts: Transform) {
             halo,
             family,
             color_runs,
+            rotation,
         } => {
+            let ts = if *rotation == 0.0 {
+                ts
+            } else {
+                ts.pre_concat(Transform::from_rotate_at(
+                    rotation.to_degrees(),
+                    pos.x,
+                    pos.y,
+                ))
+            };
             let bold = *weight >= 600;
             let Some(paths) = text_path(text, *pos, *size, *align, bold, *family) else {
                 return;

@@ -2856,3 +2856,267 @@ fn a_smooth_union_that_cannot_blend_is_a_scene_error_naming_smooth_union() {
         "control: a solid stroke on the first shape blends"
     );
 }
+
+fn sprite_src(
+    fit: Option<&str>,
+    url: &str,
+    w: f64,
+    h: f64,
+) -> Option<orbital_canvas_base::packet::Rect> {
+    let mut sprite = json!({ "type": "draw-sprite", "id": "photo", "asset": { "url": url }, "position": { "x": 0, "y": 0 }, "width": w, "height": h, "anchor": "top-left" });
+    if let Some(fit) = fit {
+        sprite["fit"] = json!(fit);
+    }
+    packet_for(json!({ "width": 800, "height": 600, "drawables": [sprite] }))
+        .draw_commands
+        .into_iter()
+        .find_map(|c| match c {
+            DrawCommand::Sprite { src, .. } => Some(src),
+            _ => None,
+        })
+}
+
+#[test]
+fn a_cover_sprite_crops_the_whole_image_centred_to_its_aspect_and_a_plain_sprite_takes_it_all() {
+    let url = "test://images/cover-400x200.png";
+    let mut bytes = Vec::new();
+    image::RgbaImage::new(400, 200)
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    orbital_canvas_paint::asset::register_asset(url, bytes.into(), Some("image/png"));
+    let square = sprite_src(Some("cover"), url, 100.0, 100.0).expect("drawn");
+    assert_eq!(
+        (square.x, square.y, square.w, square.h),
+        (100.0, 0.0, 200.0, 200.0)
+    );
+    let tall = sprite_src(Some("cover"), url, 50.0, 100.0).expect("drawn");
+    assert_eq!((tall.x, tall.y, tall.w, tall.h), (150.0, 0.0, 100.0, 200.0));
+    let wide = sprite_src(Some("cover"), url, 400.0, 50.0).expect("drawn");
+    assert_eq!((wide.x, wide.y, wide.w, wide.h), (0.0, 75.0, 400.0, 50.0));
+    let plain = sprite_src(None, url, 100.0, 100.0).expect("drawn");
+    assert_eq!(
+        (plain.x, plain.y, plain.w, plain.h),
+        (0.0, 0.0, 400.0, 200.0),
+        "control: no fit draws the whole image"
+    );
+}
+
+fn sdf_shadow(shadow: Value) -> Option<orbital_canvas_base::packet::SdfShadow> {
+    let packet = packet_for(free_props(json!([rect_shape(
+        json!({"corners": {"radius": [4, 4, 4, 4], "kind": "round"}, "shadow": shadow})
+    )])));
+    match sdf_commands(&packet).as_slice() {
+        [DrawCommand::Sdf { shadow, .. }] => shadow.clone(),
+        other => panic!("one sdf expected: {other:?}"),
+    }
+}
+
+#[test]
+fn an_sdf_shadow_takes_its_offset_and_a_hard_offset_shadow_draws_with_no_blur() {
+    let soft = sdf_shadow(json!({"color": "#000000", "blur": 8, "offsetX": 4, "offsetY": 6}))
+        .expect("soft");
+    assert_eq!((soft.offset.x, soft.offset.y), (4.0, 6.0));
+    let hard = sdf_shadow(json!({"color": "#000000", "blur": 0, "offsetX": 6, "offsetY": 6}))
+        .expect("hard offset shadow draws");
+    assert_eq!((hard.offset.x, hard.offset.y), (6.0, 6.0));
+    assert!(
+        hard.sigma > 0.0 && hard.sigma <= 0.5,
+        "a crisp edge, never a zero sigma: {}",
+        hard.sigma
+    );
+    assert!(
+        sdf_shadow(json!({"color": "#000000", "blur": 0})).is_none(),
+        "control: no blur and no offset draws no shadow"
+    );
+    let plain = sdf_shadow(json!({"color": "#000000", "blur": 8})).expect("plain");
+    assert_eq!(
+        (plain.offset.x, plain.offset.y),
+        (0.0, 0.0),
+        "control: no offset stays put"
+    );
+}
+
+fn text_group(group: Value) -> Value {
+    let mut base = json!({"type": "draw-group", "position": {"x": 100, "y": 50}, "items": [
+        {"type": "draw-text", "id": "t", "hit": true, "text": "Tilted", "anchor": "top-left",
+         "position": {"x": 0, "y": 0}, "color": "#ffffff", "font": "bold 20px sans-serif"},
+        rect_shape(json!({"position": {"x": 0, "y": 30}, "width": 10, "height": 10}))]});
+    for (key, value) in group.as_object().unwrap() {
+        base[key] = value.clone();
+    }
+    free_props(json!([base]))
+}
+
+fn first_text(packet: &GameRenderPacket) -> (Vec2, f32, f32) {
+    packet
+        .draw_commands
+        .iter()
+        .find_map(|c| match c {
+            DrawCommand::Text {
+                pos,
+                size,
+                rotation,
+                ..
+            } => Some((*pos, *size, *rotation)),
+            _ => None,
+        })
+        .expect("the group painted its text")
+}
+
+#[test]
+fn text_in_a_rotated_group_paints_rotated_about_the_group_position_with_its_siblings() {
+    let (packet, gathered) = from_props_mapped(&text_group(json!({"rotate": 0.5})), 0.0).unwrap();
+    let (pos, size, rotation) = first_text(&packet);
+    assert!((rotation - 0.5).abs() < 1e-5, "{rotation}");
+    assert!((size - 20.0).abs() < 1e-3);
+    let (flat_pos, _, _) = first_text(&packet_for(text_group(json!({}))));
+    let (dx, dy) = (flat_pos.x - 100.0, flat_pos.y - 50.0);
+    let (sin, cos) = 0.5_f32.sin_cos();
+    assert!(
+        (pos.x - (100.0 + dx * cos - dy * sin)).abs() < 1e-3
+            && (pos.y - (50.0 + dx * sin + dy * cos)).abs() < 1e-3,
+        "the text anchor turns about the group position: {pos:?}"
+    );
+    assert!(
+        packet
+            .draw_commands
+            .iter()
+            .any(|c| matches!(c, DrawCommand::Poly { .. })),
+        "the sibling shape paints, rotated"
+    );
+    let hit = &gathered.text_hits[0].lines[0];
+    let width = hit.edges.last().unwrap() - hit.edges.first().unwrap();
+    assert!(hit.bottom > hit.top && width > 0.0);
+}
+
+#[test]
+fn a_rotated_text_hit_covers_the_rotated_bounding_box() {
+    let (_, flat) = from_props_mapped(&text_group(json!({})), 0.0).unwrap();
+    let (_, turned) = from_props_mapped(
+        &text_group(json!({"rotate": std::f64::consts::FRAC_PI_2})),
+        0.0,
+    )
+    .unwrap();
+    let line = |g: &Gathered| {
+        let l = &g.text_hits[0].lines[0];
+        (
+            l.edges.last().unwrap() - l.edges.first().unwrap(),
+            l.bottom - l.top,
+        )
+    };
+    let (flat_w, flat_h) = line(&flat);
+    let (turned_w, turned_h) = line(&turned);
+    assert!((turned_w - flat_h).abs() < 1e-2, "{turned_w} vs {flat_h}");
+    assert!((turned_h - flat_w).abs() < 1e-2, "{turned_h} vs {flat_w}");
+}
+
+#[test]
+fn control_text_in_an_unrotated_group_keeps_rotation_zero_and_its_place() {
+    let (flat_pos, _, _) = first_text(&packet_for(text_group(json!({}))));
+    assert!(
+        (flat_pos.x - 100.0).abs() < 1e-3,
+        "an unrotated group only moves its text"
+    );
+    for group in [json!({}), json!({"rotate": 0.0})] {
+        let packet = packet_for(text_group(group));
+        let (pos, _, rotation) = first_text(&packet);
+        assert_eq!(rotation, 0.0);
+        assert_eq!(pos, flat_pos);
+    }
+}
+
+#[test]
+fn text_in_a_rotated_scaled_group_carries_both() {
+    let packet = packet_for(text_group(json!({"rotate": 0.3, "scale": 2})));
+    let (_, size, rotation) = first_text(&packet);
+    assert!((rotation - 0.3).abs() < 1e-5);
+    assert!((size - 40.0).abs() < 1e-3);
+}
+
+fn sdf_group(group: Value) -> Value {
+    let mut base = json!({"type": "draw-group", "position": {"x": 10, "y": 10}, "items": [
+        {"type": "draw-shape", "shape": "rect", "position": {"x": 0, "y": 0}, "anchor": "top-left",
+         "width": 40, "height": 20, "fill": "#ff0000", "corners": {"radius": [8, 8, 8, 8]}}]});
+    for (key, value) in group.as_object().unwrap() {
+        base[key] = value.clone();
+    }
+    free_props(json!([base]))
+}
+
+#[test]
+fn an_sdf_shape_in_a_moved_scaled_rotated_group_follows_the_transform() {
+    let moved = packet_for(sdf_group(json!({})));
+    let scaled = packet_for(sdf_group(json!({"scale": 2, "rotate": 0.4})));
+    let moved_sdf = sdf_commands(&moved);
+    let [DrawCommand::Sdf {
+        rect: r0,
+        corners: c0,
+        rotation: a0,
+        ..
+    }] = moved_sdf.as_slice()
+    else {
+        panic!("one sdf in the moved group: {:?}", moved.draw_commands)
+    };
+    let scaled_sdf = sdf_commands(&scaled);
+    let [DrawCommand::Sdf {
+        rect: r1,
+        corners: c1,
+        rotation: a1,
+        ..
+    }] = scaled_sdf.as_slice()
+    else {
+        panic!("one sdf in the scaled group: {:?}", scaled.draw_commands)
+    };
+    assert!(
+        (r0.x - 10.0).abs() < 1e-3 && (r0.y - 10.0).abs() < 1e-3,
+        "{r0:?}"
+    );
+    assert!((r1.w - 2.0 * r0.w).abs() < 1e-3 && (r1.h - 2.0 * r0.h).abs() < 1e-3);
+    assert!((c1[0] - 2.0 * c0[0]).abs() < 1e-3);
+    assert!((a1 - a0 - 0.4).abs() < 1e-5);
+}
+
+fn offset_group(extra: Value) -> Value {
+    let mut group = json!({"type": "draw-group", "position": {"x": 0, "y": 0}, "items": [
+        {"type": "draw-shape", "shape": "rect", "position": {"x": 0, "y": 0}, "width": 256, "height": 256,
+         "fill": "#ff0000"}]});
+    for (key, value) in extra.as_object().unwrap() {
+        group[key] = value.clone();
+    }
+    json!({"projection": "free", "scale": 1.0, "drawables": [group]})
+}
+
+fn quad_origin(packet: &GameRenderPacket) -> (f32, f32) {
+    packet
+        .draw_commands
+        .iter()
+        .find_map(|c| match c {
+            DrawCommand::Quad { rect, .. } => Some((rect.x, rect.y)),
+            _ => None,
+        })
+        .expect("grouped rectangle")
+}
+
+#[test]
+fn a_groups_static_offset_moves_it_and_adds_to_the_animated_one() {
+    let (x0, y0) = quad_origin(&packet_for(offset_group(json!({}))));
+    let (x1, y1) = quad_origin(&packet_for(offset_group(
+        json!({"offsetX": 256, "offsetY": 128}),
+    )));
+    assert!((x1 - x0 - TILE_WIDTH).abs() < 0.1, "{x1} {x0}");
+    assert!((y1 - y0 - TILE_WIDTH / 2.0).abs() < 0.1, "{y1} {y0}");
+    let animation = json!({"durationMs": 1000, "loop": false,
+        "keyframes": [{"at": 0, "offsetX": 0}, {"at": 1, "offsetX": 256}]});
+    let both = offset_group(json!({"offsetX": 256, "animation": animation.clone()}));
+    let (bx, _) = quad_origin(&from_props_at(&both, 1000.0).unwrap());
+    assert!((bx - x0 - 2.0 * TILE_WIDTH).abs() < 0.1, "{bx}");
+    let only_animated = offset_group(json!({"animation": animation}));
+    let (ax, _) = quad_origin(&from_props_at(&only_animated, 1000.0).unwrap());
+    assert!(
+        (ax - x0 - TILE_WIDTH).abs() < 0.1,
+        "control: animation alone is unchanged"
+    );
+}

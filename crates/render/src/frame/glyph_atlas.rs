@@ -397,7 +397,7 @@ impl GlyphPass {
     }
 
     /// The instances that draw `command` (a `Text` without a halo) onto a `target` px surface, `scale` px per
-    /// packet unit, grouped by atlas page in first-use order. `None` when the command is not a plain text, or a
+    /// packet unit, grouped by atlas page in first-use order. `None` when the command is not a plain unrotated text, or a
     /// glyph is too large for a page (the caller draws it on the CPU).
     pub(crate) fn place_text(
         &mut self,
@@ -417,6 +417,7 @@ impl GlyphPass {
             halo: None,
             family,
             color_runs,
+            rotation: 0.0,
         } = command
         else {
             return None;

@@ -82,6 +82,7 @@ pub fn from_props(props: &serde_json::Value) -> GameRenderPacket {
         });
         draw_commands.push(DrawCommand::Text {
             color_runs: Vec::new(),
+            rotation: 0.0,
             text: format!("viewport {:.0}/{:.0}px", canvas_w, world_w),
             pos: Vec2 {
                 x: 8.0,

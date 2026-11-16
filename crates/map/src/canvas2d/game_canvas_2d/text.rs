@@ -301,6 +301,7 @@ pub(super) fn paint_text(
                         paragraph.starts[i],
                         line.chars().count(),
                     ),
+                    rotation: 0.0,
                 });
             }
         }
@@ -503,6 +504,7 @@ pub(super) fn paint_text(
             halo: None,
             family,
             color_runs: color_runs.clone(),
+            rotation: 0.0,
         });
     }
     if editing.active() {
@@ -568,6 +570,8 @@ pub(super) fn named_family(name: &str) -> Option<orbital_canvas_base::packet::Te
         "serif" => Some(TextFamily::Serif),
         "reem kufi" => Some(TextFamily::Display),
         "cairo" => Some(TextFamily::Body),
-        _ => None,
+        "display" | "body" => Some(TextFamily::Sans),
+        "mono" => Some(TextFamily::Mono),
+        other => orbital_canvas_base::faces::face_named(other),
     }
 }

@@ -74,6 +74,7 @@ pub fn from_props(props: &serde_json::Value) -> GameRenderPacket {
     // Grid size label.
     draw_commands.push(DrawCommand::Text {
         color_runs: Vec::new(),
+        rotation: 0.0,
         text: format!("{}×{} tiles", cols, rows),
         pos: Vec2 { x: 8.0, y: 8.0 },
         size: 12.0,
@@ -118,6 +119,7 @@ pub fn from_props(props: &serde_json::Value) -> GameRenderPacket {
         });
         draw_commands.push(DrawCommand::Text {
             color_runs: Vec::new(),
+            rotation: 0.0,
             text: "Loading\u{2026}".to_string(),
             pos: Vec2 {
                 x: width / 2.0 - 30.0,

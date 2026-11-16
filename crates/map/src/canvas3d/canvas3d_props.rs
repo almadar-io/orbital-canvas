@@ -435,6 +435,7 @@ fn label(
 ) -> DrawCommand {
     DrawCommand::Text {
         color_runs: Vec::new(),
+        rotation: 0.0,
         text,
         pos,
         size,

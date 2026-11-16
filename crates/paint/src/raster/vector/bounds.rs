@@ -94,16 +94,30 @@ pub fn command_bounds(command: &DrawCommand) -> RunBounds {
             weight,
             halo,
             family,
+            rotation,
             ..
         } => match text_path(text, *pos, *size, *align, *weight >= 600, *family) {
             Some(paths) => {
                 let b = paths.all.bounds();
                 let reach = halo.as_ref().map(|h| h.width).unwrap_or(0.0) + size * 0.05 + 1.0;
+                let (sin, cos) = rotation.sin_cos();
+                let corners = [
+                    (b.left(), b.top()),
+                    (b.right(), b.top()),
+                    (b.right(), b.bottom()),
+                    (b.left(), b.bottom()),
+                ]
+                .map(|(x, y)| {
+                    let (dx, dy) = (x - pos.x, y - pos.y);
+                    (pos.x + dx * cos - dy * sin, pos.y + dx * sin + dy * cos)
+                });
+                let xs = corners.map(|c| c.0);
+                let ys = corners.map(|c| c.1);
                 RunBounds::Box {
-                    x0: b.left(),
-                    y0: b.top(),
-                    x1: b.right(),
-                    y1: b.bottom(),
+                    x0: xs.into_iter().fold(f32::INFINITY, f32::min),
+                    y0: ys.into_iter().fold(f32::INFINITY, f32::min),
+                    x1: xs.into_iter().fold(f32::NEG_INFINITY, f32::max),
+                    y1: ys.into_iter().fold(f32::NEG_INFINITY, f32::max),
                 }
                 .grow(reach)
             }
