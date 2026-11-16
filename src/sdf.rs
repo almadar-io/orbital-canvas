@@ -425,6 +425,7 @@ impl SdfPass {
         packet_size: (f32, f32),
         time_ms: f64,
         pointer: Option<Vec2>,
+        scroll: f32,
     ) -> (wgpu::BindGroup, wgpu::Buffer) {
         let mut floats = vec![0.0f32; HEADER_FLOATS + MAX_INSTANCES * FIELDS * 4];
         floats[0] = packet_size.0.max(1.0);
@@ -435,6 +436,7 @@ impl SdfPass {
             floats[4] = p.x;
             floats[5] = p.y;
         }
+        floats[6] = scroll;
         for (n, instance) in instances.iter().take(MAX_INSTANCES).enumerate() {
             for (k, slot) in instance.0.iter().enumerate() {
                 let at = HEADER_FLOATS + (n * FIELDS + k) * 4;

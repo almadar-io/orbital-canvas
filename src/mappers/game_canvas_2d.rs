@@ -86,6 +86,8 @@ pub struct Region {
     pub rotation: f32,
     /// The drawable declared `wheel: true`: the wheel over it is the canvas's, not the page's.
     pub wheel: bool,
+    /// The drawable, or a group holding it, declared `fixed: true`: it stays put when the page scrolls.
+    pub fixed: bool,
 }
 
 /// What the drawable walk gathers besides display commands: regions and measured texts, both in paint order.
@@ -100,7 +102,74 @@ pub struct Gathered {
     texts: std::collections::HashMap<String, String>,
     labelled: Vec<(usize, String)>,
     valued: Vec<(usize, String)>,
+    /// Command ranges of `fixed` drawables, which stay put when the page scrolls.
+    pinned: Vec<(usize, usize)>,
+    /// Scroll-clocked drawable animations, played per frame at the page scroll.
+    animations: Vec<crate::packet::Animation>,
 }
+
+/// A drawable `animation` with `clock: "scroll"` as a packet animation over its commands: progress is the page
+/// scroll's place between `from` and `to`; keyframes carry `at`, `opacity`, `scale`, `rotate`, `offsetX` and
+/// `offsetY` (offsets in scene units, like a time-clocked drawable animation's).
+fn scroll_animation(
+    node: &Value,
+    to_screen: &dyn Fn(f32, f32) -> (f32, f32),
+    painted: &[DrawCommand],
+) -> Result<Option<crate::packet::Animation>, CanvasSceneError> {
+    let Some(animation) = node.get("animation").filter(|a| crate::animate::is_scroll_clocked(a)) else {
+        return Ok(None);
+    };
+    let number = |key: &str| {
+        animation
+            .get(key)
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite())
+            .map(|n| n as f32)
+            .ok_or_else(|| invalid(&format!("animation.{key}"), "a scroll-clocked animation needs a finite number"))
+    };
+    let (from, to) = (number("from")?, number("to")?);
+    let frames = animation
+        .get("keyframes")
+        .and_then(Value::as_array)
+        .filter(|f| !f.is_empty())
+        .ok_or_else(|| invalid("animation.keyframes", "a scroll-clocked animation needs keyframes"))?;
+    let (zero_x, zero_y) = to_screen(0.0, 0.0);
+    let keyframes = frames
+        .iter()
+        .map(|frame| {
+            let get = |key: &str| frame.get(key).and_then(Value::as_f64).map(|n| n as f32);
+            let at = get("at").ok_or_else(|| invalid("animation.keyframes.at", "each keyframe needs `at`"))?;
+            Ok(crate::packet::Keyframe {
+                offset: at,
+                scale: get("scale"),
+                rotate: get("rotate"),
+                opacity: get("opacity"),
+                offset_x: get("offsetX").map(|x| to_screen(x, 0.0).0 - zero_x),
+                offset_y: get("offsetY").map(|y| to_screen(0.0, y).1 - zero_y),
+                ..crate::packet::Keyframe::default()
+            })
+        })
+        .collect::<Result<Vec<_>, CanvasSceneError>>()?;
+    let origin = commands_bounds(painted)
+        .map(|r| Vec2 {
+            x: r.x + r.w / 2.0,
+            y: r.y + r.h / 2.0,
+        })
+        .unwrap_or(Vec2 { x: zero_x, y: zero_y });
+    Ok(Some(crate::packet::Animation {
+        first: 0,
+        end: 0,
+        duration_ms: 1.0,
+        delay_ms: 0.0,
+        iterations: None,
+        easing: crate::packet::Easing::Linear,
+        origin,
+        base_rotation: 0.0,
+        keyframes,
+        clock: crate::packet::AnimationClock::Scroll { from, to },
+    }))
+}
+
 
 fn invalid(field: &str, detail: impl Into<String>) -> CanvasSceneError {
     CanvasSceneError::InvalidProp {
@@ -243,6 +312,7 @@ pub fn from_props_mapped(
     if let Some(bg) = props.get("backgroundImage").filter(|bg| !bg.is_null()) {
         draw_commands.extend(background_sprites(bg, width, height, cam));
     }
+    gathered.pinned.push((0, draw_commands.len()));
 
     for node in &drawables {
         walk(
@@ -269,6 +339,8 @@ pub fn from_props_mapped(
     }
 
     super::layer_props::check_target_cycles(&draw_commands)?;
+    let pinned = std::mem::take(&mut gathered.pinned);
+    let animations = std::mem::take(&mut gathered.animations);
     let packet = GameRenderPacket {
         pattern: "canvas-2d".into(),
         width,
@@ -284,9 +356,11 @@ pub fn from_props_mapped(
         tick_event: get_string(props, "tickEvent"),
         draw_event: get_string(props, "drawEvent"),
         fps: props.get("fps").and_then(Value::as_u64).map(|f| f as u32),
-        animations: Vec::new(),
+        animations,
         time_ms: 0.0,
         pointer: None,
+        scroll: 0.0,
+        pinned,
     };
     Ok((packet, gathered))
 }
@@ -456,7 +530,23 @@ fn walk(
     out: &mut Vec<DrawCommand>,
 ) -> Result<(), CanvasSceneError> {
     let (out_start, region_start) = (out.len(), gathered.regions.len());
+    let (hit_start, semantic_start) = (gathered.text_hits.len(), gathered.semantic.len());
     walk_paint(node, projector, to_screen, zoom, epoch_now_ms, gathered, out)?;
+    let fixed = node.get("fixed").and_then(Value::as_bool) == Some(true);
+    if fixed {
+        gathered.regions[region_start..].iter_mut().for_each(|r| r.fixed = true);
+        gathered.text_hits[hit_start..].iter_mut().for_each(|h| h.fixed = true);
+        gathered.semantic[semantic_start..].iter_mut().for_each(|n| n.fixed = true);
+        gathered.pinned.retain(|&(first, _)| first < out_start);
+        gathered.pinned.push((out_start, out.len()));
+    }
+    if let Some(animation) = scroll_animation(node, to_screen, &out[out_start..])? {
+        gathered.animations.push(crate::packet::Animation {
+            first: out_start,
+            end: out.len(),
+            ..animation
+        });
+    }
     let Some(id) = node.get("id").and_then(Value::as_str) else {
         return Ok(());
     };
@@ -510,6 +600,7 @@ fn walk(
             .and_then(Value::as_f64)
             .map_or(paint_order, |o| o as f32),
         rect,
+        fixed,
     });
     Ok(())
 }
@@ -1217,6 +1308,7 @@ fn paint_sprite_gathering(
                 rect,
                 rotation,
                 wheel: takes_wheel(node),
+            fixed: false,
             });
         }
     }
@@ -1722,11 +1814,13 @@ fn paint_text(
                     },
                     rotation: 0.0,
                     wheel: takes_wheel(node),
+                fixed: false,
                 });
                 if text == original {
                     if let Some(positions) = caret_positions(&paragraph.lines, text, size, bold, family) {
                         gathered.text_hits.push(super::scene::TextHit {
                             id: id.to_string(),
+                            fixed: false,
                             lines: positions
                                 .into_iter()
                                 .enumerate()
@@ -1814,6 +1908,7 @@ fn paint_text(
                     },
                     rotation: 0.0,
                     wheel: takes_wheel(node),
+                fixed: false,
                 });
                 if text == original {
                     if let Some(mut positions) = caret_positions(&[text.to_string()], text, size, bold, family) {
@@ -1821,6 +1916,7 @@ fn paint_text(
                         let (start, edges) = (laid.start, laid.edges);
                         gathered.text_hits.push(super::scene::TextHit {
                             id: id.to_string(),
+                            fixed: false,
                             lines: vec![super::scene::TextHitLine {
                                 top: sy - h / 2.0,
                                 bottom: sy + h / 2.0,
@@ -2825,6 +2921,7 @@ fn paint_sdf_shape(
             rect,
             rotation,
             wheel: takes_wheel(node),
+        fixed: false,
         });
     }
     out.push(DrawCommand::Sdf {
@@ -3249,6 +3346,7 @@ fn paint_vector_shape(
                 rect,
                 rotation: 0.0,
                 wheel: takes_wheel(node),
+            fixed: false,
             });
         }
     }

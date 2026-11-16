@@ -4,7 +4,7 @@
 //! not elapsed and a finished animation all draw it unchanged.
 
 use crate::packet::{
-    Animation, ColorRun, DrawCommand, Easing, FillPattern, GameRenderPacket, Gradient, Halo, PathSegment,
+    Animation, AnimationClock, ColorRun, DrawCommand, Easing, FillPattern, GameRenderPacket, Gradient, Halo, PathSegment,
     Stroke, Vec2,
 };
 use serde_json::Value;
@@ -25,10 +25,17 @@ pub fn start_ms(animation: &Value) -> Result<Option<f64>, String> {
     }
 }
 
+/// Whether a drawable `animation` plays on the page scroll (`clock: "scroll"`): the packet plays it per frame, so the
+/// paint clock draws its rest frame.
+pub fn is_scroll_clocked(animation: &Value) -> bool {
+    animation.get("clock").and_then(Value::as_str) == Some("scroll")
+}
+
 /// Whether the animation plays at the paint clock: any running clock, or a `startMs` animation at no clock, which
-/// shows its end state.
+/// shows its end state. A scroll-clocked animation never does.
 pub fn plays_at(animation: &Value, epoch_now_ms: f64) -> bool {
-    epoch_now_ms > 0.0 || matches!(start_ms(animation), Ok(Some(_)))
+    !is_scroll_clocked(animation)
+        && (epoch_now_ms > 0.0 || matches!(start_ms(animation), Ok(Some(_))))
 }
 
 pub fn drawable_track(animation: &Value, time_ms: f64, key: &str) -> Option<Value> {
@@ -122,6 +129,8 @@ pub(crate) struct Sample {
     pub rotate: f32,
     pub opacity: f32,
     pub dash_offset: f32,
+    pub offset_x: f32,
+    pub offset_y: f32,
 }
 
 fn bezier(p1: (f32, f32), p2: (f32, f32), x: f32) -> f32 {
@@ -203,14 +212,36 @@ impl Animation {
         if self.iterations.is_some_and(|n| cycle >= n as f32) {
             return None;
         }
-        let progress = local / self.duration_ms - cycle;
+        Some(self.sample_progress(local / self.duration_ms - cycle))
+    }
+
+    fn sample_progress(&self, progress: f32) -> Sample {
         let rotation = track(self, progress, self.base_rotation, |k| k.rotate);
-        Some(Sample {
+        Sample {
             scale: track(self, progress, 1.0, |k| k.scale),
             rotate: rotation - self.base_rotation,
             opacity: track(self, progress, 1.0, |k| k.opacity),
             dash_offset: track(self, progress, 0.0, |k| k.dash_offset),
-        })
+            offset_x: track(self, progress, 0.0, |k| k.offset_x),
+            offset_y: track(self, progress, 0.0, |k| k.offset_y),
+        }
+    }
+
+    /// The animation on its own clock: the host time `t_ms`, or the page `scroll` offset.
+    pub(crate) fn sample_at(&self, t_ms: f64, scroll: f32) -> Option<Sample> {
+        match self.clock {
+            AnimationClock::Time => self.sample(t_ms),
+            AnimationClock::Scroll { from, to } => {
+                let progress = if to > from {
+                    ((scroll - from) / (to - from)).clamp(0.0, 1.0)
+                } else if scroll < from {
+                    0.0
+                } else {
+                    1.0
+                };
+                Some(self.sample_progress(progress))
+            }
+        }
     }
 }
 
@@ -231,7 +262,10 @@ impl Xform {
         let (sin, cos) = s.rotate.to_radians().sin_cos();
         Self {
             origin: a.origin,
-            translation: Vec2 { x: 0.0, y: 0.0 },
+            translation: Vec2 {
+                x: s.offset_x,
+                y: s.offset_y,
+            },
             scale: s.scale,
             sin,
             cos,
@@ -721,9 +755,39 @@ pub(crate) fn transform_group_commands(
 }
 
 impl GameRenderPacket {
-    /// Whether the packet carries motion.
+    /// Whether the packet carries motion on the host clock, the motion that needs frames of its own; scroll-clocked
+    /// motion moves only when the scroll does.
     pub fn is_animated(&self) -> bool {
+        self.animations
+            .iter()
+            .any(|a| a.clock == AnimationClock::Time)
+    }
+
+    /// Whether the packet carries any motion, on either clock.
+    pub fn has_animations(&self) -> bool {
         !self.animations.is_empty()
+    }
+
+    /// The packet with the page scrolled `offset` packet units down: every command outside the pinned ranges moves
+    /// up by it, and materials read it as `Pixel.scroll`.
+    pub fn scrolled(mut self, offset: f32) -> GameRenderPacket {
+        self.scroll = offset;
+        if offset == 0.0 {
+            return self;
+        }
+        let shift = Xform::group(
+            Vec2 { x: 0.0, y: 0.0 },
+            Vec2 { x: 0.0, y: -offset },
+            1.0,
+            0.0,
+            1.0,
+        );
+        for (i, command) in self.draw_commands.iter_mut().enumerate() {
+            if !self.pinned.iter().any(|&(first, end)| i >= first && i < end) {
+                *command = shift.command(command);
+            }
+        }
+        self
     }
 
     /// The packet as it draws at `t_ms` on the host clock. With `motion` off, or nothing animated,
@@ -734,7 +798,7 @@ impl GameRenderPacket {
         }
         let mut out = self.clone();
         for a in &self.animations {
-            let Some(sample) = a.sample(t_ms) else {
+            let Some(sample) = a.sample_at(t_ms, self.scroll) else {
                 continue;
             };
             let x = Xform::new(a, sample);
@@ -764,6 +828,7 @@ mod tests {
             easing: Easing::EaseOut,
             origin: Vec2 { x: 70.0, y: 70.0 },
             base_rotation: 0.0,
+            clock: AnimationClock::Time,
             keyframes: vec![
                 Keyframe {
                     offset: 0.0,
@@ -830,6 +895,91 @@ mod tests {
             } => s.color[3],
             _ => panic!("no stroke"),
         }
+    }
+
+    fn centre(p: &GameRenderPacket, i: usize) -> (f32, f32) {
+        match &p.draw_commands[i] {
+            DrawCommand::Path { segments, .. } => match segments[0] {
+                PathSegment::Arc { cx, cy, .. } => (cx, cy),
+                _ => panic!("not an arc"),
+            },
+            _ => panic!("not a path"),
+        }
+    }
+
+    fn scrolled(from: f32, to: f32) -> Animation {
+        Animation {
+            delay_ms: 0.0,
+            easing: Easing::Linear,
+            clock: AnimationClock::Scroll { from, to },
+            keyframes: vec![
+                Keyframe {
+                    offset: 0.0,
+                    opacity: Some(0.0),
+                    offset_y: Some(40.0),
+                    ..Keyframe::default()
+                },
+                Keyframe {
+                    offset: 1.0,
+                    opacity: Some(1.0),
+                    offset_y: Some(0.0),
+                    ..Keyframe::default()
+                },
+            ],
+            ..pulse()
+        }
+    }
+
+    #[test]
+    fn a_scroll_clocked_animation_follows_the_scroll_offset_and_holds_outside_its_range() {
+        let a = scrolled(100.0, 300.0);
+        let before = a.sample_at(99_999.0, 0.0).expect("held at the start before the range");
+        assert_eq!((before.opacity, before.offset_y), (0.0, 40.0));
+        let mid = a.sample_at(0.0, 200.0).unwrap();
+        assert!((mid.opacity - 0.5).abs() < 1e-4 && (mid.offset_y - 20.0).abs() < 1e-4);
+        let after = a.sample_at(0.0, 900.0).unwrap();
+        assert_eq!((after.opacity, after.offset_y), (1.0, 0.0));
+        let back = a.sample_at(0.0, 150.0).unwrap();
+        assert!((back.opacity - 0.25).abs() < 1e-4, "scrolling back plays it backwards");
+    }
+
+    #[test]
+    fn a_time_clocked_animation_ignores_the_scroll_offset() {
+        let a = Animation {
+            delay_ms: 0.0,
+            ..pulse()
+        };
+        assert_eq!(a.sample_at(500.0, 0.0), a.sample_at(500.0, 4000.0), "control");
+        assert_eq!(a.sample_at(500.0, 0.0), a.sample(500.0));
+    }
+
+    #[test]
+    fn a_degenerate_scroll_range_is_a_step_at_its_offset() {
+        let a = scrolled(200.0, 200.0);
+        assert_eq!(a.sample_at(0.0, 199.0).unwrap().opacity, 0.0);
+        assert_eq!(a.sample_at(0.0, 200.0).unwrap().opacity, 1.0);
+    }
+
+    #[test]
+    fn keyframe_offsets_translate_the_range_and_resolving_plays_at_the_packet_scroll() {
+        let mut p = packet(vec![circle(40.0), circle(10.0)], vec![scrolled(0.0, 100.0)]);
+        p.scroll = 50.0;
+        let at = p.resolved(0.0, true);
+        assert_eq!(centre(&at, 0), (70.0, 90.0), "half of 40 below the rest");
+        assert!((alpha(&at, 0) - 0.5).abs() < 1e-4);
+        assert_eq!(centre(&at, 1), (70.0, 70.0), "control: outside the range");
+        p.scroll = 100.0;
+        assert_eq!(centre(&p.resolved(0.0, true), 0), (70.0, 70.0));
+    }
+
+    #[test]
+    fn only_time_clocked_motion_asks_for_frames() {
+        let by_scroll = packet(vec![circle(40.0)], vec![scrolled(0.0, 100.0)]);
+        assert!(!by_scroll.is_animated(), "a still page needs no frames");
+        assert!(by_scroll.has_animations());
+        let by_time = packet(vec![circle(40.0)], vec![pulse()]);
+        assert!(by_time.is_animated(), "control");
+        assert!(matches!(by_scroll.resolved(0.0, false), Cow::Borrowed(_)), "reduced motion: rest frame");
     }
 
     #[test]

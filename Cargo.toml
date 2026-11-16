@@ -18,7 +18,8 @@ system-fonts = ["dep:fontdb"]
 orbital-core-base = { git = "https://github.com/almadar-io/orbital-core", branch = "main" }
 wgpu = "26"
 pollster = "0.4"
-image = "0.25"
+# Every default format but `avif`, which is only the AV1 encoder (rav1e); canvas encodes PNG only.
+image = { version = "0.25", default-features = false, features = ["rayon", "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
 # SVG sprites: rasterized at on-screen size x density (see svg.rs). `text` and
 # system fonts stay off - sprites carry no live text, and the mobile targets
 # have no font db to scan; embedded raster images in an SVG stay on.
@@ -61,5 +62,6 @@ web-sys = { version = "0.3", features = ["Window", "Response", "Headers", "HtmlC
 
 
 [dev-dependencies]
+orbital-core-base = { git = "https://github.com/almadar-io/orbital-core", branch = "main", features = ["wgsl"] }
 pretty_assertions = "1.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

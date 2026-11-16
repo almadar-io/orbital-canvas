@@ -1152,6 +1152,7 @@ impl SharedDeviceRenderer {
                 (packet.width, packet.height),
                 packet.time_ms,
                 packet.pointer,
+                packet.scroll,
             );
             kept.push(buffer);
             out.push(Draw::Sdf {
@@ -1222,6 +1223,7 @@ impl SharedDeviceRenderer {
             (packet.width, packet.height),
             packet.time_ms,
             packet.pointer,
+            packet.scroll,
         );
         let behind = set.b.create_view(&wgpu::TextureViewDescriptor::default());
         let aux = pass.aux_group(&device, Some(&behind), target.as_ref().map(|t| &t.view));
@@ -3477,6 +3479,22 @@ mod sdf_tests {
         };
         assert_eq!(px(&over, 64, 32, 32)[0], 255);
         assert_eq!(px(&away, 64, 32, 32)[0], 0, "control: no pointer");
+    }
+
+    #[test]
+    fn a_material_reads_the_page_scroll() {
+        let Some(mut r) = renderer() else { return };
+        let wgsl = "fn shade(px: Pixel) -> vec4<f32> { return vec4<f32>(clamp(px.scroll / 510.0, 0.0, 1.0), 0.0, 0.0, 1.0); }";
+        let at = |r: &mut SharedDeviceRenderer, scroll: f32| {
+            let mut p = packet(vec![with_material(wgsl)], 0.0, None);
+            p.scroll = scroll;
+            draw(r, &p, 64)
+        };
+        let (Some(half), Some(top)) = (at(&mut r, 255.0), at(&mut r, 0.0)) else {
+            return;
+        };
+        assert!((126..=129).contains(&px(&half, 64, 32, 32)[0]), "{:?}", px(&half, 64, 32, 32));
+        assert_eq!(px(&top, 64, 32, 32)[0], 0, "control: at the top");
     }
 
     #[test]

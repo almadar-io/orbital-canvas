@@ -22,6 +22,8 @@ struct Pixel {
   b: vec4<f32>,
   // the blurred, saturated, tinted frame under the shape (straight alpha); zero without a `backdrop`
   behind: vec4<f32>,
+  // the page scroll offset in packet units
+  scroll: f32,
 }
 
 struct SdfParams {
@@ -297,7 +299,7 @@ fn sdf_blend_fragment(in: SdfVsOut, aa: f32) -> vec4<f32> {
     pointer = vec2<f32>(dd.x * cs + dd.y * sn, -dd.x * sn + dd.y * cs) + hs;
   }
   let color = mix(fill_b, fill_a, u.y);
-  let px = Pixel(local, size, local / size, u.x, sdf_params.frame.z, sdf_inst(i, 11u).x, pointer, color, sdf_inst(i, 9u), sdf_inst(i, 10u), sdf_unpremul(sdf_behind_raw(in.clip.xy)));
+  let px = Pixel(local, size, local / size, u.x, sdf_params.frame.z, sdf_inst(i, 11u).x, pointer, color, sdf_inst(i, 9u), sdf_inst(i, 10u), sdf_unpremul(sdf_behind_raw(in.clip.xy)), sdf_params.pointer.z);
   let base = shade(px);
   let opacity = misc.w;
   let fill_cov = clamp(0.5 - u.x / aa, 0.0, 1.0);
@@ -408,7 +410,7 @@ fn fs_main(in: SdfVsOut) -> @location(0) vec4<f32> {
     let sn = sin(misc.z);
     pointer = vec2<f32>(dd.x * cs + dd.y * sn, -dd.x * sn + dd.y * cs) + hs;
   }
-  let px = Pixel(in.local, size, in.local / size, shape.d, sdf_params.frame.z, sdf_inst(i, 11u).x, pointer, fill, sdf_inst(i, 9u), sdf_inst(i, 10u), sdf_unpremul(sdf_behind_raw(in.clip.xy)));
+  let px = Pixel(in.local, size, in.local / size, shape.d, sdf_params.frame.z, sdf_inst(i, 11u).x, pointer, fill, sdf_inst(i, 9u), sdf_inst(i, 10u), sdf_unpremul(sdf_behind_raw(in.clip.xy)), sdf_params.pointer.z);
   var base = shade(px);
   let fill_cov = clamp(0.5 - shape.d / aa, 0.0, 1.0);
   let base_a = base.a * fill_cov * opacity;

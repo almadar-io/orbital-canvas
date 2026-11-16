@@ -442,6 +442,7 @@ impl<'a> Pen<'a> {
             easing: motion.easing,
             origin: Vec2 { x, y },
             base_rotation: motion.base_rotation,
+            clock: crate::packet::AnimationClock::Time,
             keyframes: motion
                 .keyframes
                 .into_iter()

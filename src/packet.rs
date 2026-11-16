@@ -45,6 +45,13 @@ pub struct GameRenderPacket {
     /// The pointer in packet coordinates, absent when it is not over the canvas; 2D materials read it as `Pixel.pointer`.
     #[serde(default)]
     pub pointer: Option<Vec2>,
+    /// The page scroll offset (packet units) at this frame; 2D materials read it as `Pixel.scroll`, and scroll-clocked
+    /// animations play at it.
+    #[serde(default)]
+    pub scroll: f32,
+    /// Ranges of `draw_commands` that stay put when the page scrolls (the background and `fixed` drawables).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned: Vec<(usize, usize)>,
 }
 
 /// CSS timing function between two keyframes.
@@ -75,6 +82,11 @@ pub struct Keyframe {
     /// Phase of the dash pattern of every stroke in the range.
     #[serde(default)]
     pub dash_offset: Option<f32>,
+    /// Translation of the range in packet units.
+    #[serde(default)]
+    pub offset_x: Option<f32>,
+    #[serde(default)]
+    pub offset_y: Option<f32>,
 }
 
 /// A CSS keyframe animation over `draw_commands[first..end]`, in the host's clock time.
@@ -97,6 +109,19 @@ pub struct Animation {
     #[serde(default)]
     pub base_rotation: f32,
     pub keyframes: Vec<Keyframe>,
+    /// What drives the progress: the host clock (the default) or the page scroll.
+    #[serde(default)]
+    pub clock: AnimationClock,
+}
+
+/// What drives an animation: the host clock, or the page scroll, where progress is the scroll offset's place
+/// between `from` and `to` (packet units), held at 0 before and 1 after, so scrolling back plays it backwards.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum AnimationClock {
+    #[default]
+    Time,
+    Scroll { from: f32, to: f32 },
 }
 
 /// 2D camera state.

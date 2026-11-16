@@ -118,6 +118,8 @@ pub struct PointerRegion {
     pub events: PointerEvents,
     /// The drawable declared `wheel: true`.
     pub wheel: bool,
+    /// The drawable, or a group holding it, declared `fixed: true`: it stays put when the page scrolls.
+    pub fixed: bool,
 }
 
 /// One node of a canvas's semantic tree: a drawable with `semantic` and `id`, at its pointer region
@@ -137,6 +139,8 @@ pub struct SemanticNode {
     pub multiline: bool,
     pub order: f32,
     pub rect: Rect,
+    /// The node stays put when the page scrolls.
+    pub fixed: bool,
 }
 
 /// One laid-out line of a hit `draw-text`: its vertical band and the left edge of each caret position, so a press
@@ -153,6 +157,7 @@ pub struct TextHitLine {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextHit {
     pub id: String,
+    pub fixed: bool,
     pub lines: Vec<TextHitLine>,
 }
 
@@ -313,6 +318,7 @@ pub fn map_scene(
                 rotation: region.rotation,
                 events: events.clone(),
                 wheel: region.wheel,
+                fixed: region.fixed,
             })
             .collect(),
         measured: gathered.measured,
