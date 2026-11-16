@@ -30,7 +30,8 @@ static LATIN_BYTES: &[u8] = include_bytes!("../assets/fonts/DejaVuSans-subset.tt
 static ARABIC_REGULAR_BYTES: &[u8] =
     include_bytes!("../assets/fonts/NotoSansArabic-Regular-subset.ttf");
 static ARABIC_BOLD_BYTES: &[u8] = include_bytes!("../assets/fonts/NotoSansArabic-Bold-subset.ttf");
-static MONO_BYTES: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono-subset.ttf");
+static MONO_BYTES: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
+static MONO_BOLD_BYTES: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf");
 static SERIF_REGULAR_BYTES: &[u8] = include_bytes!("../assets/fonts/Amiri-Regular.ttf");
 static SERIF_BOLD_BYTES: &[u8] = include_bytes!("../assets/fonts/Amiri-Bold.ttf");
 static DISPLAY_REGULAR_BYTES: &[u8] = include_bytes!("../assets/fonts/ReemKufi-Regular.ttf");
@@ -43,8 +44,9 @@ pub(crate) enum FontId {
     Latin,
     ArabicRegular,
     ArabicBold,
-    /// DejaVu Sans Mono: text a theme draws in its `mono` face.
+    /// JetBrains Mono Regular: text a theme draws in its `mono` face.
     Mono,
+    MonoBold,
     /// Amiri Regular: the generic family `serif` (Latin and Arabic Naskh).
     Serif,
     /// Amiri Bold.
@@ -66,6 +68,8 @@ impl FontId {
             self,
             FontId::ArabicRegular
                 | FontId::ArabicBold
+                | FontId::Mono
+                | FontId::MonoBold
                 | FontId::Serif
                 | FontId::SerifBold
                 | FontId::Display
@@ -79,7 +83,7 @@ impl FontId {
 pub(crate) use crate::packet::TextFamily as Family;
 
 fn font_for(id: FontId) -> Option<&'static rustybuzz::Face<'static>> {
-    static FACES: OnceLock<[Option<rustybuzz::Face<'static>>; 10]> = OnceLock::new();
+    static FACES: OnceLock<[Option<rustybuzz::Face<'static>>; 11]> = OnceLock::new();
     let faces = FACES.get_or_init(|| {
         [
             rustybuzz::Face::from_slice(LATIN_BYTES, 0),
@@ -92,6 +96,7 @@ fn font_for(id: FontId) -> Option<&'static rustybuzz::Face<'static>> {
             rustybuzz::Face::from_slice(DISPLAY_BOLD_BYTES, 0),
             rustybuzz::Face::from_slice(BODY_REGULAR_BYTES, 0),
             rustybuzz::Face::from_slice(BODY_BOLD_BYTES, 0),
+            rustybuzz::Face::from_slice(MONO_BOLD_BYTES, 0),
         ]
     });
     match id {
@@ -99,6 +104,7 @@ fn font_for(id: FontId) -> Option<&'static rustybuzz::Face<'static>> {
         FontId::ArabicRegular => faces[1].as_ref(),
         FontId::ArabicBold => faces[2].as_ref(),
         FontId::Mono => faces[3].as_ref(),
+        FontId::MonoBold => faces[10].as_ref(),
         FontId::Serif => faces[4].as_ref(),
         FontId::SerifBold => faces[5].as_ref(),
         FontId::Display => faces[6].as_ref(),
@@ -106,6 +112,20 @@ fn font_for(id: FontId) -> Option<&'static rustybuzz::Face<'static>> {
         FontId::Body => faces[8].as_ref(),
         FontId::BodyBold => faces[9].as_ref(),
         FontId::Host(i) => host_fonts().read().ok()?.get(i as usize).map(|(_, f)| *f),
+    }
+}
+
+/// Code is drawn as typed: the mono faces' contextual ligatures (`->` as one arrow) stay off.
+fn features_for(id: FontId) -> &'static [rustybuzz::Feature] {
+    static MONO: OnceLock<[rustybuzz::Feature; 2]> = OnceLock::new();
+    match id {
+        FontId::Mono | FontId::MonoBold => MONO.get_or_init(|| {
+            [
+                rustybuzz::Feature::new(rustybuzz::ttf_parser::Tag::from_bytes(b"calt"), 0, ..),
+                rustybuzz::Feature::new(rustybuzz::ttf_parser::Tag::from_bytes(b"liga"), 0, ..),
+            ]
+        }),
+        _ => &[],
     }
 }
 
@@ -236,9 +256,11 @@ pub(crate) struct ShapedCluster {
 /// The face for `c` in `script`: the mono face when asked and it covers `c`, bundled Arabic, the bundled face when its cmap covers the
 /// char, a host face for the script, else the bundled face (`.notdef`) with the script noted.
 fn char_font(c: char, script: Script, bold: bool, family: Family) -> FontId {
-    if family == Family::Mono && font_for(FontId::Mono).is_some_and(|f| f.glyph_index(c).is_some())
-    {
-        return FontId::Mono;
+    if family == Family::Mono {
+        let mono = if bold { FontId::MonoBold } else { FontId::Mono };
+        if font_for(mono).is_some_and(|f| f.glyph_index(c).is_some()) {
+            return mono;
+        }
     }
     if family == Family::Serif {
         let serif = if bold {
@@ -342,7 +364,7 @@ pub(crate) fn shape_in(text: &str, size: f32, bold: bool, family: Family) -> Sha
                 } else {
                     Direction::LeftToRight
                 });
-                let shaped = rustybuzz::shape(face, &[], buffer);
+                let shaped = rustybuzz::shape(face, features_for(font), buffer);
                 let piece_len = range.len();
                 let piece_start = range.start;
                 let mut groups: Vec<(u32, f32, f32, usize, usize)> = Vec::new();
@@ -1985,6 +2007,36 @@ mod tests {
             .glyphs
             .iter()
             .all(|g| g.font == FontId::Mono));
+    }
+
+    #[test]
+    fn mono_code_keeps_one_glyph_per_typed_char_and_bold_takes_the_bold_file() {
+        for text in ["->", "!=", ">=", "=>", "::"] {
+            let s = shape(text, 14.0, false, Family::Mono);
+            let nominal: Vec<u16> = text
+                .chars()
+                .filter_map(|c| font_for(FontId::Mono)?.glyph_index(c).map(|g| g.0))
+                .collect();
+            let gids: Vec<u16> = s.glyphs.iter().map(|g| g.gid).collect();
+            assert_eq!(gids, nominal, "{text} draws the typed characters, not a ligature");
+        }
+        let bold = shape("ab", 14.0, true, Family::Mono);
+        assert!(bold.glyphs.iter().all(|g| g.font == FontId::MonoBold));
+        assert!(!FontId::Mono.faux_bold() && !FontId::MonoBold.faux_bold());
+        let outline = |id: FontId| {
+            let face = font_for(id).unwrap();
+            let bbox = face.glyph_bounding_box(face.glyph_index('H').unwrap()).unwrap();
+            (bbox.x_min, bbox.x_max, bbox.y_max)
+        };
+        assert_ne!(outline(FontId::Mono), outline(FontId::MonoBold));
+        assert!(
+            (shape("iW", 14.0, true, Family::Mono).width - shape("iW", 14.0, false, Family::Mono).width).abs() < 0.01,
+            "bold keeps the cell width"
+        );
+        assert!(
+            shape("ab", 14.0, true, Family::Sans).glyphs.iter().all(|g| g.font == FontId::Latin),
+            "control: sans bold stays in the sans face"
+        );
     }
 
     #[test]
