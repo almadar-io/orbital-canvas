@@ -13,6 +13,7 @@ pub mod fx_projection;
 pub(crate) mod glyph_atlas;
 pub mod gpu;
 pub mod mappers;
+pub mod morph;
 pub mod packet;
 pub mod particles;
 pub mod platform;
@@ -211,7 +212,7 @@ pub(crate) struct ScrollTouch {
     pub(crate) last_y: f32,
     pub(crate) last_ms: f64,
     pub(crate) engaged: bool,
-    /// The press began on a region declaring `wheel: true`, which keeps its gestures.
+    /// The press began on a region declaring `wheel: true` or `drag: true`, which keeps its gestures.
     pub(crate) owned: bool,
 }
 
@@ -519,6 +520,13 @@ impl SceneHost {
         self.text_hits = mapped.text_hits;
         self.measured = mapped.measured;
         self.semantic = mapped.semantic_nodes;
+        match self.scroll_max() {
+            Some(max) => {
+                self.page_scroll.offset = self.page_scroll.offset.min(max);
+                self.page_scroll.reported.get_or_insert(0.0);
+            }
+            None => self.page_scroll = PageScroll::default(),
+        }
         self.report_measured();
         self.report_resize();
         self.report_direction();
@@ -574,8 +582,18 @@ impl SceneHost {
     }
 
     /// The semantic tree of the current scene, in reading order.
-    pub fn semantic_tree(&self) -> &[mappers::scene::SemanticNode] {
-        &self.semantic
+    pub fn semantic_tree(&self) -> Vec<mappers::scene::SemanticNode> {
+        let offset = self.page_scroll.offset;
+        self.semantic
+            .iter()
+            .map(|node| {
+                let mut node = node.clone();
+                if !node.fixed {
+                    node.rect.y -= offset;
+                }
+                node
+            })
+            .collect()
     }
 
     /// Text for the focused text field (`composing`: the input method's preedit).
@@ -747,19 +765,11 @@ impl SceneHost {
                     }
                 };
                 if let Ok(packet) = remapped {
-                    let mut packet = packet.resolved(self.scene_time(), self.motion).into_owned();
-                    packet.time_ms = self.scene_time();
-                    packet.pointer = self.pointer.map(|(x, y)| packet::Vec2 { x, y });
-                    return Some(packet);
+                    return Some(self.present(packet));
                 }
             }
         }
-        let mut packet = self
-            .packet
-            .as_ref()
-            .map(|p| p.resolved(self.scene_time(), self.motion).into_owned())?;
-        packet.time_ms = self.scene_time();
-        packet.pointer = self.pointer.map(|(x, y)| packet::Vec2 { x, y });
+        let mut packet = self.present(self.packet.clone()?);
         if let Some(camera) = self.view3d.as_ref().and_then(scene3d::Scene3DView::camera) {
             for command in &mut packet.draw_commands {
                 if let DrawCommand::Scene3D { scene } = command {
@@ -768,6 +778,17 @@ impl SceneHost {
             }
         }
         Some(packet)
+    }
+
+    /// A mapped packet as this frame draws it: its animations played at the scene time and the page scroll, the
+    /// clock and pointer for materials, and every unpinned command moved up by the scroll.
+    fn present(&self, mut packet: GameRenderPacket) -> GameRenderPacket {
+        let offset = self.page_scroll.offset;
+        packet.scroll = offset;
+        let mut packet = packet.resolved(self.scene_time(), self.motion).into_owned();
+        packet.time_ms = self.scene_time();
+        packet.pointer = self.pointer.map(|(x, y)| packet::Vec2 { x, y });
+        packet.scrolled(offset)
     }
 
     /// Map the current scene again once every asset it asked for has landed (or `timeout` passes):
@@ -818,19 +839,27 @@ impl SceneHost {
     /// The wheel turned at a point (logical points): when the canvas declares `wheelEvent` and the topmost region
     /// under the point declared `wheel: true`, queues `wheelEvent` for it and returns true, the host's cue to keep
     /// the wheel from the page. Anywhere else the wheel is the page's and nothing is sent.
+    /// On a canvas that declares `scroll`, a wheel anywhere else scrolls the page (and the host keeps it from the
+    /// document).
     pub fn wheel(&mut self, x: f32, y: f32, dx: f32, dy: f32) -> bool {
-        if self.canvas_event("wheelEvent").is_none() {
-            return false;
-        }
         let (x, y) = self.to_packet_units(x, y);
-        let Some(target) = self.region_at(x, y).filter(|r| r.wheel).map(|r| r.id.clone()) else {
-            return false;
-        };
-        self.queue_canvas_event(
-            "wheelEvent",
-            serde_json::json!({ "target": target, "x": x, "y": y, "dx": dx, "dy": dy }),
-        );
-        true
+        if self.canvas_event("wheelEvent").is_some() {
+            if let Some((target, fixed)) = self
+                .region_at(x, y)
+                .filter(|r| r.wheel)
+                .map(|r| (r.id.clone(), r.fixed))
+            {
+                let y = self.world_y(fixed, y);
+                self.queue_canvas_event(
+                    "wheelEvent",
+                    serde_json::json!({ "target": target, "x": x, "y": y, "dx": dx, "dy": dy }),
+                );
+                return true;
+            }
+        }
+        self.page_scroll.velocity = 0.0;
+        let (_, delta) = self.to_packet_units(0.0, dy);
+        self.scroll_by(delta)
     }
 
     /// A double tap (the host's recognizer) at a point: the events of the region under it.
@@ -1006,14 +1035,15 @@ impl SceneHost {
         match event_type {
             "touch-down" => {
                 self.touch_down = Some((x, y));
+                let wy = self.world_y(false, y);
                 self.active_drag = self
                     .drags
                     .iter()
                     .rev()
-                    .find(|d| contains(&d.rect, x, y))
+                    .find(|d| contains(&d.rect, x, wy))
                     .map(|d| ActiveDrag {
                         id: d.id.clone(),
-                        grab: (x - d.rect.x, y - d.rect.y),
+                        grab: (x - d.rect.x, wy - d.rect.y),
                         moved: false,
                     });
                 self.pan_from = (self.active_drag.is_none() && self.pannable).then_some((x, y));
@@ -1050,7 +1080,7 @@ impl SceneHost {
                 let dragged = self.active_drag.take().is_some_and(|d| d.moved);
                 if let (Some((dx, dy)), false) = (self.touch_down.take(), dragged) {
                     if (x - dx).hypot(y - dy) <= TAP_SLOP {
-                        let emits = mappers::scene::emits_in(&self.hits, x, y);
+                        let emits = mappers::scene::emits_in(&self.hits, x, self.world_y(false, y));
                         self.scene_events.extend(emits.iter().cloned());
                     }
                 }
@@ -1188,7 +1218,7 @@ impl SceneHost {
     }
 
     /// A touch on a scrolling canvas: once it travels past [`TAP_SLOP`] the page takes it (unless it began on a
-    /// region that declares `wheel: true`), the pressed control loses the pointer as on a cancel, and the page
+    /// region that declares `wheel: true` or `drag: true`), the pressed control loses the pointer as on a cancel, and the page
     /// follows the finger. Returns true when the event was the page's.
     fn scroll_touch(&mut self, event_type: &str, x: f32, y: f32) -> bool {
         if self.scroll_declared().is_none() {
@@ -1197,7 +1227,7 @@ impl SceneHost {
         match event_type {
             "touch-down" => {
                 self.page_scroll.velocity = 0.0;
-                let owned = self.region_at(x, y).is_some_and(|r| r.wheel);
+                let owned = self.region_at(x, y).is_some_and(|r| r.wheel || r.drag);
                 self.page_scroll.touch = Some(ScrollTouch {
                     start_y: y,
                     last_y: y,
@@ -1364,6 +1394,7 @@ impl SceneHost {
         }
         active.moved = true;
         let (id, grab) = (active.id.clone(), active.grab);
+        let y = self.world_y(false, y);
         let Some(region) = self.drags.iter().rev().find(|d| d.id == id) else {
             return;
         };
@@ -1702,6 +1733,7 @@ mod tests {
             },
             wheel: false,
             fixed: false,
+            drag: false,
         }
     }
 
@@ -2087,10 +2119,10 @@ mod tests {
     fn the_semantic_tree_follows_relayouts() {
         let mut r = SceneHost::new();
         r.set_scene(sem_scene(&["a", "b"])).unwrap();
-        let ids: Vec<&str> = r.semantic_tree().iter().map(|n| n.id.as_str()).collect();
+        let ids: Vec<String> = r.semantic_tree().into_iter().map(|n| n.id).collect();
         assert_eq!(ids, vec!["a", "b"]);
         r.set_scene(sem_scene(&["b", "c"])).unwrap();
-        let ids: Vec<&str> = r.semantic_tree().iter().map(|n| n.id.as_str()).collect();
+        let ids: Vec<String> = r.semantic_tree().into_iter().map(|n| n.id).collect();
         assert_eq!(ids, vec!["b", "c"]);
         r.set_scene(sem_scene(&[])).unwrap();
         assert!(r.semantic_tree().is_empty());
@@ -3132,6 +3164,260 @@ mod tests {
         r.set_scene(wheel_scene(false)).unwrap();
         assert!(!r.wheel(10.0, 10.0, 0.0, 40.0), "an undeclared wheel is not the canvas's");
         assert!(events(&mut r).is_empty());
+    }
+
+    fn scroll_scene(declared: bool) -> serde_json::Value {
+        let mut scene = serde_json::json!({
+            "type": "canvas", "mode": "2d", "projection": "free", "camera": {"zoom": 1}, "width": 200, "height": 100,
+            "pointerDownEvent": "DOWN",
+            "drawables": [
+                {"type": "draw-shape", "id": "bar", "shape": "rect", "anchor": "top-left", "position": {"x": 0, "y": 0},
+                 "width": 200, "height": 20, "fill": "#000000", "hit": true, "fixed": true,
+                 "semantic": {"role": "banner", "name": "bar"}},
+                {"type": "draw-shape", "id": "low", "shape": "rect", "anchor": "top-left", "position": {"x": 0, "y": 150},
+                 "width": 200, "height": 40, "fill": "#ff0000", "hit": true,
+                 "semantic": {"role": "button", "name": "low"}},
+                {"type": "draw-shape", "id": "knob", "shape": "rect", "anchor": "top-left", "position": {"x": 150, "y": 40},
+                 "width": 40, "height": 40, "fill": "#00ff00", "hit": true, "drag": true}
+            ]
+        });
+        if declared {
+            scene["scroll"] = serde_json::json!({"height": 300, "event": "SCROLLED", "reportMs": 100});
+        }
+        scene
+    }
+
+    fn command_text(p: &GameRenderPacket, i: usize) -> String {
+        format!("{:?}", p.draw_commands[i])
+    }
+
+    #[test]
+    fn a_scrolling_canvas_takes_the_wheel_and_moves_all_but_its_fixed_drawables() {
+        let mut r = SceneHost::new();
+        r.set_scene(scroll_scene(true)).unwrap();
+        let rest = r.frame_packet().unwrap();
+        assert!(r.wheel(10.0, 50.0, 0.0, 120.0), "the page's wheel is the canvas's");
+        assert_eq!(r.page_scroll(), 120.0);
+        let moved = r.frame_packet().unwrap();
+        assert_eq!(moved.scroll, 120.0, "materials read it");
+        assert_eq!(command_text(&moved, 0), command_text(&rest, 0), "the background stays");
+        assert_eq!(command_text(&moved, 1), command_text(&rest, 1), "the fixed bar stays");
+        assert_ne!(command_text(&moved, 2), command_text(&rest, 2), "the content moves");
+    }
+
+    #[test]
+    fn control_a_canvas_without_scroll_leaves_the_wheel_to_the_page() {
+        let mut r = SceneHost::new();
+        r.set_scene(scroll_scene(false)).unwrap();
+        let rest = r.frame_packet().unwrap();
+        assert!(!r.wheel(10.0, 50.0, 0.0, 120.0));
+        assert_eq!(r.page_scroll(), 0.0);
+        assert_eq!(command_text(&r.frame_packet().unwrap(), 2), command_text(&rest, 2));
+        assert!(r.take_scene_events().is_empty());
+    }
+
+    #[test]
+    fn the_page_scroll_holds_inside_its_content() {
+        let mut r = SceneHost::new();
+        r.set_scene(scroll_scene(true)).unwrap();
+        r.wheel(10.0, 50.0, 0.0, 5000.0);
+        assert_eq!(r.page_scroll(), 200.0, "300 tall in a 100 tall canvas");
+        r.wheel(10.0, 50.0, 0.0, -9000.0);
+        assert_eq!(r.page_scroll(), 0.0);
+    }
+
+    #[test]
+    fn a_press_after_scrolling_hits_what_is_drawn_there_in_scene_coordinates() {
+        let mut r = SceneHost::new();
+        r.set_scene(scroll_scene(true)).unwrap();
+        r.wheel(10.0, 50.0, 0.0, 120.0);
+        r.take_scene_events();
+        r.input("touch-down", 10.0, 40.0, 0, None);
+        let sent = r.take_scene_events();
+        assert_eq!(sent[0].payload["target"], "low");
+        assert_eq!(sent[0].payload["y"], 160.0, "the scene's own height for the program");
+        r.input("touch-up", 10.0, 40.0, 0, None);
+        r.take_scene_events();
+        r.input("touch-down", 10.0, 10.0, 0, None);
+        let sent = r.take_scene_events();
+        assert_eq!(sent[0].payload["target"], "bar", "control: the fixed bar is where it is drawn");
+        assert_eq!(sent[0].payload["y"], 10.0);
+    }
+
+    #[test]
+    fn the_semantic_tree_follows_the_scroll_except_fixed_nodes() {
+        let mut r = SceneHost::new();
+        r.set_scene(scroll_scene(true)).unwrap();
+        r.wheel(10.0, 50.0, 0.0, 120.0);
+        let tree = r.semantic_tree();
+        let rect = |id: &str| tree.iter().find(|n| n.id == id).unwrap().rect;
+        assert_eq!(rect("low").y, 30.0);
+        assert_eq!(rect("bar").y, 0.0, "control");
+    }
+
+    #[test]
+    fn the_offset_reaches_the_program_at_most_once_per_report_interval_and_trails_the_last_move() {
+        let mut r = SceneHost::new();
+        r.set_scene(scroll_scene(true)).unwrap();
+        r.set_clock(1000.0);
+        r.wheel(10.0, 50.0, 0.0, 10.0);
+        let sent = r.take_scene_events();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].event, "SCROLLED");
+        assert_eq!(sent[0].payload, serde_json::json!({"offset": 10.0, "max": 200.0}));
+        r.wheel(10.0, 50.0, 0.0, 10.0);
+        assert!(r.take_scene_events().is_empty(), "inside the interval");
+        assert!(r.wants_frames(), "a pending report keeps the clock running");
+        r.set_clock(1050.0);
+        assert!(r.take_scene_events().is_empty());
+        r.set_clock(1100.0);
+        let sent = r.take_scene_events();
+        assert_eq!(sent.len(), 1, "the trailing report");
+        assert_eq!(sent[0].payload["offset"], 20.0);
+        r.set_clock(1200.0);
+        assert!(r.take_scene_events().is_empty(), "control: nothing moved");
+        assert!(!r.wants_frames());
+    }
+
+    #[test]
+    fn a_touch_that_travels_scrolls_the_page_glides_on_and_rests() {
+        let mut r = SceneHost::new();
+        r.set_scene(scroll_scene(true)).unwrap();
+        r.set_clock(1000.0);
+        r.input("touch-down", 10.0, 90.0, 0, None);
+        r.set_clock(1016.0);
+        r.input("touch-move", 10.0, 70.0, 0, None);
+        assert_eq!(r.page_scroll(), 20.0, "past the slop the page follows the finger");
+        r.set_clock(1032.0);
+        r.input("touch-move", 10.0, 60.0, 0, None);
+        assert_eq!(r.page_scroll(), 30.0);
+        r.input("touch-up", 10.0, 60.0, 0, None);
+        r.take_scene_events();
+        r.set_clock(1048.0);
+        let gliding = r.page_scroll();
+        assert!(gliding > 30.0, "it carries on after the finger lifts: {gliding}");
+        assert!(r.wants_frames());
+        let mut t = 1048.0;
+        while r.wants_frames() && t < 5000.0 {
+            t += 16.0;
+            r.set_clock(t);
+        }
+        assert!(!r.wants_frames(), "it comes to rest");
+        let rested = r.page_scroll();
+        let sent = r.take_scene_events();
+        assert_eq!(sent.last().unwrap().payload["offset"], rested, "the resting offset reaches the program");
+    }
+
+    #[test]
+    fn control_a_touch_on_a_drag_region_keeps_its_travel() {
+        let mut r = SceneHost::new();
+        r.set_scene(scroll_scene(true)).unwrap();
+        r.set_clock(1000.0);
+        r.input("touch-down", 160.0, 50.0, 0, None);
+        r.set_clock(1016.0);
+        r.input("touch-move", 160.0, 20.0, 0, None);
+        assert_eq!(r.page_scroll(), 0.0, "drag: true keeps the gesture");
+    }
+
+    #[test]
+    fn control_a_touch_within_the_slop_is_a_tap() {
+        let mut r = SceneHost::new();
+        r.set_scene(scroll_scene(true)).unwrap();
+        r.input("touch-down", 10.0, 90.0, 0, None);
+        r.input("touch-move", 10.0, 85.0, 0, None);
+        assert_eq!(r.page_scroll(), 0.0);
+    }
+
+    #[test]
+    fn a_scroll_clocked_drawable_plays_at_the_page_scroll_without_a_clock() {
+        let mut scene = scroll_scene(true);
+        scene["drawables"][1]["animation"] = serde_json::json!({
+            "clock": "scroll", "from": 0, "to": 100,
+            "keyframes": [{"at": 0, "opacity": 0}, {"at": 1, "opacity": 1}]
+        });
+        let mut r = SceneHost::new();
+        r.set_scene(scene).unwrap();
+        let top = r.frame_packet().unwrap();
+        assert!(!r.wants_frames(), "a still page needs no frames");
+        r.wheel(10.0, 50.0, 0.0, 50.0);
+        let half = r.frame_packet().unwrap();
+        assert_ne!(command_text(&top, 2), command_text(&half, 2));
+        assert_eq!(top.animations.len(), 1);
+        assert!(matches!(top.animations[0].clock, packet::AnimationClock::Scroll { from, to } if from == 0.0 && to == 100.0));
+    }
+
+    fn morph_scene(animation: serde_json::Value) -> serde_json::Value {
+        let mut scene = scroll_scene(true);
+        scene["drawables"].as_array_mut().unwrap().push(serde_json::json!({
+            "type": "draw-shape", "id": "hero", "shape": "path", "position": {"x": 0, "y": 30},
+            "d": "M0 0 L10 0 L10 10 L0 10 Z", "fill": "#0000ff", "fixed": true, "animation": animation
+        }));
+        scene
+    }
+
+    fn first_point(p: &GameRenderPacket) -> (f32, f32) {
+        match p.draw_commands.last() {
+            Some(DrawCommand::Path { segments, .. }) => match segments[0] {
+                packet::PathSegment::MoveTo { x, y } => (x, y),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_path_morphs_between_outlines_as_the_page_scrolls() {
+        let mut r = SceneHost::new();
+        r.set_scene(morph_scene(serde_json::json!({
+            "clock": "scroll", "from": 0, "to": 100,
+            "keyframes": [{"at": 0, "d": "M0 0 L10 0 L10 10 L0 10 Z"}, {"at": 1, "d": "M40 0 L50 0 L50 10 L40 10 Z"}]
+        })))
+        .unwrap();
+        let (x0, y0) = first_point(&r.frame_packet().unwrap());
+        r.wheel(10.0, 50.0, 0.0, 50.0);
+        let (xh, yh) = first_point(&r.frame_packet().unwrap());
+        assert!((xh - x0 - 20.0).abs() < 0.01, "halfway between the outlines: {x0} -> {xh}");
+        assert_eq!(yh, y0, "fixed: the hero does not scroll away");
+        r.wheel(10.0, 50.0, 0.0, -50.0);
+        assert_eq!(first_point(&r.frame_packet().unwrap()).0, x0, "scrolling back undoes it");
+        r.set_clock(1000.0);
+        r.set_clock(1200.0);
+        assert!(!r.wants_frames());
+    }
+
+    #[test]
+    fn a_morph_on_the_paint_clock_needs_frames_and_a_duration() {
+        let mut r = SceneHost::new();
+        r.set_scene(morph_scene(serde_json::json!({
+            "durationMs": 1000,
+            "keyframes": [{"at": 0, "d": "M0 0 L10 0 L10 10 L0 10 Z"}, {"at": 1, "d": "M40 0 L50 0 L50 10 L40 10 Z"}]
+        })))
+        .unwrap();
+        assert!(r.wants_frames());
+        r.set_clock(0.0);
+        let start = first_point(&r.frame_packet().unwrap()).0;
+        r.set_clock(500.0);
+        assert!((first_point(&r.frame_packet().unwrap()).0 - start - 20.0).abs() < 0.01);
+        assert!(SceneHost::new()
+            .set_scene(morph_scene(serde_json::json!({"keyframes": [{"at": 0, "d": "M0 0 L1 1"}]})))
+            .is_err(), "control: no duration");
+        assert!(SceneHost::new()
+            .set_scene(morph_scene(serde_json::json!({"durationMs": 10, "startMs": 5, "keyframes": [{"at": 0, "d": "M0 0 L1 1"}]})))
+            .is_err(), "control: startMs is refused, not ignored");
+    }
+
+    #[test]
+    fn a_morph_refuses_outlines_with_different_subpath_counts_and_non_path_shapes() {
+        let mismatched = morph_scene(serde_json::json!({
+            "clock": "scroll", "from": 0, "to": 100,
+            "keyframes": [{"at": 0, "d": "M0 0 L10 0 L10 10 Z"}, {"at": 1, "d": "M0 0 L10 0 L10 10 Z M20 0 L30 0 L30 10 Z"}]
+        }));
+        assert!(SceneHost::new().set_scene(mismatched).is_err());
+        let mut rect = morph_scene(serde_json::json!({
+            "clock": "scroll", "from": 0, "to": 100, "keyframes": [{"at": 0, "d": "M0 0 L1 1"}]
+        }));
+        rect["drawables"][3]["shape"] = serde_json::json!("rect");
+        assert!(SceneHost::new().set_scene(rect).is_err());
     }
 
     fn touch(r: &mut SceneHost, kind: &str, x: f32, y: f32, id: i64) -> Vec<mappers::scene::Emit> {

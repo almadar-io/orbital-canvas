@@ -62,6 +62,6 @@ web-sys = { version = "0.3", features = ["Window", "Response", "Headers", "HtmlC
 
 
 [dev-dependencies]
-orbital-core-base = { git = "https://github.com/almadar-io/orbital-core", branch = "main", features = ["wgsl"] }
+orbital-core = { git = "https://github.com/almadar-io/orbital-core", branch = "main", features = ["native"] }
 pretty_assertions = "1.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

@@ -31,10 +31,20 @@ pub fn is_scroll_clocked(animation: &Value) -> bool {
     animation.get("clock").and_then(Value::as_str) == Some("scroll")
 }
 
+/// Whether the packet plays a drawable `animation` per frame: on the scroll clock, or morphing a path (a keyframe
+/// carries `d`). The mapper then draws its rest frame.
+pub fn plays_on_packet(animation: &Value) -> bool {
+    is_scroll_clocked(animation)
+        || animation
+            .get("keyframes")
+            .and_then(Value::as_array)
+            .is_some_and(|frames| frames.iter().any(|f| f.get("d").is_some()))
+}
+
 /// Whether the animation plays at the paint clock: any running clock, or a `startMs` animation at no clock, which
-/// shows its end state. A scroll-clocked animation never does.
+/// shows its end state. One the packet plays never does.
 pub fn plays_at(animation: &Value, epoch_now_ms: f64) -> bool {
-    !is_scroll_clocked(animation)
+    !plays_on_packet(animation)
         && (epoch_now_ms > 0.0 || matches!(start_ms(animation), Ok(Some(_))))
 }
 
@@ -201,6 +211,10 @@ fn track(
 impl Animation {
     /// The animation at `t_ms` on the host clock; `None` while it shows the rest frame.
     pub(crate) fn sample(&self, t_ms: f64) -> Option<Sample> {
+        self.time_progress(t_ms).map(|p| self.sample_progress(p))
+    }
+
+    fn time_progress(&self, t_ms: f64) -> Option<f32> {
         if self.duration_ms <= 0.0 {
             return None;
         }
@@ -212,7 +226,39 @@ impl Animation {
         if self.iterations.is_some_and(|n| cycle >= n as f32) {
             return None;
         }
-        Some(self.sample_progress(local / self.duration_ms - cycle))
+        Some(local / self.duration_ms - cycle)
+    }
+
+    /// Where the animation is on its own clock, 0 to 1; `None` while it shows the rest frame.
+    pub(crate) fn progress_at(&self, t_ms: f64, scroll: f32) -> Option<f32> {
+        match self.clock {
+            AnimationClock::Time => self.time_progress(t_ms),
+            AnimationClock::Scroll { from, to } => Some(if to > from {
+                ((scroll - from) / (to - from)).clamp(0.0, 1.0)
+            } else if scroll < from {
+                0.0
+            } else {
+                1.0
+            }),
+        }
+    }
+
+    /// The morph outline at `progress`: the two frames around it blended with the animation's easing; `None`
+    /// without morph frames.
+    pub(crate) fn morph_at(&self, progress: f32) -> Option<Vec<crate::packet::MorphContour>> {
+        let mut frames: Vec<&crate::packet::MorphFrame> = self.morph.iter().collect();
+        frames.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+        let first = frames.first()?;
+        let before = frames.iter().rev().find(|f| f.offset <= progress).unwrap_or(first);
+        let Some(after) = frames.iter().find(|f| f.offset > progress) else {
+            return Some(before.contours.clone());
+        };
+        if before.offset > progress {
+            return Some(before.contours.clone());
+        }
+        let span = (after.offset - before.offset).max(f32::EPSILON);
+        let k = self.easing.apply((progress - before.offset) / span);
+        Some(crate::morph::blend(&before.contours, &after.contours, k))
     }
 
     fn sample_progress(&self, progress: f32) -> Sample {
@@ -229,19 +275,7 @@ impl Animation {
 
     /// The animation on its own clock: the host time `t_ms`, or the page `scroll` offset.
     pub(crate) fn sample_at(&self, t_ms: f64, scroll: f32) -> Option<Sample> {
-        match self.clock {
-            AnimationClock::Time => self.sample(t_ms),
-            AnimationClock::Scroll { from, to } => {
-                let progress = if to > from {
-                    ((scroll - from) / (to - from)).clamp(0.0, 1.0)
-                } else if scroll < from {
-                    0.0
-                } else {
-                    1.0
-                };
-                Some(self.sample_progress(progress))
-            }
-        }
+        self.progress_at(t_ms, scroll).map(|p| self.sample_progress(p))
     }
 }
 
@@ -798,13 +832,17 @@ impl GameRenderPacket {
         }
         let mut out = self.clone();
         for a in &self.animations {
-            let Some(sample) = a.sample_at(t_ms, self.scroll) else {
+            let Some(progress) = a.progress_at(t_ms, self.scroll) else {
                 continue;
             };
-            let x = Xform::new(a, sample);
+            let x = Xform::new(a, a.sample_progress(progress));
+            let outline = a.morph_at(progress).map(|c| crate::morph::segments(&c));
             let end = a.end.min(out.draw_commands.len());
             for i in a.first.min(end)..end {
-                out.draw_commands[i] = x.command(&self.draw_commands[i]);
+                out.draw_commands[i] = match &outline {
+                    Some(outline) => x.command(&crate::morph::with_outline(&self.draw_commands[i], outline)),
+                    None => x.command(&self.draw_commands[i]),
+                };
             }
         }
         Cow::Owned(out)
@@ -829,6 +867,7 @@ mod tests {
             origin: Vec2 { x: 70.0, y: 70.0 },
             base_rotation: 0.0,
             clock: AnimationClock::Time,
+            morph: Vec::new(),
             keyframes: vec![
                 Keyframe {
                     offset: 0.0,

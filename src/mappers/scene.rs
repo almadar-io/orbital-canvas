@@ -120,6 +120,8 @@ pub struct PointerRegion {
     pub wheel: bool,
     /// The drawable, or a group holding it, declared `fixed: true`: it stays put when the page scrolls.
     pub fixed: bool,
+    /// The drawable declared `drag: true`: a press on it keeps the pointer's travel, the page does not scroll.
+    pub drag: bool,
 }
 
 /// One node of a canvas's semantic tree: a drawable with `semantic` and `id`, at its pointer region
@@ -319,6 +321,7 @@ pub fn map_scene(
                 events: events.clone(),
                 wheel: region.wheel,
                 fixed: region.fixed,
+                drag: region.drag,
             })
             .collect(),
         measured: gathered.measured,

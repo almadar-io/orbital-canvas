@@ -68,7 +68,7 @@ pub enum Easing {
 
 /// One keyframe: the properties it names are interpolated, the others stay as the rest frame draws
 /// them. `scale` and `rotate` (degrees, absolute) act about the animation's origin.
-#[derive(Debug, Copy, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Keyframe {
     /// Position in the cycle, 0 to 1.
     pub offset: f32,
@@ -90,7 +90,7 @@ pub struct Keyframe {
 }
 
 /// A CSS keyframe animation over `draw_commands[first..end]`, in the host's clock time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Animation {
     pub first: usize,
     pub end: usize,
@@ -112,6 +112,23 @@ pub struct Animation {
     /// What drives the progress: the host clock (the default) or the page scroll.
     #[serde(default)]
     pub clock: AnimationClock,
+    /// Outlines the range's paths morph through, by keyframe offset; empty draws the rest outline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub morph: Vec<MorphFrame>,
+}
+
+/// One outline of a path morph at a keyframe offset: contours resampled to the same point count.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MorphFrame {
+    pub offset: f32,
+    pub contours: Vec<MorphContour>,
+}
+
+/// One flattened subpath of a morph outline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MorphContour {
+    pub points: Vec<Vec2>,
+    pub closed: bool,
 }
 
 /// What drives an animation: the host clock, or the page scroll, where progress is the scroll offset's place
@@ -355,7 +372,7 @@ fn default_saturate() -> f32 {
 /// to `end` in the direction of the difference, a full ellipse when it spans
 /// 2 pi or more, and is joined to the current point by a line like canvas
 /// `ellipse()`.
-#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op")]
 pub enum PathSegment {
     MoveTo {

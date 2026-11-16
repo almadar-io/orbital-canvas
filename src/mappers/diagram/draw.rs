@@ -443,6 +443,7 @@ impl<'a> Pen<'a> {
             origin: Vec2 { x, y },
             base_rotation: motion.base_rotation,
             clock: crate::packet::AnimationClock::Time,
+            morph: Vec::new(),
             keyframes: motion
                 .keyframes
                 .into_iter()

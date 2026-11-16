@@ -88,6 +88,8 @@ pub struct Region {
     pub wheel: bool,
     /// The drawable, or a group holding it, declared `fixed: true`: it stays put when the page scrolls.
     pub fixed: bool,
+    /// The drawable declared `drag: true`: a press on it keeps the pointer's travel, the page does not scroll.
+    pub drag: bool,
 }
 
 /// What the drawable walk gathers besides display commands: regions and measured texts, both in paint order.
@@ -104,19 +106,23 @@ pub struct Gathered {
     valued: Vec<(usize, String)>,
     /// Command ranges of `fixed` drawables, which stay put when the page scrolls.
     pinned: Vec<(usize, usize)>,
-    /// Scroll-clocked drawable animations, played per frame at the page scroll.
+    /// Drawable animations the packet plays per frame: scroll-clocked ones and path morphs.
     animations: Vec<crate::packet::Animation>,
 }
 
-/// A drawable `animation` with `clock: "scroll"` as a packet animation over its commands: progress is the page
-/// scroll's place between `from` and `to`; keyframes carry `at`, `opacity`, `scale`, `rotate`, `offsetX` and
-/// `offsetY` (offsets in scene units, like a time-clocked drawable animation's).
-fn scroll_animation(
+/// A drawable `animation` the packet plays per frame (see [`crate::animate::plays_on_packet`]) as a packet
+/// animation over the drawable's commands. Progress follows the page scroll between `from` and `to` with
+/// `clock: "scroll"`, else the paint clock over `durationMs` (looping unless `loop: false`). Keyframes carry `at`,
+/// `opacity`, `scale`, `rotate`, `offsetX` and `offsetY` (scene units, as in a paint-clock drawable animation) and,
+/// on a `path` shape, `d`: the outline at that offset, every `d` with the same number of subpaths.
+fn packet_animation(
     node: &Value,
+    projector: &Projector,
     to_screen: &dyn Fn(f32, f32) -> (f32, f32),
+    zoom: f32,
     painted: &[DrawCommand],
 ) -> Result<Option<crate::packet::Animation>, CanvasSceneError> {
-    let Some(animation) = node.get("animation").filter(|a| crate::animate::is_scroll_clocked(a)) else {
+    let Some(animation) = node.get("animation").filter(|a| crate::animate::plays_on_packet(a)) else {
         return Ok(None);
     };
     let number = |key: &str| {
@@ -125,31 +131,79 @@ fn scroll_animation(
             .and_then(Value::as_f64)
             .filter(|n| n.is_finite())
             .map(|n| n as f32)
-            .ok_or_else(|| invalid(&format!("animation.{key}"), "a scroll-clocked animation needs a finite number"))
     };
-    let (from, to) = (number("from")?, number("to")?);
+    let scrolled = crate::animate::is_scroll_clocked(animation);
+    let (clock, duration_ms, iterations) = if scrolled {
+        let need = |key: &str| {
+            number(key).ok_or_else(|| invalid(&format!("animation.{key}"), "a scroll-clocked animation needs a finite number"))
+        };
+        (crate::packet::AnimationClock::Scroll { from: need("from")?, to: need("to")? }, 1.0, None)
+    } else {
+        if animation.get("startMs").is_some_and(|v| !v.is_null()) {
+            return Err(invalid("animation.startMs", "a morphing animation on the paint clock plays from the scene's first frame and takes no startMs"));
+        }
+        let duration = number("durationMs")
+            .filter(|d| *d > 0.0)
+            .ok_or_else(|| invalid("animation.durationMs", "a morphing animation needs a duration above zero"))?;
+        let looping = animation.get("loop").and_then(Value::as_bool) != Some(false);
+        (crate::packet::AnimationClock::Time, duration, (!looping).then_some(1))
+    };
     let frames = animation
         .get("keyframes")
         .and_then(Value::as_array)
         .filter(|f| !f.is_empty())
-        .ok_or_else(|| invalid("animation.keyframes", "a scroll-clocked animation needs keyframes"))?;
+        .ok_or_else(|| invalid("animation.keyframes", "a packet-played animation needs keyframes"))?;
+    let tw = projector.tile_width;
     let (zero_x, zero_y) = to_screen(0.0, 0.0);
+    let at = |frame: &Value| {
+        frame
+            .get("at")
+            .and_then(Value::as_f64)
+            .map(|n| n as f32)
+            .ok_or_else(|| invalid("animation.keyframes.at", "each keyframe needs `at`"))
+    };
     let keyframes = frames
         .iter()
         .map(|frame| {
             let get = |key: &str| frame.get(key).and_then(Value::as_f64).map(|n| n as f32);
-            let at = get("at").ok_or_else(|| invalid("animation.keyframes.at", "each keyframe needs `at`"))?;
             Ok(crate::packet::Keyframe {
-                offset: at,
+                offset: at(frame)?,
                 scale: get("scale"),
                 rotate: get("rotate"),
                 opacity: get("opacity"),
-                offset_x: get("offsetX").map(|x| to_screen(x, 0.0).0 - zero_x),
-                offset_y: get("offsetY").map(|y| to_screen(0.0, y).1 - zero_y),
+                offset_x: get("offsetX").map(|x| to_screen(x * tw, 0.0).0 - zero_x),
+                offset_y: get("offsetY").map(|y| to_screen(0.0, y * tw).1 - zero_y),
                 ..crate::packet::Keyframe::default()
             })
         })
         .collect::<Result<Vec<_>, CanvasSceneError>>()?;
+    let mut morph = Vec::new();
+    for frame in frames {
+        let Some(d) = frame.get("d") else {
+            continue;
+        };
+        if node.get("shape").and_then(Value::as_str) != Some("path") {
+            return Err(invalid("animation.keyframes.d", "only a `path` shape morphs"));
+        }
+        let d = d
+            .as_str()
+            .ok_or_else(|| invalid("animation.keyframes.d", "an outline is SVG path data"))?;
+        let segments = parse_path_data(d, path_xf(node, projector, to_screen, zoom))
+            .ok_or_else(|| invalid("animation.keyframes.d", format!("malformed SVG path `{d}`")))?;
+        let contours = crate::morph::contours(&segments);
+        if let Some(first) = morph.first().map(|f: &crate::packet::MorphFrame| f.contours.len()) {
+            if contours.len() != first {
+                return Err(invalid(
+                    "animation.keyframes.d",
+                    format!("every outline of a morph has the same number of subpaths ({first}), `{d}` has {}", contours.len()),
+                ));
+            }
+        }
+        morph.push(crate::packet::MorphFrame {
+            offset: at(frame)?,
+            contours,
+        });
+    }
     let origin = commands_bounds(painted)
         .map(|r| Vec2 {
             x: r.x + r.w / 2.0,
@@ -159,15 +213,35 @@ fn scroll_animation(
     Ok(Some(crate::packet::Animation {
         first: 0,
         end: 0,
-        duration_ms: 1.0,
+        duration_ms,
         delay_ms: 0.0,
-        iterations: None,
+        iterations,
         easing: crate::packet::Easing::Linear,
         origin,
         base_rotation: 0.0,
         keyframes,
-        clock: crate::packet::AnimationClock::Scroll { from, to },
+        clock,
+        morph,
     }))
+}
+
+/// The transform a `path` shape's `d` is drawn with: its projected position plus `offsetX`/`offsetY`, scaled by the
+/// tile width, the zoom and its `scale`.
+fn path_xf(node: &Value, projector: &Projector, to_screen: &dyn Fn(f32, f32) -> (f32, f32), zoom: f32) -> Xf {
+    let tw = projector.tile_width;
+    let (bx, by) = node
+        .get("position")
+        .and_then(parse_scene_pos)
+        .map_or((0.0, 0.0), |p| projector.project(p));
+    let (ox, oy) = to_screen(
+        bx + get_f32(node, "offsetX", 0.0) * tw,
+        by + get_f32(node, "offsetY", 0.0) * tw,
+    );
+    Xf {
+        s: tw * zoom * get_f32(node, "scale", 1.0),
+        ox,
+        oy,
+    }
 }
 
 
@@ -188,6 +262,10 @@ fn hit_id(node: &Value) -> Option<&str> {
 
 fn takes_wheel(node: &Value) -> bool {
     node.get("wheel").and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn takes_drag(node: &Value) -> bool {
+    node.get("drag").and_then(Value::as_bool).unwrap_or(false)
 }
 
 /// Build a display-list packet from `canvas-2d` props (kernel-resolved).
@@ -540,7 +618,7 @@ fn walk(
         gathered.pinned.retain(|&(first, _)| first < out_start);
         gathered.pinned.push((out_start, out.len()));
     }
-    if let Some(animation) = scroll_animation(node, to_screen, &out[out_start..])? {
+    if let Some(animation) = packet_animation(node, projector, to_screen, zoom, &out[out_start..])? {
         gathered.animations.push(crate::packet::Animation {
             first: out_start,
             end: out.len(),
@@ -1309,6 +1387,7 @@ fn paint_sprite_gathering(
                 rotation,
                 wheel: takes_wheel(node),
             fixed: false,
+            drag: takes_drag(node),
             });
         }
     }
@@ -1815,6 +1894,7 @@ fn paint_text(
                     rotation: 0.0,
                     wheel: takes_wheel(node),
                 fixed: false,
+                drag: takes_drag(node),
                 });
                 if text == original {
                     if let Some(positions) = caret_positions(&paragraph.lines, text, size, bold, family) {
@@ -1909,6 +1989,7 @@ fn paint_text(
                     rotation: 0.0,
                     wheel: takes_wheel(node),
                 fixed: false,
+                drag: takes_drag(node),
                 });
                 if text == original {
                     if let Some(mut positions) = caret_positions(&[text.to_string()], text, size, bold, family) {
@@ -2922,6 +3003,7 @@ fn paint_sdf_shape(
             rotation,
             wheel: takes_wheel(node),
         fixed: false,
+        drag: takes_drag(node),
         });
     }
     out.push(DrawCommand::Sdf {
@@ -3248,18 +3330,7 @@ fn paint_vector_shape(
                 gap_once("shape-path", "draw-shape path without d");
                 return;
             };
-            let (bx, by) = projector.project(position);
-            let x = bx + get_f32(node, "offsetX", 0.0) * tw;
-            let y = by + get_f32(node, "offsetY", 0.0) * tw;
-            let (ox, oy) = to_screen(x, y);
-            let Some(segments) = parse_path_data(
-                d,
-                Xf {
-                    s: tw * zoom * get_f32(node, "scale", 1.0),
-                    ox,
-                    oy,
-                },
-            ) else {
+            let Some(segments) = parse_path_data(d, path_xf(node, projector, to_screen, zoom)) else {
                 gap_once("shape-path-data", "malformed draw-shape SVG path");
                 return;
             };
@@ -3347,6 +3418,7 @@ fn paint_vector_shape(
                 rotation: 0.0,
                 wheel: takes_wheel(node),
             fixed: false,
+            drag: takes_drag(node),
             });
         }
     }
