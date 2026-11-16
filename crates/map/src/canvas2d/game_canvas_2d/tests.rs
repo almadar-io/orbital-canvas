@@ -2909,7 +2909,7 @@ fn sdf_shadow(shadow: Value) -> Option<orbital_canvas_base::packet::SdfShadow> {
         json!({"corners": {"radius": [4, 4, 4, 4], "kind": "round"}, "shadow": shadow})
     )])));
     match sdf_commands(&packet).as_slice() {
-        [DrawCommand::Sdf { shadow, .. }] => shadow.clone(),
+        [DrawCommand::Sdf { shadow, .. }] => *shadow,
         other => panic!("one sdf expected: {other:?}"),
     }
 }
@@ -3119,4 +3119,144 @@ fn a_groups_static_offset_moves_it_and_adds_to_the_animated_one() {
         (ax - x0 - TILE_WIDTH).abs() < 0.1,
         "control: animation alone is unchanged"
     );
+}
+
+fn fit_node(text: &str, extra: Value) -> Value {
+    let mut node = json!({"type": "draw-text", "id": "f", "text": text, "color": "#000000",
+        "font": "bold 40px sans-serif", "position": {"x": 5, "y": 5}, "anchor": "top-left",
+        "measure": true, "width": 80});
+    for (key, value) in extra.as_object().unwrap() {
+        node[key] = value.clone();
+    }
+    node
+}
+
+fn fitted(node: Value) -> (f32, Vec<(String, f32)>, Measured) {
+    let (packet, gathered) = from_props_mapped(&free_props(json!([node])), 0.0).unwrap();
+    let texts: Vec<(String, f32)> = packet
+        .draw_commands
+        .iter()
+        .filter_map(|c| match c {
+            DrawCommand::Text { text, size, .. } => Some((text.clone(), *size)),
+            _ => None,
+        })
+        .collect();
+    let size = texts.first().expect("painted").1;
+    (size, texts, gathered.measured[0].clone())
+}
+
+const LONG: &str = "Poster type in a fixed cell spills over what is below";
+
+#[test]
+fn fit_shrink_steps_a_long_string_down_until_its_measured_height_is_within_the_box() {
+    let (size, _, m) = fitted(fit_node(
+        LONG,
+        json!({"height": 60, "fit": "shrink", "minSize": 8}),
+    ));
+    assert!((8.0..40.0).contains(&size), "{size}");
+    assert!(m.height <= 60.0 + 1e-3, "{}", m.height);
+    assert!(m.width <= 80.0 + 1e-3, "{}", m.width);
+    assert!((m.height - m.lines as f32 * size * 1.3).abs() < 1e-3);
+    let (again, _, _) = fitted(fit_node(
+        LONG,
+        json!({"height": 60, "fit": "shrink", "minSize": 8}),
+    ));
+    assert_eq!(size, again);
+}
+
+#[test]
+fn control_fit_none_keeps_the_declared_size_and_overflows_as_before() {
+    for extra in [
+        json!({"height": 60}),
+        json!({"height": 60, "fit": "none"}),
+        json!({}),
+    ] {
+        let (size, _, m) = fitted(fit_node(LONG, extra));
+        assert_eq!(size, 40.0);
+        assert!(m.height > 60.0);
+    }
+}
+
+#[test]
+fn control_text_that_already_fits_keeps_its_declared_size() {
+    let (size, _, m) = fitted(fit_node(
+        "Hi",
+        json!({"height": 60, "fit": "shrink", "width": 200}),
+    ));
+    assert_eq!(size, 40.0);
+    assert_eq!(m.lines, 1);
+}
+
+#[test]
+fn fit_shrink_steps_down_for_one_unbreakable_word_wider_than_the_box() {
+    let (size, texts, m) = fitted(fit_node(
+        "Extraordinarily",
+        json!({"height": 200, "fit": "shrink", "minSize": 8}),
+    ));
+    assert!(size < 40.0, "{size}");
+    assert_eq!(texts.len(), 1);
+    assert!(m.width <= 80.0 + 1e-3, "{}", m.width);
+}
+
+#[test]
+fn fit_shrink_stops_at_min_size_and_paints_there_overflowing() {
+    let (size, _, m) = fitted(fit_node(
+        LONG,
+        json!({"height": 20, "fit": "shrink", "minSize": 18}),
+    ));
+    assert_eq!(size, 18.0);
+    assert!(m.height > 20.0);
+}
+
+#[test]
+fn fit_shrink_respects_max_lines() {
+    let (_, texts, m) = fitted(fit_node(
+        LONG,
+        json!({"height": 60, "fit": "shrink", "minSize": 8, "maxLines": 2, "width": 200}),
+    ));
+    assert!(texts.len() <= 2);
+    assert!(m.height <= 60.0 + 1e-3);
+}
+
+#[test]
+fn fit_shrink_works_for_right_to_left_text() {
+    let (size, _, m) = fitted(fit_node(
+        "عنوان طويل جدا يتجاوز الصندوق المحدد له في الصفحة",
+        json!({"height": 60, "fit": "shrink", "minSize": 8}),
+    ));
+    assert!(size < 40.0);
+    assert!(m.height <= 60.0 + 1e-3);
+}
+
+#[test]
+fn fit_shrink_inside_a_rotated_group_fits_the_same_and_keeps_the_rotation() {
+    let group = |rotate: f64| {
+        free_props(
+            json!([{"type": "draw-group", "position": {"x": 100, "y": 50}, "rotate": rotate,
+            "items": [fit_node(LONG, json!({"height": 60, "fit": "shrink", "minSize": 8}))]}]),
+        )
+    };
+    let flat_size = flat_size_of(&group(0.0));
+    let (_, tilted_size, rotation) = first_text(&packet_for(group(0.5)));
+    assert!((rotation - 0.5).abs() < 1e-5);
+    assert!((flat_size - tilted_size).abs() < 1e-3);
+    assert!(flat_size < 40.0);
+}
+
+fn flat_size_of(props: &Value) -> f32 {
+    first_text(&packet_for(props.clone())).1
+}
+
+#[test]
+fn fit_shrink_needs_a_width_and_a_height_and_names_the_prop_otherwise() {
+    for node in [
+        fit_node(LONG, json!({"fit": "shrink"})),
+        json!({"type": "draw-text", "text": "x", "color": "#000", "position": {"x": 1, "y": 1},
+            "fit": "shrink", "height": 20}),
+        fit_node(LONG, json!({"fit": "grow", "height": 20})),
+        fit_node(LONG, json!({"fit": "shrink", "height": 20, "minSize": 0})),
+        fit_node(LONG, json!({"height": -1})),
+    ] {
+        assert!(from_props_mapped(&free_props(json!([node])), 0.0).is_err());
+    }
 }

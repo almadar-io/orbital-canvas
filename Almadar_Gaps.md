@@ -7,7 +7,7 @@ Every open gap this repo owns lives here. This file is the source of truth; the 
 - **Codes:** new gaps use this repo's prefix `G-ORBITAL-GAME-RENDERER-`. Take the "Next code" below, then bump it in the same edit. Codes are never reused or renamed.
 - **Close by deleting.** Remove the entry in the same commit as the fix.
 
-Next code: `G-ORBITAL-GAME-RENDERER-030`
+Next code: `G-ORBITAL-GAME-RENDERER-031`
 
 - **G-ORBITAL-GAME-RENDERER-028** [mechanical] — A theme font file that is a variable font draws weights below 600 at its 400 instance: `url_font` keys a face by (file, bold) and sets `wght` 700 for bold (real bold since 2026-11-16) and 400 otherwise, because shaping passes only `bold`, not the text's weight. Symptom: a style asking for 200 or 300 display type (minimalist, luxury) draws it at 400. Fix: thread the text command's weight into shaping and key URL faces by weight. Prevention rung: a paint test that a variable face at 300 and 400 rasterises differently. Severity: low. Root cause: one-off.
 

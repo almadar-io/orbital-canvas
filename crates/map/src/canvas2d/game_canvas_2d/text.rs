@@ -204,6 +204,7 @@ pub(super) fn paint_text(
         }
         None => size,
     };
+    let fit = read_fit(node, zoom)?;
     let id = node.get("id").and_then(Value::as_str);
     let measure = node
         .get("measure")
@@ -232,18 +233,16 @@ pub(super) fn paint_text(
             x + get_f32(node, "offsetX", 0.0),
             y + get_f32(node, "offsetY", 0.0),
         );
-        let paragraph = layout_paragraph(
-            text,
-            size,
-            bold,
-            family,
-            ParagraphBox {
-                width,
-                wrap,
-                max_lines,
-                truncate,
-            },
-        );
+        let frame = ParagraphBox {
+            width,
+            wrap,
+            max_lines,
+            truncate,
+        };
+        let (size, paragraph) = match fit {
+            Some(fit) => fit_paragraph(text, size, bold, family, frame, line_height, fit),
+            None => (size, layout_paragraph(text, size, bold, family, frame)),
+        };
         let line_px = size * line_height;
         let text_start = out.len();
         let revealed = reveal.as_ref().and_then(|reveal| {
@@ -525,6 +524,83 @@ pub(super) fn paint_text(
         }
     }
     Ok(())
+}
+
+/// A paragraph's `fit: "shrink"` box: its height and the smallest font size, in screen units.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Fit {
+    height: f32,
+    min_size: f32,
+}
+
+/// The `fit`, `height` and `minSize` of a `draw-text`: `None` for `fit: "none"` (the default), an error for a
+/// value that is not understood or a `shrink` without the `width` and `height` that make its box.
+pub(super) fn read_fit(node: &Value, zoom: f32) -> Result<Option<Fit>, CanvasSceneError> {
+    let positive = |field: &str| match node.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => match value.as_f64() {
+            Some(v) if v.is_finite() && v > 0.0 => Ok(Some(v as f32 * zoom)),
+            _ => Err(invalid(field, "must be a number above zero")),
+        },
+    };
+    let height = positive("height")?;
+    let min_size = positive("minSize")?;
+    match node.get("fit") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(mode)) if mode == "none" => Ok(None),
+        Some(Value::String(mode)) if mode == "shrink" => {
+            let has_width = node.get("width").is_some_and(|w| !w.is_null());
+            match (height, has_width) {
+                (Some(height), true) => Ok(Some(Fit {
+                    height,
+                    min_size: min_size.unwrap_or(10.0 * zoom),
+                })),
+                _ => Err(invalid("fit", "shrink needs both a width and a height")),
+            }
+        }
+        _ => Err(invalid("fit", "must be \"none\" or \"shrink\"")),
+    }
+}
+
+/// The paragraph at the largest font size, between `fit.min_size` and `size`, whose lines fit `frame.width` and
+/// stack within `fit.height`; at `fit.min_size` it is the paragraph as it falls, overflowing. The size is found by
+/// bisection on the same layout the paint uses.
+pub(super) fn fit_paragraph(
+    text: &str,
+    size: f32,
+    bold: bool,
+    family: orbital_canvas_base::packet::TextFamily,
+    frame: ParagraphBox,
+    line_height: f32,
+    fit: Fit,
+) -> (f32, Paragraph) {
+    let laid = |s: f32| layout_paragraph(text, s, bold, family, frame);
+    let fits = |s: f32, p: &Paragraph| {
+        p.lines.len() as f32 * s * line_height <= fit.height
+            && p.widths.iter().all(|w| *w <= frame.width + 1e-3)
+    };
+    let first = laid(size);
+    let floor = fit.min_size.min(size);
+    if fits(size, &first) || floor >= size {
+        return (size, first);
+    }
+    let at_floor = laid(floor);
+    if !fits(floor, &at_floor) {
+        return (floor, at_floor);
+    }
+    let (mut low, mut high) = (floor, size);
+    let mut best = (floor, at_floor);
+    for _ in 0..24 {
+        let mid = (low + high) / 2.0;
+        let paragraph = laid(mid);
+        if fits(mid, &paragraph) {
+            low = mid;
+            best = (mid, paragraph);
+        } else {
+            high = mid;
+        }
+    }
+    best
 }
 
 pub(crate) fn parse_text_font(
