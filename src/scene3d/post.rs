@@ -553,7 +553,7 @@ mod tests {
             bloom,
             vignette,
         );
-        crate::renderer::copy_texture_to_rgba(device, queue, encoder, &target, SIZE, SIZE).ok()
+        crate::texture::copy_texture_to_rgba(device, queue, encoder, &target, SIZE, SIZE).ok()
     }
 
     fn at(rgba: &[u8], x: u32, y: u32) -> [u8; 4] {

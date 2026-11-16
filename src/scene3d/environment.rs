@@ -5,7 +5,7 @@
 //! Integration in `render.rs`:
 //! 1. Generate once and keep it: [`Environment::room`] (or [`Environment::encode_room`] on an encoder submitted
 //!    later); bind [`Environment::placeholder`] when the scene has no environment.
-//! 2. Append [`IBL_WGSL`] to the lit shader source and add [`Environment::layout_entries`]`(3)` to the frame bind
+//! 2. Append [`crate::shaders::IBL`] to the lit shader source and add [`Environment::layout_entries`]`(3)` to the frame bind
 //!    group layout, [`Environment::bind_entries`]`(3)` to the frame bind group (bindings 3 and 4 of group 0).
 //! 3. In `fs_main`, for standard and physical materials only (three gives `scene.environment` to
 //!    MeshStandardMaterial and its subclass alone), when the frame says an environment is bound (e.g. `options.w`):
@@ -16,13 +16,6 @@
 
 use glam::{Mat4, Quat, Vec3};
 use std::f64::consts::PI;
-
-/// The lit shader's IBL functions: the CubeUV sampler and three's `getIBLIrradiance`/`getIBLRadiance` with
-/// `RE_IndirectSpecular_Physical`. It uses `PI` from prelude.wgsl and declares group 0 bindings 3 and 4.
-pub const IBL_WGSL: &str = concat!(
-    include_str!("cube_uv.wgsl"),
-    include_str!("environment_ibl.wgsl")
-);
 
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub const CUBE_SIZE: u32 = 256;
@@ -379,10 +372,8 @@ impl Environment {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene3d pmrem"),
             source: wgpu::ShaderSource::Wgsl(
-                concat!(
-                    include_str!("cube_uv.wgsl"),
-                    include_str!("environment.wgsl")
-                )
+                [crate::shaders::CUBE_UV, include_str!("environment.wgsl")]
+                .concat()
                 .into(),
             ),
         });
@@ -1013,7 +1004,7 @@ fn fs_ibl_probe(@builtin(position) at: vec4<f32>) -> @location(0) vec4<f32> {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ibl probe"),
             source: wgpu::ShaderSource::Wgsl(
-                [super::super::render::lit_source().as_str(), probe]
+                [crate::shaders::lit_source().as_str(), probe]
                     .concat()
                     .into(),
             ),

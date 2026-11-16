@@ -1,0 +1,608 @@
+//! Typed display-list packet consumed by the shared game renderer.
+
+use serde::{Deserialize, Serialize};
+
+/// Where a particle draw reads its packed words.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "from", rename_all = "kebab-case")]
+pub enum ParticleSource {
+    /// Words inline (a CPU copy, e.g. a readback).
+    Bytes { data: Vec<u8> },
+    /// A live GPU buffer (`{ id, device }` of a `GpuBuffer` handle), drawn where it lies (EXEC-GPU-7).
+    Gpu { id: u64, device: u64 },
+}
+
+/// Top-level packet describing one frame of game rendering.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GameRenderPacket {
+    /// Pattern name that produced this packet, e.g. "isometric-canvas".
+    pub pattern: String,
+    /// Surface width in logical pixels.
+    pub width: f32,
+    /// Surface height in logical pixels.
+    pub height: f32,
+    /// Optional background image URL/path.
+    pub background_image: Option<String>,
+    /// Base URL for resolving relative asset paths.
+    pub asset_base_url: Option<String>,
+    /// Optional 2D camera transform.
+    pub camera: Option<Camera>,
+    /// Ordered list of draw commands.
+    pub draw_commands: Vec<DrawCommand>,
+    /// Event name to emit each simulation tick.
+    pub tick_event: Option<String>,
+    /// Event name to emit each render frame.
+    pub draw_event: Option<String>,
+    /// Target frames per second.
+    pub fps: Option<u32>,
+    /// Time-driven motion over ranges of `draw_commands`; `draw_commands` holds each range's
+    /// rest frame. [`GameRenderPacket::resolved`] plays them at a host clock time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub animations: Vec<Animation>,
+    /// The canvas clock at this frame in milliseconds; 2D materials read it as `Pixel.time`.
+    #[serde(default)]
+    pub time_ms: f64,
+    /// The pointer in packet coordinates, absent when it is not over the canvas; 2D materials read it as `Pixel.pointer`.
+    #[serde(default)]
+    pub pointer: Option<Vec2>,
+    /// The page scroll offset (packet units) at this frame; 2D materials read it as `Pixel.scroll`, and scroll-clocked
+    /// animations play at it.
+    #[serde(default)]
+    pub scroll: f32,
+    /// Ranges of `draw_commands` that stay put when the page scrolls (the background and `fixed` drawables).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned: Vec<(usize, usize)>,
+}
+
+/// CSS timing function between two keyframes.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Easing {
+    #[default]
+    Linear,
+    Ease,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+}
+
+/// One keyframe: the properties it names are interpolated, the others stay as the rest frame draws
+/// them. `scale` and `rotate` (degrees, absolute) act about the animation's origin.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Keyframe {
+    /// Position in the cycle, 0 to 1.
+    pub offset: f32,
+    #[serde(default)]
+    pub scale: Option<f32>,
+    #[serde(default)]
+    pub rotate: Option<f32>,
+    /// Multiplier on the alpha of every mark in the range.
+    #[serde(default)]
+    pub opacity: Option<f32>,
+    /// Phase of the dash pattern of every stroke in the range.
+    #[serde(default)]
+    pub dash_offset: Option<f32>,
+    /// Translation of the range in packet units.
+    #[serde(default)]
+    pub offset_x: Option<f32>,
+    #[serde(default)]
+    pub offset_y: Option<f32>,
+}
+
+/// A CSS keyframe animation over `draw_commands[first..end]`, in the host's clock time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Animation {
+    pub first: usize,
+    pub end: usize,
+    pub duration_ms: f32,
+    /// Before it elapses the range shows its rest frame (CSS `animation-delay`, no fill).
+    #[serde(default)]
+    pub delay_ms: f32,
+    /// Cycles to play; absent is infinite. After the last the range shows its rest frame.
+    #[serde(default)]
+    pub iterations: Option<u32>,
+    #[serde(default)]
+    pub easing: Easing,
+    /// Transform origin in packet units.
+    pub origin: Vec2,
+    /// The rotation (degrees) the rest frame already carries, which a keyframe `rotate` replaces.
+    #[serde(default)]
+    pub base_rotation: f32,
+    pub keyframes: Vec<Keyframe>,
+    /// What drives the progress: the host clock (the default) or the page scroll.
+    #[serde(default)]
+    pub clock: AnimationClock,
+    /// Outlines the range's paths morph through, by keyframe offset; empty draws the rest outline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub morph: Vec<MorphFrame>,
+}
+
+/// One outline of a path morph at a keyframe offset: contours resampled to the same point count.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MorphFrame {
+    pub offset: f32,
+    pub contours: Vec<MorphContour>,
+}
+
+/// One flattened subpath of a morph outline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MorphContour {
+    pub points: Vec<Vec2>,
+    pub closed: bool,
+}
+
+/// What drives an animation: the host clock, or the page scroll, where progress is the scroll offset's place
+/// between `from` and `to` (packet units), held at 0 before and 1 after, so scrolling back plays it backwards.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum AnimationClock {
+    #[default]
+    Time,
+    Scroll { from: f32, to: f32 },
+}
+
+/// 2D camera state.
+#[derive(Debug, Copy, Clone, Default, Serialize, Deserialize)]
+pub struct Camera {
+    pub x: f32,
+    pub y: f32,
+    pub zoom: f32,
+    pub rotation: f32,
+}
+
+/// Axis-aligned rectangle.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// 2D vector.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Vec2 {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// A single tile in a `TileGrid`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Tile {
+    pub row: u32,
+    pub col: u32,
+    pub kind: String,
+}
+
+/// The generic font family a text command is drawn in.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextFamily {
+    #[default]
+    Sans,
+    Mono,
+    Serif,
+    /// Reem Kufi, the osama site's display face.
+    Display,
+    /// Cairo, the osama site's text face.
+    Body,
+}
+
+/// Horizontal text alignment against the anchor x.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+fn default_text_weight() -> u16 {
+    400
+}
+
+/// The characters `from..to` (indices into a `Text`'s `text`, half-open) paint in `color`.
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColorRun {
+    pub from: usize,
+    pub to: usize,
+    pub color: [f32; 4],
+}
+
+/// Outline drawn under text.
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+pub struct Halo {
+    pub color: [f32; 4],
+    pub width: f32,
+}
+
+/// Stroke end style.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineCap {
+    Butt,
+    #[default]
+    Round,
+    Square,
+}
+
+/// Stroke corner style.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineJoin {
+    Miter,
+    #[default]
+    Round,
+    Bevel,
+}
+
+/// Stroke style of a [`DrawCommand::Path`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Stroke {
+    pub color: [f32; 4],
+    pub width: f32,
+    /// Alternating on/off lengths; empty is a solid line.
+    #[serde(default)]
+    pub dash: Vec<f32>,
+    /// Phase of the dash pattern (SVG `stroke-dashoffset`).
+    #[serde(default)]
+    pub dash_offset: f32,
+    #[serde(default)]
+    pub cap: LineCap,
+    #[serde(default)]
+    pub join: LineJoin,
+}
+
+/// One source-tagged color stop of an authored shape gradient.
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+pub struct GradientStop {
+    pub offset: f32,
+    pub color: [f32; 4],
+}
+
+/// Gradient geometry is already projected to packet pixel coordinates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Gradient {
+    Linear {
+        from: Vec2,
+        to: Vec2,
+        stops: Vec<GradientStop>,
+    },
+    Radial {
+        center: Vec2,
+        radius: f32,
+        stops: Vec<GradientStop>,
+    },
+    Conic {
+        center: Vec2,
+        angle: f32,
+        stops: Vec<GradientStop>,
+    },
+}
+
+/// A repeating fill overlay in packet pixel coordinates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum FillPattern {
+    Noise {
+        scale: f32,
+        alpha: f32,
+        color: [f32; 4],
+    },
+    Image {
+        url: String,
+        scale: f32,
+    },
+}
+
+/// Which signed-distance shape an [`DrawCommand::Sdf`] paints inside its `rect`.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SdfKind {
+    /// A rectangle with per-corner radii (`corners`, `corner_kind`).
+    #[default]
+    Rect,
+    /// A stadium: radius is half the shorter side.
+    Capsule,
+    /// A ring segment centred in the rect, radius half the shorter side (`arc`).
+    Arc,
+    /// A regular polygon or star inscribed in the rect (`polygon`).
+    Polygon,
+    Ellipse,
+}
+
+/// Centred stroke of an [`DrawCommand::Sdf`], optionally dashed along the outline.
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SdfStroke {
+    pub color: [f32; 4],
+    pub width: f32,
+    /// On and off lengths; zeros are a solid line.
+    #[serde(default)]
+    pub dash: [f32; 2],
+    #[serde(default)]
+    pub dash_offset: f32,
+}
+
+/// Analytic drop shadow of an [`DrawCommand::Sdf`]: its coverage blurred by `sigma` painter pixels, moved by `offset`.
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SdfShadow {
+    pub color: [f32; 4],
+    pub sigma: f32,
+    #[serde(default)]
+    pub offset: Vec2,
+}
+
+/// A 2D material: the program's WGSL (declares `fn shade(px: Pixel) -> vec4<f32>`) and its parameters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SdfMaterial {
+    pub wgsl: String,
+    /// At most 8; `Pixel.a` holds the first four, `Pixel.b` the next four, zero-filled.
+    #[serde(default)]
+    pub params: Vec<f32>,
+    /// The material reads `Pixel.time`: the host asks for a frame every tick.
+    #[serde(default)]
+    pub live: bool,
+    /// Seconds from `material.anchor` to this frame's epoch, read as `Pixel.since`; 0 without an anchor or an epoch.
+    #[serde(default)]
+    pub since: f32,
+    /// Ids of render targets (`DrawCommand::Target`) the material samples; the first is `target_a` at `@group(1)`.
+    #[serde(default)]
+    pub targets: Vec<String>,
+}
+
+/// What a backdrop shape shows behind itself: the frame painted so far, Gaussian-blurred by sigma `blur / 2`
+/// painter pixels, saturated, and tinted.
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SdfBackdrop {
+    pub blur: f32,
+    #[serde(default)]
+    pub tint: Option<[f32; 4]>,
+    #[serde(default = "default_saturate")]
+    pub saturate: f32,
+}
+
+fn default_saturate() -> f32 {
+    1.0
+}
+
+/// One path operation. Angles are radians in screen convention (0 = +x,
+/// increasing clockwise because y points down); an `Arc` sweeps from `start`
+/// to `end` in the direction of the difference, a full ellipse when it spans
+/// 2 pi or more, and is joined to the current point by a line like canvas
+/// `ellipse()`.
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op")]
+pub enum PathSegment {
+    MoveTo {
+        x: f32,
+        y: f32,
+    },
+    LineTo {
+        x: f32,
+        y: f32,
+    },
+    Arc {
+        cx: f32,
+        cy: f32,
+        rx: f32,
+        ry: f32,
+        start: f32,
+        end: f32,
+    },
+    /// A cubic Bezier from the current point; SVG `Q`/`T`/`A` arrive elevated to cubics.
+    CubicTo {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        x: f32,
+        y: f32,
+    },
+    Close,
+}
+
+/// One drawing primitive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum DrawCommand {
+    /// Fill the entire surface with a color.
+    Clear { color: [f32; 4] },
+    /// Draw a textured quad (sprite).
+    Sprite {
+        texture: String,
+        src: Rect,
+        dst: Rect,
+        rotation: f32,
+        opacity: f32,
+        flip_x: bool,
+        flip_y: bool,
+    },
+    /// One deformable textured triangle; UVs are normalized unless the source
+    /// mesh declares pixel-space UV coordinates.
+    TexturedTriangle {
+        texture: String,
+        points: [Vec2; 3],
+        uv: [[f32; 2]; 3],
+        uv_in_pixels: bool,
+        opacity: f32,
+    },
+    /// Draw a solid colored quad.
+    Quad { rect: Rect, color: [f32; 4] },
+    /// Draw a filled convex polygon (triangle fan from `points[0]`).
+    Poly { points: Vec<Vec2>, color: [f32; 4] },
+    /// Packed particles drawn in one instanced pass: one little-endian 32-bit word every `stride` bytes, x in bits
+    /// 0-11, y in bits 12-23 (scene pixels) and a `palette` index in bits 24-31; each a square of half-size
+    /// `radius` scene pixels, placed at `origin + scene * scale` in packet units.
+    Particles {
+        source: ParticleSource,
+        stride: u32,
+        radius: f32,
+        palette: Vec<[f32; 4]>,
+        scale: f32,
+        origin: Vec2,
+    },
+    /// A whole 3D scene drawn by the 3D renderer across the surface, before the 2D commands, which
+    /// paint over it.
+    Scene3D { scene: Box<crate::scene3d::Scene3D> },
+    /// Draw a line segment.
+    Line {
+        from: Vec2,
+        to: Vec2,
+        color: [f32; 4],
+        width: f32,
+    },
+    /// Draw text anchored at `pos`: `align` places the string horizontally
+    /// against `pos.x`, and `pos.y` is the vertical middle of the em box
+    /// (canvas `textBaseline = "middle"`). `size` is the font size in logical
+    /// units; a `weight` of 600 or more is drawn emboldened. A `halo` is a
+    /// ground-colored outline drawn first so the label stays legible where it
+    /// crosses a mark.
+    Text {
+        text: String,
+        pos: Vec2,
+        size: f32,
+        color: [f32; 4],
+        #[serde(default)]
+        align: TextAlign,
+        #[serde(default = "default_text_weight")]
+        weight: u16,
+        #[serde(default)]
+        halo: Option<Halo>,
+        /// The generic family the text is drawn in; `mono` is the theme's `mono` label font.
+        #[serde(default)]
+        family: TextFamily,
+        /// Parts of the line that paint in their own colour, by character index into `text`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        color_runs: Vec<ColorRun>,
+    },
+    /// One signed-distance shape drawn by the SDF pass in z-order with the other commands: anti-aliased by the
+    /// distance's screen derivative, stroke centred on the edge, shadow blurred analytically. `corners` run top-left,
+    /// top-right, bottom-right, bottom-left in px; `corner_kind` is 0 round, 1 bevel, 2 notch, 3 scoop; `arc` is
+    /// start and sweep in radians and thickness in px; `polygon` is the side count and the star ratio. `rotation`
+    /// turns the shape about the centre of `rect`. With a `material`, its `shade` provides the fill.
+    Sdf {
+        /// Serialized as `shape`: the enum's own tag already names this object `kind`.
+        #[serde(rename = "shape")]
+        kind: SdfKind,
+        rect: Rect,
+        #[serde(default)]
+        corners: [f32; 4],
+        #[serde(default)]
+        corner_kind: u32,
+        #[serde(default)]
+        arc: [f32; 3],
+        #[serde(default)]
+        polygon: [f32; 2],
+        fill: [f32; 4],
+        #[serde(default)]
+        stroke: Option<SdfStroke>,
+        #[serde(default)]
+        shadow: Option<SdfShadow>,
+        #[serde(default)]
+        rotation: f32,
+        opacity: f32,
+        #[serde(default)]
+        material: Option<SdfMaterial>,
+    },
+    /// Two [`DrawCommand::Sdf`] shapes painted as one: their distances meet in a polynomial smooth minimum of
+    /// `radius` painter pixels, so they melt into each other. `first` supplies stroke, shadow, opacity and
+    /// material; the fill colour is mixed from both by the blend weight.
+    SdfBlend {
+        first: Box<DrawCommand>,
+        second: Box<DrawCommand>,
+        radius: f32,
+    },
+    /// An [`DrawCommand::Sdf`] whose coverage first shows `backdrop` (the frame painted so far, blurred) in place of
+    /// what is behind it; its fill and stroke then paint over that. It ends the SDF batch: the pass needs the frame
+    /// so far.
+    SdfBackdrop {
+        shape: Box<DrawCommand>,
+        backdrop: SdfBackdrop,
+    },
+    /// Children painted into an offscreen texture of `width` x `height` pixels (their origin at its top-left), and
+    /// nothing in the frame. A `Sprite` with `texture: "target:<id>"` paints it and a material lists it in
+    /// `targets`. It repaints when `commands` change, or every frame with `live`.
+    Target {
+        id: String,
+        width: u32,
+        height: u32,
+        #[serde(default)]
+        live: bool,
+        commands: Vec<DrawCommand>,
+    },
+    /// Draw a vector path: filled, stroked, or both (fill first). Rasterized
+    /// anti-aliased in the vector layer.
+    Path {
+        segments: Vec<PathSegment>,
+        #[serde(default)]
+        fill: Option<[f32; 4]>,
+        #[serde(default)]
+        stroke: Option<Stroke>,
+    },
+    /// Vector shape with authored gradient fill or stroke, using the same
+    /// geometry and stroke rules as `Path`.
+    GradientPath {
+        segments: Vec<PathSegment>,
+        #[serde(default)]
+        fill: Option<[f32; 4]>,
+        #[serde(default)]
+        stroke: Option<Stroke>,
+        #[serde(default)]
+        fill_gradient: Option<Gradient>,
+        #[serde(default)]
+        stroke_gradient: Option<Gradient>,
+    },
+    /// Repeating image or deterministic noise over a path fill, after the
+    /// solid/gradient fill and before the stroke.
+    PatternPath {
+        segments: Vec<PathSegment>,
+        pattern: FillPattern,
+        opacity: f32,
+    },
+    /// Apply a Gaussian blur in painter pixels to one vector draw operation.
+    Blurred {
+        command: Box<DrawCommand>,
+        radius: f32,
+    },
+    /// Canvas `shadowColor`/`shadowBlur` under one shape: the coverage of its vector operations painted in `color`,
+    /// Gaussian-blurred by `sigma` painter pixels.
+    Shadow {
+        commands: Vec<DrawCommand>,
+        color: [f32; 4],
+        sigma: f32,
+    },
+    /// Composite one shape's vector operations with canvas `lighter` blending.
+    AdditiveGroup { commands: Vec<DrawCommand> },
+    /// Scope mixed child commands to an authored SVG path in packet pixels.
+    ClipGroup {
+        clip: Vec<PathSegment>,
+        commands: Vec<DrawCommand>,
+    },
+    /// A path painted only where every `clip` region covers and no `cut` region does
+    /// (canvas `clip()` then `destination-out`): venn regions and hatch fills.
+    ClippedPath {
+        segments: Vec<PathSegment>,
+        #[serde(default)]
+        fill: Option<[f32; 4]>,
+        #[serde(default)]
+        stroke: Option<Stroke>,
+        #[serde(default)]
+        clip: Vec<Vec<PathSegment>>,
+        #[serde(default)]
+        cut: Vec<Vec<PathSegment>>,
+    },
+    /// Draw a grid of tiles.
+    TileGrid {
+        rows: u32,
+        cols: u32,
+        tile_width: f32,
+        tile_height: f32,
+        tiles: Vec<Tile>,
+    },
+    /// Restrict drawing to a rectangle.
+    Scissor { rect: Rect },
+    /// Remove the scissor rectangle.
+    ResetScissor,
+}

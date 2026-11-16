@@ -1,13 +1,15 @@
 //! Draws a [`Scene3D`] on the GPU: vertex transforms, lighting and shadows run in shaders, meshes upload once and are
 //! cached by content, and the frame renders multisampled into any target texture of the renderer's device.
 
-use super::environment::{self, Environment};
+use super::environment::Environment;
 use super::mipmap::{mip_level_count, MipmapError, MipmapGenerator};
 use super::model::{
-    EnvironmentKind, Flat, MaterialKind, MeshData, Projection, Scene3D, ShaderBlend, Side,
+    EnvironmentKind, Flat, MaterialKind, MeshData, Scene3D, ShaderBlend, Side,
 };
 use super::post::{self, PostStack};
 use super::transmission::{self, Transmission};
+use super::view_projection;
+use crate::shaders::{lit_source, surface_source};
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -241,72 +243,10 @@ fn color3(rgb: [f32; 3], scale: f32, w: f32) -> [f32; 4] {
     [rgb[0] * scale, rgb[1] * scale, rgb[2] * scale, w]
 }
 
-/// The lit shader's source: the shared prelude, the lit pass, three's IBL and its transmission.
-pub(super) fn lit_source() -> String {
-    [
-        include_str!("prelude.wgsl"),
-        include_str!("lit.wgsl"),
-        environment::IBL_WGSL,
-        transmission::WGSL,
-    ]
-    .concat()
-}
-
-/// A shader material's whole module: the lit source (its vertex stage and bindings), the fragment stage that calls
-/// `shade`, and the program's WGSL that declares it.
-pub(crate) fn surface_source(wgsl: &str) -> String {
-    [lit_source().as_str(), include_str!("surface.wgsl"), wgsl].concat()
-}
-
 fn surface_key(wgsl: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     wgsl.hash(&mut hasher);
     hasher.finish()
-}
-
-/// Whether a shader material's WGSL makes a valid module: the mapper refuses a scene whose shader does not, so the
-/// device never sees it. Answers are kept by the WGSL's hash, since a canvas maps its scene every frame.
-pub(crate) fn check_surface(wgsl: &str) -> Result<(), String> {
-    use std::sync::{Mutex, OnceLock};
-    static CHECKED: OnceLock<Mutex<HashMap<u64, Result<(), String>>>> = OnceLock::new();
-    let key = surface_key(wgsl);
-    let checked = CHECKED.get_or_init(Default::default);
-    if let Some(known) = checked.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
-        return known.clone();
-    }
-    let source = surface_source(wgsl);
-    let answer = wgpu::naga::front::wgsl::parse_str(&source)
-        .map_err(|e| e.emit_to_string(&source))
-        .and_then(|module| {
-            wgpu::naga::valid::Validator::new(
-                wgpu::naga::valid::ValidationFlags::all(),
-                wgpu::naga::valid::Capabilities::empty(),
-            )
-            .validate(&module)
-            .map(|_| ())
-            .map_err(|e| e.emit_to_string(&source))
-        });
-    checked
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(key, answer.clone());
-    answer
-}
-
-/// The camera's view-projection for an `aspect` (width over height).
-pub fn view_projection(scene: &Scene3D, aspect: f32) -> Mat4 {
-    let c = &scene.camera;
-    let view = Mat4::look_at_rh(Vec3::from(c.eye), Vec3::from(c.target), Vec3::from(c.up));
-    let projection = match c.projection {
-        Projection::Perspective { fov_y_degrees } => {
-            Mat4::perspective_rh(fov_y_degrees.to_radians(), aspect, c.near, c.far)
-        }
-        Projection::Orthographic { height } => {
-            let (h, w) = (height * 0.5, height * 0.5 * aspect);
-            Mat4::orthographic_rh(-w, w, -h, h, c.near, c.far)
-        }
-    };
-    projection * view
 }
 
 fn light_view_projection(position: Vec3, target: Vec3, extent: f32, near: f32, far: f32) -> Mat4 {
@@ -425,7 +365,7 @@ impl Renderer3D {
         let grid_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene3d grid shader"),
             source: wgpu::ShaderSource::Wgsl(
-                concat!(include_str!("prelude.wgsl"), include_str!("grid.wgsl")).into(),
+                [crate::shaders::PRELUDE_3D, include_str!("grid.wgsl")].concat().into(),
             ),
         });
         let grid_size = std::mem::size_of::<GridUniform>() as u64;
@@ -1614,39 +1554,17 @@ fn upload_rgba(
     levels: u32,
     rgba: &[u8],
 ) -> wgpu::Texture {
-    let size = wgpu::Extent3d {
+    crate::texture::upload_rgba(
+        device,
+        queue,
+        "scene3d map",
+        rgba,
         width,
         height,
-        depth_or_array_layers: 1,
-    };
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("scene3d map"),
-        size,
-        mip_level_count: levels,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_DST
-            | wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        rgba,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(4 * width),
-            rows_per_image: Some(height),
-        },
-        size,
-    );
-    texture
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        levels,
+        wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+    )
 }
 
 fn map_bind_group(
@@ -1747,7 +1665,7 @@ mod integration_tests {
         renderer
             .encode(&mut encoder, scene, &texture, 4)
             .expect("render");
-        let rgba = crate::renderer::copy_texture_to_rgba(
+        let rgba = crate::texture::copy_texture_to_rgba(
             &shared.device,
             &shared.queue,
             encoder,
@@ -2229,10 +2147,10 @@ mod integration_tests {
 
     #[test]
     fn a_shader_that_does_not_declare_shade_is_refused_before_the_device_sees_it() {
-        assert!(super::check_surface(PAINT_A).is_ok());
-        let wrong = super::check_surface("fn tint(px: Pixel) -> vec4<f32> { return px.a; }");
+        assert!(crate::shaders::check_surface(PAINT_A).is_ok());
+        let wrong = crate::shaders::check_surface("fn tint(px: Pixel) -> vec4<f32> { return px.a; }");
         assert!(wrong.is_err_and(|e| e.contains("shade")));
-        let mistyped = super::check_surface("fn shade(px: Pixel) -> vec4<f32> { return px.time; }");
+        let mistyped = crate::shaders::check_surface("fn shade(px: Pixel) -> vec4<f32> { return px.time; }");
         assert!(mistyped.is_err());
     }
 

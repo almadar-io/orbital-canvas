@@ -1,0 +1,24 @@
+[package]
+name = "orbital-canvas-base"
+version = "18.0.0"
+edition = "2021"
+license = "BUSL-1.1"
+repository = "https://github.com/almadar-io/orbital-canvas"
+description = "orbital-canvas layer: base"
+
+[features]
+# Fixtures (`targets::fixtures`) for the tests of crates that paint targets.
+test-support = []
+
+[dependencies]
+orbital-core-base = { git = "https://github.com/almadar-io/orbital-core", branch = "main", features = ["wgsl"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+glam = "0.30"
+# Every CSS color a browser paints (named, transparent, hsl, hwb), as the web hosts accept them.
+csscolorparser = { version = "0.7", default-features = false, features = ["named-colors"] }
+
+[dev-dependencies]
+pretty_assertions = "1.4"

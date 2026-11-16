@@ -1,0 +1,1554 @@
+//! Playing a packet's [`Animation`]s: the CSS keyframe model (delay, iterations, per-interval
+//! timing functions, properties that fall back to the rest frame) evaluated at a host clock time.
+//! `draw_commands` carries each animated range's rest frame, so reduced motion, a delay that has
+//! not elapsed and a finished animation all draw it unchanged.
+
+use crate::packet::{
+    Animation, AnimationClock, ColorRun, DrawCommand, Easing, FillPattern, GameRenderPacket, Gradient, Halo, PathSegment,
+    Stroke, Vec2,
+};
+use serde_json::Value;
+use std::borrow::Cow;
+use std::f32::consts::TAU;
+
+/// One authored drawable animation track at the host paint clock. Shape,
+/// group, and mesh descriptors use the same keyframe contract.
+/// The epoch-ms instant a drawable animation starts at, when it declares one.
+pub fn start_ms(animation: &Value) -> Result<Option<f64>, String> {
+    match animation.get("startMs").filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(v) => v
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .map(Some)
+            .ok_or_else(|| "startMs must be a non-negative finite number".to_owned()),
+    }
+}
+
+/// Whether a drawable `animation` plays on the page scroll (`clock: "scroll"`): the packet plays it per frame, so the
+/// paint clock draws its rest frame.
+pub fn is_scroll_clocked(animation: &Value) -> bool {
+    animation.get("clock").and_then(Value::as_str) == Some("scroll")
+}
+
+/// Whether the packet plays a drawable `animation` per frame: on the scroll clock, or morphing a path (a keyframe
+/// carries `d`). The mapper then draws its rest frame.
+pub fn plays_on_packet(animation: &Value) -> bool {
+    is_scroll_clocked(animation)
+        || animation
+            .get("keyframes")
+            .and_then(Value::as_array)
+            .is_some_and(|frames| frames.iter().any(|f| f.get("d").is_some()))
+}
+
+/// Whether the animation plays at the paint clock: any running clock, or a `startMs` animation at no clock, which
+/// shows its end state. One the packet plays never does.
+pub fn plays_at(animation: &Value, epoch_now_ms: f64) -> bool {
+    !plays_on_packet(animation)
+        && (epoch_now_ms > 0.0 || matches!(start_ms(animation), Ok(Some(_))))
+}
+
+pub fn drawable_track(animation: &Value, time_ms: f64, key: &str) -> Option<Value> {
+    let duration = animation.get("durationMs")?.as_f64()?;
+    let frames = animation.get("keyframes")?.as_array()?;
+    if !duration.is_finite() || duration <= 0.0 || frames.is_empty() {
+        return None;
+    }
+    let looping = animation.get("loop").and_then(Value::as_bool) != Some(false);
+    let local = match start_ms(animation).ok().flatten() {
+        None => Some(time_ms),
+        Some(_) if time_ms <= 0.0 => None,
+        Some(start) => Some((time_ms - start).max(0.0)),
+    };
+    let progress = match local {
+        None => 1.0,
+        Some(local) => {
+            let cycle = local / duration;
+            if looping {
+                cycle - cycle.floor()
+            } else {
+                cycle.min(1.0)
+            }
+        }
+    };
+    let mut defined: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| {
+            let value = key
+                .split('.')
+                .try_fold(frame, |value, part| value.get(part))?;
+            Some((frame.get("at")?.as_f64()?, value))
+        })
+        .collect();
+    defined.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let first = defined.first()?;
+    let previous = defined.iter().rev().find(|(at, _)| *at <= progress);
+    let Some((at, value)) = previous else {
+        return Some(first.1.clone());
+    };
+    let Some((next_at, next_value)) = defined.iter().find(|(next_at, _)| *next_at > progress)
+    else {
+        return Some((*value).clone());
+    };
+    match (value.as_f64(), next_value.as_f64()) {
+        (Some(a), Some(b)) => {
+            let span = next_at - at;
+            let fraction = if span > 0.0 {
+                (progress - at) / span
+            } else {
+                1.0
+            };
+            serde_json::Number::from_f64(a + (b - a) * fraction).map(Value::Number)
+        }
+        _ => Some((*value).clone()),
+    }
+}
+
+#[cfg(test)]
+mod drawable_track_tests {
+    use super::drawable_track;
+    use serde_json::json;
+
+    #[test]
+    fn drawable_tracks_interpolate_numbers_and_hold_colors() {
+        let animation = json!({
+            "durationMs": 1000, "loop": false,
+            "keyframes": [
+                {"at": 0, "width": 0, "fill": "#ff0000", "shadow": {"blur": 1}},
+                {"at": 1, "width": 2, "fill": "#0000ff", "shadow": {"blur": 5}}
+            ]
+        });
+        assert_eq!(drawable_track(&animation, 500.0, "width"), Some(json!(1.0)));
+        assert_eq!(
+            drawable_track(&animation, 500.0, "fill"),
+            Some(json!("#ff0000"))
+        );
+        assert_eq!(
+            drawable_track(&animation, 500.0, "shadow.blur"),
+            Some(json!(3.0))
+        );
+        assert_eq!(drawable_track(&animation, 1500.0, "width"), Some(json!(2)));
+    }
+}
+
+/// The properties of one animation sampled at one time.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub(crate) struct Sample {
+    pub scale: f32,
+    /// Degrees added to the rest frame.
+    pub rotate: f32,
+    pub opacity: f32,
+    pub dash_offset: f32,
+    pub offset_x: f32,
+    pub offset_y: f32,
+}
+
+fn bezier(p1: (f32, f32), p2: (f32, f32), x: f32) -> f32 {
+    let at = |t: f32, a: f32, b: f32| {
+        let u = 1.0 - t;
+        3.0 * u * u * t * a + 3.0 * u * t * t * b + t * t * t
+    };
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..32 {
+        let mid = (lo + hi) / 2.0;
+        if at(mid, p1.0, p2.0) < x {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    at((lo + hi) / 2.0, p1.1, p2.1)
+}
+
+impl Easing {
+    /// Eased progress for linear progress `x` in 0..=1.
+    pub fn apply(self, x: f32) -> f32 {
+        let x = x.clamp(0.0, 1.0);
+        match self {
+            Easing::Linear => x,
+            Easing::Ease => bezier((0.25, 0.1), (0.25, 1.0), x),
+            Easing::EaseIn => bezier((0.42, 0.0), (1.0, 1.0), x),
+            Easing::EaseOut => bezier((0.0, 0.0), (0.58, 1.0), x),
+            Easing::EaseInOut => bezier((0.42, 0.0), (0.58, 1.0), x),
+        }
+    }
+}
+
+/// One property's value at `progress`: keyframes naming it, with the rest value standing in at
+/// 0 and 1 when they do not.
+fn track(
+    a: &Animation,
+    progress: f32,
+    rest: f32,
+    of: impl Fn(&crate::packet::Keyframe) -> Option<f32>,
+) -> f32 {
+    let mut points: Vec<(f32, f32)> = a
+        .keyframes
+        .iter()
+        .filter_map(|k| of(k).map(|v| (k.offset.clamp(0.0, 1.0), v)))
+        .collect();
+    points.sort_by(|x, y| x.0.total_cmp(&y.0));
+    if points.is_empty() {
+        return rest;
+    }
+    if points[0].0 > 0.0 {
+        points.insert(0, (0.0, rest));
+    }
+    if points[points.len() - 1].0 < 1.0 {
+        points.push((1.0, rest));
+    }
+    for w in points.windows(2) {
+        let ((o0, v0), (o1, v1)) = (w[0], w[1]);
+        if progress >= o0 && progress <= o1 {
+            let span = (o1 - o0).max(f32::EPSILON);
+            let k = a.easing.apply((progress - o0) / span);
+            return v0 + (v1 - v0) * k;
+        }
+    }
+    rest
+}
+
+impl Animation {
+    /// The animation at `t_ms` on the host clock; `None` while it shows the rest frame.
+    pub(crate) fn sample(&self, t_ms: f64) -> Option<Sample> {
+        self.time_progress(t_ms).map(|p| self.sample_progress(p))
+    }
+
+    fn time_progress(&self, t_ms: f64) -> Option<f32> {
+        if self.duration_ms <= 0.0 {
+            return None;
+        }
+        let local = t_ms as f32 - self.delay_ms;
+        if local < 0.0 {
+            return None;
+        }
+        let cycle = (local / self.duration_ms).floor();
+        if self.iterations.is_some_and(|n| cycle >= n as f32) {
+            return None;
+        }
+        Some(local / self.duration_ms - cycle)
+    }
+
+    /// Where the animation is on its own clock, 0 to 1; `None` while it shows the rest frame.
+    pub(crate) fn progress_at(&self, t_ms: f64, scroll: f32) -> Option<f32> {
+        match self.clock {
+            AnimationClock::Time => self.time_progress(t_ms),
+            AnimationClock::Scroll { from, to } => Some(if to > from {
+                ((scroll - from) / (to - from)).clamp(0.0, 1.0)
+            } else if scroll < from {
+                0.0
+            } else {
+                1.0
+            }),
+        }
+    }
+
+    /// The morph outline at `progress`: the two frames around it blended with the animation's easing; `None`
+    /// without morph frames.
+    pub(crate) fn morph_at(&self, progress: f32) -> Option<Vec<crate::packet::MorphContour>> {
+        let mut frames: Vec<&crate::packet::MorphFrame> = self.morph.iter().collect();
+        frames.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+        let first = frames.first()?;
+        let before = frames.iter().rev().find(|f| f.offset <= progress).unwrap_or(first);
+        let Some(after) = frames.iter().find(|f| f.offset > progress) else {
+            return Some(before.contours.clone());
+        };
+        if before.offset > progress {
+            return Some(before.contours.clone());
+        }
+        let span = (after.offset - before.offset).max(f32::EPSILON);
+        let k = self.easing.apply((progress - before.offset) / span);
+        Some(crate::morph::blend(&before.contours, &after.contours, k))
+    }
+
+    fn sample_progress(&self, progress: f32) -> Sample {
+        let rotation = track(self, progress, self.base_rotation, |k| k.rotate);
+        Sample {
+            scale: track(self, progress, 1.0, |k| k.scale),
+            rotate: rotation - self.base_rotation,
+            opacity: track(self, progress, 1.0, |k| k.opacity),
+            dash_offset: track(self, progress, 0.0, |k| k.dash_offset),
+            offset_x: track(self, progress, 0.0, |k| k.offset_x),
+            offset_y: track(self, progress, 0.0, |k| k.offset_y),
+        }
+    }
+
+    /// The animation on its own clock: the host time `t_ms`, or the page `scroll` offset.
+    pub(crate) fn sample_at(&self, t_ms: f64, scroll: f32) -> Option<Sample> {
+        self.progress_at(t_ms, scroll).map(|p| self.sample_progress(p))
+    }
+}
+
+struct Xform {
+    origin: Vec2,
+    translation: Vec2,
+    scale: f32,
+    sin: f32,
+    cos: f32,
+    rotated: bool,
+    opacity: f32,
+    dash_offset: f32,
+    scale_strokes: bool,
+}
+
+impl Xform {
+    fn new(a: &Animation, s: Sample) -> Self {
+        let (sin, cos) = s.rotate.to_radians().sin_cos();
+        Self {
+            origin: a.origin,
+            translation: Vec2 {
+                x: s.offset_x,
+                y: s.offset_y,
+            },
+            scale: s.scale,
+            sin,
+            cos,
+            rotated: s.rotate != 0.0,
+            opacity: s.opacity,
+            dash_offset: s.dash_offset,
+            scale_strokes: true,
+        }
+    }
+
+    fn group(origin: Vec2, translation: Vec2, scale: f32, radians: f32, opacity: f32) -> Self {
+        let (sin, cos) = radians.sin_cos();
+        Self {
+            origin,
+            translation,
+            scale,
+            sin,
+            cos,
+            rotated: radians != 0.0,
+            opacity,
+            dash_offset: 0.0,
+            scale_strokes: false,
+        }
+    }
+
+    fn point(&self, p: Vec2) -> Vec2 {
+        let (dx, dy) = (
+            (p.x - self.origin.x) * self.scale,
+            (p.y - self.origin.y) * self.scale,
+        );
+        Vec2 {
+            x: self.origin.x + dx * self.cos - dy * self.sin + self.translation.x,
+            y: self.origin.y + dx * self.sin + dy * self.cos + self.translation.y,
+        }
+    }
+
+    fn color(&self, mut c: [f32; 4]) -> [f32; 4] {
+        c[3] = (c[3] * self.opacity).clamp(0.0, 1.0);
+        c
+    }
+
+    fn stroke(&self, s: &Stroke) -> Stroke {
+        Stroke {
+            color: self.color(s.color),
+            width: s.width * if self.scale_strokes { self.scale } else { 1.0 },
+            dash: s
+                .dash
+                .iter()
+                .map(|d| d * if self.scale_strokes { self.scale } else { 1.0 })
+                .collect(),
+            dash_offset: s.dash_offset + self.dash_offset,
+            cap: s.cap,
+            join: s.join,
+        }
+    }
+
+    fn gradient(&self, gradient: &Gradient) -> Gradient {
+        let stops = |stops: &[crate::packet::GradientStop]| {
+            stops
+                .iter()
+                .map(|stop| crate::packet::GradientStop {
+                    offset: stop.offset,
+                    color: self.color(stop.color),
+                })
+                .collect()
+        };
+        match gradient {
+            Gradient::Linear {
+                from,
+                to,
+                stops: colors,
+            } => Gradient::Linear {
+                from: self.point(*from),
+                to: self.point(*to),
+                stops: stops(colors),
+            },
+            Gradient::Radial {
+                center,
+                radius,
+                stops: colors,
+            } => Gradient::Radial {
+                center: self.point(*center),
+                radius: radius * self.scale,
+                stops: stops(colors),
+            },
+            Gradient::Conic {
+                center,
+                angle,
+                stops: colors,
+            } => Gradient::Conic {
+                center: self.point(*center),
+                angle: angle + self.sin.atan2(self.cos),
+                stops: stops(colors),
+            },
+        }
+    }
+
+    fn segments(&self, segments: &[PathSegment]) -> Vec<PathSegment> {
+        let mut out = Vec::with_capacity(segments.len());
+        for seg in segments {
+            match *seg {
+                PathSegment::MoveTo { x, y } => {
+                    let p = self.point(Vec2 { x, y });
+                    out.push(PathSegment::MoveTo { x: p.x, y: p.y });
+                }
+                PathSegment::LineTo { x, y } => {
+                    let p = self.point(Vec2 { x, y });
+                    out.push(PathSegment::LineTo { x: p.x, y: p.y });
+                }
+                PathSegment::CubicTo {
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    x,
+                    y,
+                } => {
+                    let c1 = self.point(Vec2 { x: x1, y: y1 });
+                    let c2 = self.point(Vec2 { x: x2, y: y2 });
+                    let p = self.point(Vec2 { x, y });
+                    out.push(PathSegment::CubicTo {
+                        x1: c1.x,
+                        y1: c1.y,
+                        x2: c2.x,
+                        y2: c2.y,
+                        x: p.x,
+                        y: p.y,
+                    });
+                }
+                PathSegment::Arc {
+                    cx,
+                    cy,
+                    rx,
+                    ry,
+                    start,
+                    end,
+                } => {
+                    let c = self.point(Vec2 { x: cx, y: cy });
+                    let spin = self.sin.atan2(self.cos);
+                    if !self.rotated || (rx - ry).abs() <= f32::EPSILON {
+                        out.push(PathSegment::Arc {
+                            cx: c.x,
+                            cy: c.y,
+                            rx: rx * self.scale,
+                            ry: ry * self.scale,
+                            start: start + spin,
+                            end: end + spin,
+                        });
+                    } else {
+                        let sweep = (end - start).clamp(-TAU, TAU);
+                        let steps = ((sweep.abs() / TAU) * 64.0).ceil().max(2.0) as usize;
+                        for i in 0..=steps {
+                            let a = start + sweep * i as f32 / steps as f32;
+                            let p = self.point(Vec2 {
+                                x: cx + rx * a.cos(),
+                                y: cy + ry * a.sin(),
+                            });
+                            out.push(if i == 0 {
+                                PathSegment::MoveTo { x: p.x, y: p.y }
+                            } else {
+                                PathSegment::LineTo { x: p.x, y: p.y }
+                            });
+                        }
+                    }
+                }
+                PathSegment::Close => out.push(PathSegment::Close),
+            }
+        }
+        out
+    }
+
+    fn command(&self, cmd: &DrawCommand) -> DrawCommand {
+        match cmd {
+            DrawCommand::Path {
+                segments,
+                fill,
+                stroke,
+            } => DrawCommand::Path {
+                segments: self.segments(segments),
+                fill: fill.map(|c| self.color(c)),
+                stroke: stroke.as_ref().map(|s| self.stroke(s)),
+            },
+            DrawCommand::GradientPath {
+                segments,
+                fill,
+                stroke,
+                fill_gradient,
+                stroke_gradient,
+            } => DrawCommand::GradientPath {
+                segments: self.segments(segments),
+                fill: fill.map(|color| self.color(color)),
+                stroke: stroke.as_ref().map(|stroke| self.stroke(stroke)),
+                fill_gradient: fill_gradient
+                    .as_ref()
+                    .map(|gradient| self.gradient(gradient)),
+                stroke_gradient: stroke_gradient
+                    .as_ref()
+                    .map(|gradient| self.gradient(gradient)),
+            },
+            DrawCommand::PatternPath {
+                segments,
+                pattern,
+                opacity,
+            } => {
+                let scale = match pattern {
+                    FillPattern::Noise {
+                        scale,
+                        alpha,
+                        color,
+                    } => FillPattern::Noise {
+                        scale: *scale / self.scale.abs().max(f32::EPSILON),
+                        alpha: *alpha,
+                        color: *color,
+                    },
+                    FillPattern::Image { url, scale } => FillPattern::Image {
+                        url: url.clone(),
+                        scale: *scale / self.scale.abs().max(f32::EPSILON),
+                    },
+                };
+                DrawCommand::PatternPath {
+                    segments: self.segments(segments),
+                    pattern: scale,
+                    opacity: *opacity * self.opacity,
+                }
+            }
+            DrawCommand::Blurred { command, radius } => DrawCommand::Blurred {
+                command: Box::new(self.command(command)),
+                radius: *radius,
+            },
+            DrawCommand::Shadow {
+                commands,
+                color,
+                sigma,
+            } => DrawCommand::Shadow {
+                commands: commands
+                    .iter()
+                    .map(|command| self.command(command))
+                    .collect(),
+                color: *color,
+                sigma: *sigma * self.scale.abs(),
+            },
+            DrawCommand::AdditiveGroup { commands } => DrawCommand::AdditiveGroup {
+                commands: commands
+                    .iter()
+                    .map(|command| self.command(command))
+                    .collect(),
+            },
+            DrawCommand::ClipGroup { clip, commands } => DrawCommand::ClipGroup {
+                clip: self.segments(clip),
+                commands: commands
+                    .iter()
+                    .map(|command| self.command(command))
+                    .collect(),
+            },
+            DrawCommand::ClippedPath {
+                segments,
+                fill,
+                stroke,
+                clip,
+                cut,
+            } => DrawCommand::ClippedPath {
+                segments: self.segments(segments),
+                fill: fill.map(|c| self.color(c)),
+                stroke: stroke.as_ref().map(|s| self.stroke(s)),
+                clip: clip.iter().map(|r| self.segments(r)).collect(),
+                cut: cut.iter().map(|r| self.segments(r)).collect(),
+            },
+            DrawCommand::Line {
+                from,
+                to,
+                color,
+                width,
+            } => DrawCommand::Line {
+                from: self.point(*from),
+                to: self.point(*to),
+                color: self.color(*color),
+                width: width * self.scale,
+            },
+            DrawCommand::Text {
+                text,
+                pos,
+                size,
+                color,
+                align,
+                weight,
+                halo,
+                family,
+                color_runs,
+            } => DrawCommand::Text {
+                text: text.clone(),
+                pos: self.point(*pos),
+                size: size * self.scale,
+                color: self.color(*color),
+                align: *align,
+                weight: *weight,
+                family: *family,
+                color_runs: color_runs
+                    .iter()
+                    .map(|run| ColorRun { color: self.color(run.color), ..*run })
+                    .collect(),
+                halo: halo.map(|h| Halo {
+                    color: self.color(h.color),
+                    width: h.width * self.scale,
+                }),
+            },
+            DrawCommand::Quad { rect, color } if self.rotated => DrawCommand::Poly {
+                points: [
+                    Vec2 {
+                        x: rect.x,
+                        y: rect.y,
+                    },
+                    Vec2 {
+                        x: rect.x + rect.w,
+                        y: rect.y,
+                    },
+                    Vec2 {
+                        x: rect.x + rect.w,
+                        y: rect.y + rect.h,
+                    },
+                    Vec2 {
+                        x: rect.x,
+                        y: rect.y + rect.h,
+                    },
+                ]
+                .map(|p| self.point(p))
+                .to_vec(),
+                color: self.color(*color),
+            },
+            DrawCommand::Quad { rect, color } => {
+                let p = self.point(Vec2 {
+                    x: rect.x,
+                    y: rect.y,
+                });
+                DrawCommand::Quad {
+                    rect: crate::packet::Rect {
+                        x: p.x,
+                        y: p.y,
+                        w: rect.w * self.scale,
+                        h: rect.h * self.scale,
+                    },
+                    color: self.color(*color),
+                }
+            }
+            DrawCommand::Poly { points, color } => DrawCommand::Poly {
+                points: points.iter().map(|p| self.point(*p)).collect(),
+                color: self.color(*color),
+            },
+            DrawCommand::TexturedTriangle {
+                texture,
+                points,
+                uv,
+                uv_in_pixels,
+                opacity,
+            } => DrawCommand::TexturedTriangle {
+                texture: texture.clone(),
+                points: points.map(|point| self.point(point)),
+                uv: *uv,
+                uv_in_pixels: *uv_in_pixels,
+                opacity: opacity * self.opacity,
+            },
+            DrawCommand::Sprite {
+                texture,
+                src,
+                dst,
+                rotation,
+                opacity,
+                flip_x,
+                flip_y,
+            } => {
+                let center = self.point(Vec2 {
+                    x: dst.x + dst.w / 2.0,
+                    y: dst.y + dst.h / 2.0,
+                });
+                let w = dst.w * self.scale.abs();
+                let h = dst.h * self.scale.abs();
+                DrawCommand::Sprite {
+                    texture: texture.clone(),
+                    src: *src,
+                    dst: crate::packet::Rect {
+                        x: center.x - w / 2.0,
+                        y: center.y - h / 2.0,
+                        w,
+                        h,
+                    },
+                    rotation: *rotation
+                        + self.sin.atan2(self.cos)
+                        + if self.scale < 0.0 {
+                            std::f32::consts::PI
+                        } else {
+                            0.0
+                        },
+                    opacity: *opacity * self.opacity,
+                    flip_x: *flip_x,
+                    flip_y: *flip_y,
+                }
+            }
+            DrawCommand::SdfBackdrop { shape, backdrop } => DrawCommand::SdfBackdrop {
+                shape: Box::new(self.command(shape)),
+                backdrop: crate::packet::SdfBackdrop {
+                    blur: backdrop.blur * self.scale.abs(),
+                    ..*backdrop
+                },
+            },
+            DrawCommand::SdfBlend {
+                first,
+                second,
+                radius,
+            } => DrawCommand::SdfBlend {
+                first: Box::new(self.command(first)),
+                second: Box::new(self.command(second)),
+                radius: radius * self.scale.abs(),
+            },
+            DrawCommand::Sdf {
+                kind,
+                rect,
+                corners,
+                corner_kind,
+                arc,
+                polygon,
+                fill,
+                stroke,
+                shadow,
+                rotation,
+                opacity,
+                material,
+            } => {
+                let center = self.point(Vec2 {
+                    x: rect.x + rect.w / 2.0,
+                    y: rect.y + rect.h / 2.0,
+                });
+                let size = self.scale.abs();
+                let (w, h) = (rect.w * size, rect.h * size);
+                let stroke_scale = if self.scale_strokes { self.scale } else { 1.0 };
+                DrawCommand::Sdf {
+                    kind: *kind,
+                    rect: crate::packet::Rect {
+                        x: center.x - w / 2.0,
+                        y: center.y - h / 2.0,
+                        w,
+                        h,
+                    },
+                    corners: corners.map(|radius| radius * size),
+                    corner_kind: *corner_kind,
+                    arc: [arc[0], arc[1], arc[2] * size],
+                    polygon: *polygon,
+                    fill: self.color(*fill),
+                    stroke: stroke.map(|s| crate::packet::SdfStroke {
+                        color: self.color(s.color),
+                        width: s.width * stroke_scale,
+                        dash: s.dash.map(|d| d * stroke_scale),
+                        dash_offset: s.dash_offset + self.dash_offset,
+                    }),
+                    shadow: shadow.map(|s| crate::packet::SdfShadow {
+                        color: self.color(s.color),
+                        sigma: s.sigma * size,
+                        offset: Vec2 {
+                            x: (s.offset.x * self.cos - s.offset.y * self.sin) * self.scale,
+                            y: (s.offset.x * self.sin + s.offset.y * self.cos) * self.scale,
+                        },
+                    }),
+                    rotation: *rotation
+                        + self.sin.atan2(self.cos)
+                        + if self.scale < 0.0 { std::f32::consts::PI } else { 0.0 },
+                    opacity: *opacity * self.opacity,
+                    material: material.clone(),
+                }
+            }
+            other => other.clone(),
+        }
+    }
+}
+
+/// Apply one 2D group transform to the range a drawable group just emitted.
+/// The same command geometry path serves packet animations and group nesting.
+pub fn transform_group_commands(
+    commands: &mut [DrawCommand],
+    origin: Vec2,
+    translation: Vec2,
+    scale: f32,
+    radians: f32,
+    opacity: f32,
+) {
+    let transform = Xform::group(origin, translation, scale, radians, opacity);
+    for command in commands {
+        *command = transform.command(command);
+    }
+}
+
+impl GameRenderPacket {
+    /// Whether the packet carries motion on the host clock, the motion that needs frames of its own; scroll-clocked
+    /// motion moves only when the scroll does.
+    pub fn is_animated(&self) -> bool {
+        self.animations
+            .iter()
+            .any(|a| a.clock == AnimationClock::Time)
+    }
+
+    /// Whether the packet carries any motion, on either clock.
+    pub fn has_animations(&self) -> bool {
+        !self.animations.is_empty()
+    }
+
+    /// The packet with the page scrolled `offset` packet units down: every command outside the pinned ranges moves
+    /// up by it, and materials read it as `Pixel.scroll`.
+    pub fn scrolled(mut self, offset: f32) -> GameRenderPacket {
+        self.scroll = offset;
+        if offset == 0.0 {
+            return self;
+        }
+        let shift = Xform::group(
+            Vec2 { x: 0.0, y: 0.0 },
+            Vec2 { x: 0.0, y: -offset },
+            1.0,
+            0.0,
+            1.0,
+        );
+        for (i, command) in self.draw_commands.iter_mut().enumerate() {
+            if !self.pinned.iter().any(|&(first, end)| i >= first && i < end) {
+                *command = shift.command(command);
+            }
+        }
+        self
+    }
+
+    /// The packet as it draws at `t_ms` on the host clock. With `motion` off, or nothing animated,
+    /// that is the rest frame: the packet itself.
+    pub fn resolved(&self, t_ms: f64, motion: bool) -> Cow<'_, GameRenderPacket> {
+        if !motion || self.animations.is_empty() {
+            return Cow::Borrowed(self);
+        }
+        let mut out = self.clone();
+        for a in &self.animations {
+            let Some(progress) = a.progress_at(t_ms, self.scroll) else {
+                continue;
+            };
+            let x = Xform::new(a, a.sample_progress(progress));
+            let outline = a.morph_at(progress).map(|c| crate::morph::segments(&c));
+            let end = a.end.min(out.draw_commands.len());
+            for i in a.first.min(end)..end {
+                out.draw_commands[i] = match &outline {
+                    Some(outline) => x.command(&crate::morph::with_outline(&self.draw_commands[i], outline)),
+                    None => x.command(&self.draw_commands[i]),
+                };
+            }
+        }
+        Cow::Owned(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet::{Keyframe, LineCap, LineJoin};
+
+    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+
+    fn pulse() -> Animation {
+        Animation {
+            first: 0,
+            end: 1,
+            duration_ms: 2000.0,
+            delay_ms: 600.0,
+            iterations: None,
+            easing: Easing::EaseOut,
+            origin: Vec2 { x: 70.0, y: 70.0 },
+            base_rotation: 0.0,
+            clock: AnimationClock::Time,
+            morph: Vec::new(),
+            keyframes: vec![
+                Keyframe {
+                    offset: 0.0,
+                    scale: Some(0.3),
+                    opacity: Some(0.4),
+                    ..Keyframe::default()
+                },
+                Keyframe {
+                    offset: 1.0,
+                    scale: Some(1.0),
+                    opacity: Some(0.0),
+                    ..Keyframe::default()
+                },
+            ],
+        }
+    }
+
+    fn circle(r: f32) -> DrawCommand {
+        DrawCommand::Path {
+            segments: vec![PathSegment::Arc {
+                cx: 70.0,
+                cy: 70.0,
+                rx: r,
+                ry: r,
+                start: 0.0,
+                end: TAU,
+            }],
+            fill: None,
+            stroke: Some(Stroke {
+                color: RED,
+                width: 2.0,
+                dash: vec![],
+                dash_offset: 0.0,
+                cap: LineCap::Round,
+                join: LineJoin::Round,
+            }),
+        }
+    }
+
+    fn packet(cmds: Vec<DrawCommand>, animations: Vec<Animation>) -> GameRenderPacket {
+        GameRenderPacket {
+            width: 140.0,
+            height: 140.0,
+            draw_commands: cmds,
+            animations,
+            ..Default::default()
+        }
+    }
+
+    fn radius(p: &GameRenderPacket, i: usize) -> f32 {
+        match &p.draw_commands[i] {
+            DrawCommand::Path { segments, .. } => match segments[0] {
+                PathSegment::Arc { rx, .. } => rx,
+                _ => panic!("not an arc"),
+            },
+            _ => panic!("not a path"),
+        }
+    }
+
+    fn alpha(p: &GameRenderPacket, i: usize) -> f32 {
+        match &p.draw_commands[i] {
+            DrawCommand::Path {
+                stroke: Some(s), ..
+            } => s.color[3],
+            _ => panic!("no stroke"),
+        }
+    }
+
+    fn centre(p: &GameRenderPacket, i: usize) -> (f32, f32) {
+        match &p.draw_commands[i] {
+            DrawCommand::Path { segments, .. } => match segments[0] {
+                PathSegment::Arc { cx, cy, .. } => (cx, cy),
+                _ => panic!("not an arc"),
+            },
+            _ => panic!("not a path"),
+        }
+    }
+
+    fn scrolled(from: f32, to: f32) -> Animation {
+        Animation {
+            delay_ms: 0.0,
+            easing: Easing::Linear,
+            clock: AnimationClock::Scroll { from, to },
+            keyframes: vec![
+                Keyframe {
+                    offset: 0.0,
+                    opacity: Some(0.0),
+                    offset_y: Some(40.0),
+                    ..Keyframe::default()
+                },
+                Keyframe {
+                    offset: 1.0,
+                    opacity: Some(1.0),
+                    offset_y: Some(0.0),
+                    ..Keyframe::default()
+                },
+            ],
+            ..pulse()
+        }
+    }
+
+    #[test]
+    fn a_scroll_clocked_animation_follows_the_scroll_offset_and_holds_outside_its_range() {
+        let a = scrolled(100.0, 300.0);
+        let before = a.sample_at(99_999.0, 0.0).expect("held at the start before the range");
+        assert_eq!((before.opacity, before.offset_y), (0.0, 40.0));
+        let mid = a.sample_at(0.0, 200.0).unwrap();
+        assert!((mid.opacity - 0.5).abs() < 1e-4 && (mid.offset_y - 20.0).abs() < 1e-4);
+        let after = a.sample_at(0.0, 900.0).unwrap();
+        assert_eq!((after.opacity, after.offset_y), (1.0, 0.0));
+        let back = a.sample_at(0.0, 150.0).unwrap();
+        assert!((back.opacity - 0.25).abs() < 1e-4, "scrolling back plays it backwards");
+    }
+
+    #[test]
+    fn a_time_clocked_animation_ignores_the_scroll_offset() {
+        let a = Animation {
+            delay_ms: 0.0,
+            ..pulse()
+        };
+        assert_eq!(a.sample_at(500.0, 0.0), a.sample_at(500.0, 4000.0), "control");
+        assert_eq!(a.sample_at(500.0, 0.0), a.sample(500.0));
+    }
+
+    #[test]
+    fn a_degenerate_scroll_range_is_a_step_at_its_offset() {
+        let a = scrolled(200.0, 200.0);
+        assert_eq!(a.sample_at(0.0, 199.0).unwrap().opacity, 0.0);
+        assert_eq!(a.sample_at(0.0, 200.0).unwrap().opacity, 1.0);
+    }
+
+    #[test]
+    fn keyframe_offsets_translate_the_range_and_resolving_plays_at_the_packet_scroll() {
+        let mut p = packet(vec![circle(40.0), circle(10.0)], vec![scrolled(0.0, 100.0)]);
+        p.scroll = 50.0;
+        let at = p.resolved(0.0, true);
+        assert_eq!(centre(&at, 0), (70.0, 90.0), "half of 40 below the rest");
+        assert!((alpha(&at, 0) - 0.5).abs() < 1e-4);
+        assert_eq!(centre(&at, 1), (70.0, 70.0), "control: outside the range");
+        p.scroll = 100.0;
+        assert_eq!(centre(&p.resolved(0.0, true), 0), (70.0, 70.0));
+    }
+
+    #[test]
+    fn only_time_clocked_motion_asks_for_frames() {
+        let by_scroll = packet(vec![circle(40.0)], vec![scrolled(0.0, 100.0)]);
+        assert!(!by_scroll.is_animated(), "a still page needs no frames");
+        assert!(by_scroll.has_animations());
+        let by_time = packet(vec![circle(40.0)], vec![pulse()]);
+        assert!(by_time.is_animated(), "control");
+        assert!(matches!(by_scroll.resolved(0.0, false), Cow::Borrowed(_)), "reduced motion: rest frame");
+    }
+
+    #[test]
+    fn easing_runs_from_zero_to_one_and_each_curve_keeps_its_shape() {
+        for e in [
+            Easing::Linear,
+            Easing::Ease,
+            Easing::EaseIn,
+            Easing::EaseOut,
+            Easing::EaseInOut,
+        ] {
+            assert!(
+                e.apply(0.0).abs() < 1e-4 && (e.apply(1.0) - 1.0).abs() < 1e-4,
+                "{e:?}"
+            );
+        }
+        assert_eq!(Easing::Linear.apply(0.25), 0.25);
+        assert!(Easing::EaseOut.apply(0.5) > 0.5, "ease-out decelerates");
+        assert!(
+            Easing::EaseIn.apply(0.5) < 0.5,
+            "control: ease-in accelerates"
+        );
+        assert!(
+            (Easing::EaseInOut.apply(0.5) - 0.5).abs() < 1e-3,
+            "ease-in-out is symmetric"
+        );
+    }
+
+    #[test]
+    fn a_delayed_animation_shows_its_rest_frame_until_the_delay_elapses() {
+        let a = pulse();
+        assert_eq!(a.sample(0.0), None);
+        assert_eq!(a.sample(599.0), None);
+        let s = a.sample(600.0).expect("starts at the delay");
+        assert!((s.scale - 0.3).abs() < 1e-3 && (s.opacity - 0.4).abs() < 1e-3);
+    }
+
+    #[test]
+    fn an_infinite_animation_repeats_and_a_finite_one_returns_to_rest() {
+        let a = Animation {
+            delay_ms: 0.0,
+            ..pulse()
+        };
+        let (first, again) = (a.sample(500.0).unwrap(), a.sample(2500.0).unwrap());
+        assert!((first.scale - again.scale).abs() < 1e-4);
+        let once = Animation {
+            iterations: Some(1),
+            ..a
+        };
+        assert!(once.sample(1999.0).is_some());
+        assert_eq!(
+            once.sample(2000.0),
+            None,
+            "control: the second cycle never plays"
+        );
+    }
+
+    #[test]
+    fn midway_through_an_ease_out_cycle_the_ring_is_past_the_linear_midpoint() {
+        let a = Animation {
+            delay_ms: 0.0,
+            ..pulse()
+        };
+        let s = a.sample(1000.0).unwrap();
+        assert!(
+            s.scale > 0.65,
+            "linear midpoint of 0.3..1 is 0.65, got {}",
+            s.scale
+        );
+        assert!(s.opacity < 0.2);
+    }
+
+    #[test]
+    fn a_property_no_keyframe_names_keeps_the_rest_value() {
+        let a = Animation {
+            delay_ms: 0.0,
+            ..pulse()
+        };
+        let s = a.sample(500.0).unwrap();
+        assert_eq!((s.rotate, s.dash_offset), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_keyframe_rotation_replaces_the_rotation_the_rest_frame_carries() {
+        let a = Animation {
+            base_rotation: 60.0,
+            delay_ms: 0.0,
+            duration_ms: 1000.0,
+            easing: Easing::Linear,
+            keyframes: vec![
+                Keyframe {
+                    offset: 0.0,
+                    rotate: Some(0.0),
+                    ..Keyframe::default()
+                },
+                Keyframe {
+                    offset: 1.0,
+                    rotate: Some(360.0),
+                    ..Keyframe::default()
+                },
+            ],
+            ..pulse()
+        };
+        assert!(
+            (a.sample(0.0).unwrap().rotate + 60.0).abs() < 1e-3,
+            "starts at 0 degrees, 60 below the rest"
+        );
+        assert!((a.sample(500.0).unwrap().rotate - 120.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn resolving_scales_a_circle_about_the_origin_and_fades_its_stroke() {
+        let p = packet(
+            vec![circle(40.0)],
+            vec![Animation {
+                delay_ms: 0.0,
+                ..pulse()
+            }],
+        );
+        let at0 = p.resolved(0.0, true);
+        assert!((radius(&at0, 0) - 12.0).abs() < 1e-3, "40 x 0.3");
+        assert!((alpha(&at0, 0) - 0.4).abs() < 1e-3);
+        match &at0.draw_commands[0] {
+            DrawCommand::Path {
+                segments,
+                stroke: Some(s),
+                ..
+            } => {
+                assert!(
+                    matches!(segments[0], PathSegment::Arc { cx, cy, .. } if cx == 70.0 && cy == 70.0)
+                );
+                assert!(
+                    (s.width - 0.6).abs() < 1e-3,
+                    "stroke scales with the geometry, like CSS scale"
+                );
+            }
+            _ => panic!("path"),
+        }
+        let later = p.resolved(1000.0, true);
+        assert_ne!(radius(&later, 0), radius(&at0, 0), "the ring has moved");
+    }
+
+    #[test]
+    fn motion_off_a_static_packet_and_the_rest_frame_are_the_packet_itself() {
+        let animated = packet(
+            vec![circle(40.0)],
+            vec![Animation {
+                delay_ms: 0.0,
+                ..pulse()
+            }],
+        );
+        assert!(
+            matches!(animated.resolved(500.0, false), Cow::Borrowed(_)),
+            "reduced motion"
+        );
+        let still = packet(vec![circle(40.0)], vec![]);
+        assert!(
+            matches!(still.resolved(500.0, true), Cow::Borrowed(_)),
+            "control: nothing declared"
+        );
+        assert!(!still.is_animated() && animated.is_animated());
+        let waiting = animated.resolved(0.0, true);
+        assert!(
+            (radius(&waiting, 0) - 12.0).abs() < 1e-3,
+            "control: motion on shows the animated frame at t=0"
+        );
+        let delayed = packet(vec![circle(40.0)], vec![pulse()]);
+        assert_eq!(
+            radius(&delayed.resolved(100.0, true), 0),
+            40.0,
+            "inside the delay: rest frame"
+        );
+    }
+
+    #[test]
+    fn only_the_animated_range_changes() {
+        let p = packet(
+            vec![circle(10.0), circle(40.0), circle(20.0)],
+            vec![Animation {
+                first: 1,
+                end: 2,
+                delay_ms: 0.0,
+                ..pulse()
+            }],
+        );
+        let r = p.resolved(0.0, true);
+        assert_eq!((radius(&r, 0), radius(&r, 2)), (10.0, 20.0));
+        assert!((radius(&r, 1) - 12.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_range_past_the_command_list_is_clamped_not_a_panic() {
+        let p = packet(
+            vec![circle(40.0)],
+            vec![Animation {
+                first: 0,
+                end: 9,
+                delay_ms: 0.0,
+                ..pulse()
+            }],
+        );
+        assert_eq!(p.resolved(0.0, true).draw_commands.len(), 1);
+        let backwards = packet(
+            vec![circle(40.0)],
+            vec![Animation {
+                first: 5,
+                end: 2,
+                delay_ms: 0.0,
+                ..pulse()
+            }],
+        );
+        assert_eq!(radius(&backwards.resolved(0.0, true), 0), 40.0);
+    }
+
+    #[test]
+    fn dash_offset_accumulates_on_the_stroke_and_scales_nothing_else() {
+        let mut c = circle(40.0);
+        if let DrawCommand::Path {
+            stroke: Some(s), ..
+        } = &mut c
+        {
+            s.dash = vec![8.0, 6.0];
+        }
+        let a = Animation {
+            delay_ms: 0.0,
+            duration_ms: 800.0,
+            easing: Easing::Linear,
+            keyframes: vec![
+                Keyframe {
+                    offset: 0.0,
+                    dash_offset: Some(0.0),
+                    ..Keyframe::default()
+                },
+                Keyframe {
+                    offset: 1.0,
+                    dash_offset: Some(-14.0),
+                    ..Keyframe::default()
+                },
+            ],
+            ..pulse()
+        };
+        let r = packet(vec![c], vec![a]).resolved(400.0, true).into_owned();
+        match &r.draw_commands[0] {
+            DrawCommand::Path {
+                stroke: Some(s), ..
+            } => {
+                assert!((s.dash_offset + 7.0).abs() < 1e-3);
+                assert_eq!(s.dash, vec![8.0, 6.0]);
+                assert_eq!(s.width, 2.0);
+            }
+            _ => panic!("path"),
+        }
+    }
+
+    #[test]
+    fn rotating_a_circle_keeps_an_arc_and_rotating_an_ellipse_flattens_it() {
+        let rot = Animation {
+            delay_ms: 0.0,
+            duration_ms: 1000.0,
+            easing: Easing::Linear,
+            keyframes: vec![
+                Keyframe {
+                    offset: 0.0,
+                    rotate: Some(0.0),
+                    ..Keyframe::default()
+                },
+                Keyframe {
+                    offset: 1.0,
+                    rotate: Some(360.0),
+                    ..Keyframe::default()
+                },
+            ],
+            origin: Vec2 { x: 0.0, y: 0.0 },
+            ..pulse()
+        };
+        let off_centre = DrawCommand::Path {
+            segments: vec![PathSegment::Arc {
+                cx: 10.0,
+                cy: 0.0,
+                rx: 4.0,
+                ry: 4.0,
+                start: 0.0,
+                end: TAU,
+            }],
+            fill: Some(RED),
+            stroke: None,
+        };
+        let r = packet(vec![off_centre], vec![rot.clone()])
+            .resolved(250.0, true)
+            .into_owned();
+        match &r.draw_commands[0] {
+            DrawCommand::Path { segments, .. } => match segments[0] {
+                PathSegment::Arc { cx, cy, rx, .. } => {
+                    assert!(
+                        cx.abs() < 1e-3 && (cy - 10.0).abs() < 1e-3,
+                        "a quarter turn moves (10,0) to (0,10)"
+                    );
+                    assert_eq!(rx, 4.0);
+                }
+                _ => panic!("a circle stays an arc"),
+            },
+            _ => panic!("path"),
+        }
+        let ellipse = DrawCommand::Path {
+            segments: vec![PathSegment::Arc {
+                cx: 0.0,
+                cy: 0.0,
+                rx: 8.0,
+                ry: 2.0,
+                start: 0.0,
+                end: TAU,
+            }],
+            fill: Some(RED),
+            stroke: None,
+        };
+        let r = packet(vec![ellipse], vec![rot])
+            .resolved(250.0, true)
+            .into_owned();
+        match &r.draw_commands[0] {
+            DrawCommand::Path { segments, .. } => {
+                assert!(
+                    segments.len() > 8
+                        && segments
+                            .iter()
+                            .all(|s| !matches!(s, PathSegment::Arc { .. }))
+                );
+                let ys = segments.iter().filter_map(|s| match s {
+                    PathSegment::MoveTo { y, .. } | PathSegment::LineTo { y, .. } => Some(y.abs()),
+                    _ => None,
+                });
+                assert!(
+                    ys.fold(0.0f32, f32::max) > 7.5,
+                    "the long axis now points down"
+                );
+            }
+            _ => panic!("path"),
+        }
+    }
+
+    #[test]
+    fn text_and_lines_scale_and_fade_with_the_group() {
+        let cmds = vec![
+            DrawCommand::Text {
+                color_runs: Vec::new(),
+                text: "x".into(),
+                pos: Vec2 { x: 70.0, y: 40.0 },
+                size: 10.0,
+                color: RED,
+                align: Default::default(),
+                weight: 400,
+                family: crate::packet::TextFamily::Sans,
+                halo: None,
+            },
+            DrawCommand::Line {
+                from: Vec2 { x: 70.0, y: 70.0 },
+                to: Vec2 { x: 70.0, y: 40.0 },
+                color: RED,
+                width: 2.0,
+            },
+        ];
+        let r = packet(
+            cmds,
+            vec![Animation {
+                end: 2,
+                delay_ms: 0.0,
+                ..pulse()
+            }],
+        )
+        .resolved(0.0, true)
+        .into_owned();
+        match (&r.draw_commands[0], &r.draw_commands[1]) {
+            (
+                DrawCommand::Text {
+                    size, pos, color, ..
+                },
+                DrawCommand::Line { to, width, .. },
+            ) => {
+                assert!((size - 3.0).abs() < 1e-3 && (pos.y - 61.0).abs() < 1e-3);
+                assert!((color[3] - 0.4).abs() < 1e-3);
+                assert!((to.y - 61.0).abs() < 1e-3 && (width - 0.6).abs() < 1e-3);
+            }
+            _ => panic!("text and line"),
+        }
+    }
+
+    #[test]
+    fn affine_group_transform_carries_quad_sprite_and_constant_width_stroke() {
+        let mut commands = vec![
+            DrawCommand::Quad {
+                rect: crate::packet::Rect {
+                    x: 1.0,
+                    y: 0.0,
+                    w: 2.0,
+                    h: 1.0,
+                },
+                color: RED,
+            },
+            DrawCommand::Sprite {
+                texture: "icon.png".into(),
+                src: crate::packet::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 2.0,
+                    h: 2.0,
+                },
+                dst: crate::packet::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 2.0,
+                    h: 2.0,
+                },
+                rotation: 0.0,
+                opacity: 1.0,
+                flip_x: false,
+                flip_y: false,
+            },
+            DrawCommand::Path {
+                segments: vec![
+                    PathSegment::MoveTo { x: 0.0, y: 0.0 },
+                    PathSegment::LineTo { x: 1.0, y: 0.0 },
+                ],
+                fill: None,
+                stroke: Some(Stroke {
+                    color: RED,
+                    width: 3.0,
+                    dash: vec![2.0, 1.0],
+                    dash_offset: 0.0,
+                    cap: LineCap::Butt,
+                    join: LineJoin::Miter,
+                }),
+            },
+        ];
+        transform_group_commands(
+            &mut commands,
+            Vec2 { x: 0.0, y: 0.0 },
+            Vec2 { x: 5.0, y: 7.0 },
+            2.0,
+            std::f32::consts::FRAC_PI_2,
+            0.5,
+        );
+        let DrawCommand::Poly { points, color } = &commands[0] else {
+            panic!("rotated quad")
+        };
+        assert!((points[0].x - 5.0).abs() < 1e-4 && (points[0].y - 9.0).abs() < 1e-4);
+        assert_eq!(color[3], 0.5);
+        let DrawCommand::Sprite {
+            dst,
+            rotation,
+            opacity,
+            ..
+        } = &commands[1]
+        else {
+            panic!("sprite")
+        };
+        assert!((dst.x - 1.0).abs() < 1e-4 && (dst.y - 7.0).abs() < 1e-4);
+        assert_eq!((dst.w, dst.h), (4.0, 4.0));
+        assert!((*rotation - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
+        assert_eq!(*opacity, 0.5);
+        let DrawCommand::Path {
+            stroke: Some(stroke),
+            ..
+        } = &commands[2]
+        else {
+            panic!("path stroke")
+        };
+        assert_eq!(stroke.width, 3.0);
+        assert_eq!(stroke.dash, vec![2.0, 1.0]);
+        assert_eq!(stroke.color[3], 0.5);
+    }
+
+    #[test]
+    fn an_sdf_shape_rides_the_group_transform_about_its_centre() {
+        let sdf = DrawCommand::Sdf {
+            kind: crate::packet::SdfKind::Rect,
+            rect: crate::packet::Rect { x: 10.0, y: 10.0, w: 20.0, h: 10.0 },
+            corners: [2.0; 4],
+            corner_kind: 0,
+            arc: [0.0; 3],
+            polygon: [0.0; 2],
+            fill: RED,
+            stroke: Some(crate::packet::SdfStroke { color: RED, width: 3.0, dash: [0.0; 2], dash_offset: 0.0 }),
+            shadow: Some(crate::packet::SdfShadow { color: RED, sigma: 4.0, offset: Vec2::default() }),
+            rotation: 0.0,
+            opacity: 1.0,
+            material: None,
+        };
+        let mut moved = vec![sdf.clone()];
+        transform_group_commands(&mut moved, Vec2::default(), Vec2 { x: 5.0, y: 0.0 }, 2.0, 0.0, 0.5);
+        let DrawCommand::Sdf { rect, corners, fill, stroke, shadow, rotation, opacity, .. } = &moved[0] else {
+            panic!("sdf")
+        };
+        assert!((rect.x - 25.0).abs() < 1e-4 && (rect.y - 20.0).abs() < 1e-4, "{rect:?}");
+        assert_eq!((rect.w, rect.h), (40.0, 20.0));
+        assert_eq!(*corners, [4.0; 4]);
+        assert_eq!(fill[3], 0.5);
+        assert_eq!(stroke.unwrap().width, 3.0, "group strokes keep their width");
+        assert_eq!(shadow.unwrap().sigma, 8.0);
+        assert_eq!((*rotation, *opacity), (0.0, 0.5));
+        let mut turned = vec![sdf.clone()];
+        transform_group_commands(&mut turned, Vec2::default(), Vec2::default(), 1.0, std::f32::consts::FRAC_PI_2, 1.0);
+        let DrawCommand::Sdf { rect, rotation, .. } = &turned[0] else { panic!("sdf") };
+        assert!((rotation - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
+        assert!((rect.x + rect.w / 2.0 + 15.0).abs() < 1e-3 && (rect.y + rect.h / 2.0 - 20.0).abs() < 1e-3, "centre (20,15) turns to (-15,20): {rect:?}");
+        let mut still = vec![sdf.clone()];
+        transform_group_commands(&mut still, Vec2::default(), Vec2::default(), 1.0, 0.0, 1.0);
+        assert_eq!(format!("{:?}", still[0]), format!("{sdf:?}"), "control: the identity transform changes nothing");
+    }
+
+    #[test]
+    fn a_blend_rides_the_group_transform_with_its_radius_scaled() {
+        let member = |x: f32| DrawCommand::Sdf {
+            kind: crate::packet::SdfKind::Ellipse,
+            rect: crate::packet::Rect { x, y: 0.0, w: 10.0, h: 10.0 },
+            corners: [0.0; 4],
+            corner_kind: 0,
+            arc: [0.0; 3],
+            polygon: [0.0; 2],
+            fill: RED,
+            stroke: None,
+            shadow: None,
+            rotation: 0.0,
+            opacity: 1.0,
+            material: None,
+        };
+        let mut commands = vec![DrawCommand::SdfBlend { first: Box::new(member(0.0)), second: Box::new(member(20.0)), radius: 3.0 }];
+        transform_group_commands(&mut commands, Vec2::default(), Vec2 { x: 1.0, y: 0.0 }, 2.0, 0.0, 1.0);
+        let DrawCommand::SdfBlend { first, second, radius } = &commands[0] else { panic!("blend") };
+        assert_eq!(*radius, 6.0);
+        let (DrawCommand::Sdf { rect: a, .. }, DrawCommand::Sdf { rect: b, .. }) = (first.as_ref(), second.as_ref()) else { panic!("members") };
+        assert_eq!((a.x, a.w), (1.0, 20.0));
+        assert_eq!((b.x, b.w), (41.0, 20.0));
+    }
+}

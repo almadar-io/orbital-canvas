@@ -7,8 +7,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use wgpu::util::DeviceExt;
 
-const PRELUDE: &str = include_str!("sdf.wgsl");
-const PLAIN_SHADE: &str = "\nfn shade(px: Pixel) -> vec4<f32> { return px.color; }\n";
+use crate::shaders::{check_material, material_source, plain_material_source};
 
 /// Shapes per uniform buffer; the WGSL array holds `MAX_INSTANCES * FIELDS` vec4 slots.
 pub(crate) const MAX_INSTANCES: usize = 64;
@@ -141,47 +140,6 @@ pub(crate) fn pipeline_key(wgsl: Option<&str>) -> u64 {
     }
 }
 
-/// A material's whole module: the prelude and the program's WGSL that declares `shade`.
-pub(crate) fn material_source(wgsl: &str) -> String {
-    [PRELUDE, wgsl].concat()
-}
-
-fn plain_source() -> String {
-    [PRELUDE, PLAIN_SHADE].concat()
-}
-
-/// Whether a material's WGSL makes a valid module, kept by the WGSL's hash since a canvas maps its scene every frame.
-pub(crate) fn check_material(wgsl: &str) -> Result<(), String> {
-    use std::sync::{Mutex, OnceLock};
-    static CHECKED: OnceLock<Mutex<HashMap<u64, Result<(), String>>>> = OnceLock::new();
-    let key = pipeline_key(Some(wgsl));
-    let checked = CHECKED.get_or_init(Default::default);
-    if let Some(known) = checked.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
-        return known.clone();
-    }
-    let source = material_source(wgsl);
-    let answer = check_source(&source);
-    checked
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(key, answer.clone());
-    answer
-}
-
-fn check_source(source: &str) -> Result<(), String> {
-    wgpu::naga::front::wgsl::parse_str(source)
-        .map_err(|e| e.emit_to_string(source))
-        .and_then(|module| {
-            wgpu::naga::valid::Validator::new(
-                wgpu::naga::valid::ValidationFlags::all(),
-                wgpu::naga::valid::Capabilities::empty(),
-            )
-            .validate(&module)
-            .map(|_| ())
-            .map_err(|e| e.emit_to_string(source))
-        })
-}
-
 fn build_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -306,7 +264,7 @@ impl SdfPass {
                 device,
                 &pipeline_layout,
                 format,
-                &plain_source(),
+                &plain_material_source(),
                 "fs_main",
                 wgpu::BlendState::ALPHA_BLENDING,
             ),
@@ -378,7 +336,7 @@ impl SdfPass {
             return;
         }
         let (cut, add) = backdrop_blends();
-        let source = plain_source();
+        let source = plain_material_source();
         self.backdrop = Some((
             build_pipeline(device, &self.pipeline_layout, self.format, &source, "fs_backdrop_cut", cut),
             build_pipeline(device, &self.pipeline_layout, self.format, &source, "fs_backdrop_add", add),
@@ -467,7 +425,7 @@ mod tests {
 
     #[test]
     fn the_plain_module_checks_and_a_missing_shade_does_not() {
-        assert_eq!(check_source(&plain_source()), Ok(()));
+        assert_eq!(orbital_core_base::gpu_wgsl::check_wgsl_portable(&plain_material_source()), Ok(()));
         let err = check_material("fn other() -> f32 { return 1.0; }").unwrap_err();
         assert!(err.contains("shade"), "{err}");
     }

@@ -5,10 +5,6 @@ use crate::{Canvas, RendererError, Result};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
-fn align_up(value: usize, alignment: usize) -> usize {
-    (value + alignment - 1) & !(alignment - 1)
-}
-
 /// Lazily-initialized GPU resources needed for offscreen rendering.
 pub(crate) struct DeviceResources {
     #[allow(dead_code)]
@@ -666,38 +662,16 @@ impl SharedDeviceRenderer {
             }
         };
         let (width, height) = tex;
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("game sprite sheet"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        let texture = crate::texture::upload_rgba(
+            &self.device,
+            &self.queue,
+            "game sprite sheet",
             &rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * width),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
+            width,
+            height,
+            wgpu::TextureFormat::Rgba8Unorm,
+            1,
+            wgpu::TextureUsages::TEXTURE_BINDING,
         );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -795,14 +769,9 @@ impl SharedDeviceRenderer {
         {
             std::hash::Hash::hash(&crate::asset::generation(), &mut hasher);
         }
-        for command in &commands {
-            match serde_json::to_string(command) {
-                Ok(json) => std::hash::Hash::hash(&json, &mut hasher),
-                Err(err) => {
-                    tracing::warn!(target: "almadar::game_renderer", error = %err, "vector command not serializable — skipped");
-                    return;
-                }
-            }
+        if let Err(err) = crate::targets::hash_commands(commands.iter().copied(), &mut hasher) {
+            tracing::warn!(target: "almadar::game_renderer", error = %err, "vector command not serializable — skipped");
+            return;
         }
         let key = SpriteKey {
             url: format!(
@@ -901,40 +870,17 @@ impl SharedDeviceRenderer {
     }
 
     fn upload_rgba_texture(&self, rgba: &[u8], width: u32, height: u32) -> wgpu::Texture {
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("game vector layer"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        crate::texture::upload_rgba(
+            &self.device,
+            &self.queue,
+            "game vector layer",
             rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * width),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-        texture
+            width,
+            height,
+            wgpu::TextureFormat::Rgba8Unorm,
+            1,
+            wgpu::TextureUsages::TEXTURE_BINDING,
+        )
     }
 
     /// Upload straight-alpha RGBA8 as a sampled texture with its bind group.
@@ -1680,7 +1626,7 @@ impl SharedDeviceRenderer {
                     flip_y,
                 } => {
                     self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
-                    if let Some(id) = texture.strip_prefix(crate::render_target::TARGET_PREFIX) {
+                    if let Some(id) = texture.strip_prefix(crate::targets::TARGET_PREFIX) {
                         let Some(read) = self.targets.read(id) else {
                             continue;
                         };
@@ -2156,78 +2102,7 @@ impl Canvas {
     }
 }
 
-/// Record a texture→buffer copy into `encoder`, submit, and read the pixels
-/// back as a tightly-packed RGBA8 buffer (top-to-bottom rows). Takes the
-/// encoder by value (it finishes + submits it). Shared by the headless
-/// readback path, tests of the shared-device renderer, and the
-/// `dump-canvas-packet` example (fixture → PNG visual proof).
-pub fn copy_texture_to_rgba(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    mut encoder: wgpu::CommandEncoder,
-    texture: &wgpu::Texture,
-    width: u32,
-    height: u32,
-) -> Result<Vec<u8>> {
-    let bytes_per_row_unpadded = width * 4;
-    let bytes_per_row_padded = align_up(
-        bytes_per_row_unpadded as usize,
-        wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize,
-    );
-    let buffer_size = bytes_per_row_padded * height as usize;
-
-    let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("game readback"),
-        size: buffer_size as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    encoder.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo {
-            texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::TexelCopyBufferInfo {
-            buffer: &readback_buffer,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_row_padded as u32),
-                rows_per_image: Some(height),
-            },
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-
-    queue.submit(std::iter::once(encoder.finish()));
-
-    let slice = readback_buffer.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
-    device.poll(wgpu::PollType::wait()).ok();
-    rx.recv()
-        .map_err(|_| RendererError::Surface("readback channel closed".into()))?
-        .map_err(|e| RendererError::Surface(format!("buffer map failed: {e}")))?;
-
-    let data = slice.get_mapped_range();
-    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-    for row in 0..height {
-        let start = row as usize * bytes_per_row_padded;
-        rgba.extend_from_slice(&data[start..start + bytes_per_row_unpadded as usize]);
-    }
-    drop(data);
-    readback_buffer.unmap();
-
-    Ok(rgba)
-}
+pub use crate::texture::copy_texture_to_rgba;
 
 /// Convert pixel coordinates to Normalized Device Coordinates (-1..1).
 fn to_ndc(x: f32, y: f32, width: u32, height: u32) -> [f32; 2] {
@@ -3169,7 +3044,19 @@ mod vector_layer_tests {
             color: RED,
         };
         let flat = GameRenderPacket { height: 0.0, ..text_packet(vec![red.clone(), word("W", 8.0, 0.0, 15.0)]) };
-        let Some(blank) = draw(&mut r, &flat, SIDE) else {
+        let target = r.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("flat world target"),
+            size: wgpu::Extent3d { width: SIDE, height: SIDE, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        assert!(!r.render_packet_to_texture(&flat, &target), "nothing is drawn");
+        let encoder = r.device().create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
+        let Ok(blank) = copy_texture_to_rgba(r.device(), r.queue(), encoder, &target, SIDE, SIDE) else {
             return;
         };
         assert!(blank.chunks_exact(4).all(|p| p[0] < 15), "a world with no height paints nothing");

@@ -1201,7 +1201,7 @@ mod tests {
         let _font = crate::vector::FONT_GENERATION_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let bytes = include_bytes!("../assets/fonts/NotoSansArabic-Regular-subset.ttf");
+        let bytes = include_bytes!("../crates/paint/assets/fonts/NotoSansArabic-Regular-subset.ttf");
         let bad = CString::new("Zzzq").unwrap();
         assert_eq!(
             unsafe { orbital_canvas_add_font(bad.as_ptr(), bytes.as_ptr(), bytes.len(), 0) },

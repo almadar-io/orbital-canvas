@@ -4,31 +4,27 @@
 //! through a tiny C ABI. The server/runtime sends a JSON `GameRenderPacket`
 //! (display list); this crate turns it into draw calls.
 
-pub mod animate;
-pub mod asset;
-pub mod atlas;
+pub use orbital_canvas_base::{
+    animate, color, diagnostics, fx_projection, morph, packet, projector, shader_check, shaders, skinning_2d, spring,
+    path_data, targets, transform,
+};
+pub use orbital_canvas_paint::{asset, atlas, svg, vector};
+#[cfg(feature = "system-fonts")]
+pub use orbital_canvas_paint::system_fonts;
+
 pub mod c_api;
 pub mod device;
-pub mod fx_projection;
 pub(crate) mod glyph_atlas;
 pub mod gpu;
 pub mod mappers;
-pub mod morph;
-pub mod packet;
 pub mod particles;
 pub mod platform;
-pub mod projector;
 pub mod renderer;
 pub mod scene3d;
 pub(crate) mod backdrop;
 pub(crate) mod render_target;
 pub(crate) mod sdf;
-pub mod skinning_2d;
-pub mod spring;
-pub mod svg;
-#[cfg(feature = "system-fonts")]
-pub mod system_fonts;
-pub mod vector;
+pub(crate) mod texture;
 #[cfg(target_arch = "wasm32")]
 pub mod web2d;
 #[cfg(target_arch = "wasm32")]
@@ -441,7 +437,7 @@ impl SceneHost {
     pub fn set_scene(
         &mut self,
         node: serde_json::Value,
-    ) -> std::result::Result<(), mappers::game_canvas_2d::CanvasSceneError> {
+    ) -> std::result::Result<(), mappers::error::CanvasSceneError> {
         let generation = asset::generation();
         let mut bank = self.springs.clone();
         bank.retarget(&node);
@@ -463,7 +459,7 @@ impl SceneHost {
     fn map_scene(
         &mut self,
         node: &serde_json::Value,
-    ) -> std::result::Result<mappers::scene::MappedScene, mappers::game_canvas_2d::CanvasSceneError>
+    ) -> std::result::Result<mappers::scene::MappedScene, mappers::error::CanvasSceneError>
     {
         let density = self.density;
         let shown = (!self.springs.is_empty()).then(|| self.springs.apply(node));
@@ -2704,7 +2700,7 @@ mod tests {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("readback"),
             });
-        let rgba = match renderer::copy_texture_to_rgba(
+        let rgba = match crate::texture::copy_texture_to_rgba(
             renderer.device(),
             renderer.queue(),
             encoder,
@@ -2836,7 +2832,7 @@ mod tests {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("readback"),
             });
-        let rgba = match renderer::copy_texture_to_rgba(
+        let rgba = match crate::texture::copy_texture_to_rgba(
             renderer.device(),
             renderer.queue(),
             encoder,

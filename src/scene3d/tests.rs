@@ -97,7 +97,7 @@ fn draw(renderer: &mut Renderer3D, scene: &Scene3D, samples: u32) -> Vec<u8> {
     renderer
         .encode(&mut encoder, scene, &texture, samples)
         .expect("render");
-    crate::renderer::copy_texture_to_rgba(
+    crate::texture::copy_texture_to_rgba(
         &shared.device,
         &shared.queue,
         encoder,
@@ -428,7 +428,7 @@ fn a_mapped_canvas_scene_renders_its_meshes_over_the_grid() {
     });
     let mut encoder = shared.device.create_command_encoder(&Default::default());
     r.encode(&mut encoder, &scene, &texture, 4).expect("render");
-    let rgba = crate::renderer::copy_texture_to_rgba(
+    let rgba = crate::texture::copy_texture_to_rgba(
         &shared.device,
         &shared.queue,
         encoder,
@@ -484,7 +484,7 @@ fn a_non_srgb_target_clears_to_the_authored_background_and_control_an_srgb_one_t
         });
         let mut encoder = shared.device.create_command_encoder(&Default::default());
         r.encode(&mut encoder, &s, &texture, 4).expect("render");
-        let rgba = crate::renderer::copy_texture_to_rgba(
+        let rgba = crate::texture::copy_texture_to_rgba(
             &shared.device,
             &shared.queue,
             encoder,

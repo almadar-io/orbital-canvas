@@ -10,12 +10,16 @@ description = "GPU canvas embedded by Orbital hosts (iOS, Android, Rust)"
 default = []
 # HTTP(S) asset fetching (ureq/rustls) — native-only; off on wasm32 and in
 # minimal builds. Local files (`file://`, absolute, relative) work without it.
-http = ["dep:ureq", "ureq/tls"]
+http = ["orbital-canvas-paint/http"]
 # Desktop hosts: supply the scripts the bundled faces lack from the installed system fonts.
-system-fonts = ["dep:fontdb"]
+system-fonts = ["orbital-canvas-paint/system-fonts"]
 
 [dependencies]
-orbital-core-base = { git = "https://github.com/almadar-io/orbital-core", branch = "main" }
+orbital-canvas-base = { path = "crates/base" }
+orbital-canvas-paint = { path = "crates/paint" }
+orbital-canvas-map = { path = "crates/map" }
+orbital-canvas-patterns = { path = "crates/patterns" }
+orbital-core-base = { git = "https://github.com/almadar-io/orbital-core", branch = "main", features = ["wgsl"] }
 wgpu = "26"
 pollster = "0.4"
 # Every default format but `avif`, which is only the AV1 encoder (rav1e); canvas encodes PNG only.
@@ -64,4 +68,6 @@ web-sys = { version = "0.3", features = ["Window", "Response", "Headers", "HtmlC
 [dev-dependencies]
 orbital-core = { git = "https://github.com/almadar-io/orbital-core", branch = "main", features = ["native"] }
 pretty_assertions = "1.4"
+orbital-canvas-base = { path = "crates/base", features = ["test-support"] }
+orbital-canvas-paint = { path = "crates/paint", features = ["test-support"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

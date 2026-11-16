@@ -8,7 +8,7 @@
 //! Integration in `render.rs` (when any mesh has a physical material with `transmission > 0`):
 //! 1. Lists as three's `WebGLRenderList`: transmission > 0 is "transmissive" whatever its opacity; opaque, then
 //!    transmissive (sorted like opaque), then transparent with the grid.
-//! 2. Shader: append [`WGSL`] after `environment::IBL_WGSL`; add [`Transmission::layout_entries`]`(5)` to the frame
+//! 2. Shader: append [`crate::shaders::TRANSMISSION`] after [`crate::shaders::IBL`]; add [`Transmission::layout_entries`]`(5)` to the frame
 //!    layout. Object uniform gains transmission, ior and thickness. In `fs_main` for kind 2 with transmission > 0:
 //!    keep direct and indirect diffuse apart from specular, then
 //!    `let t = transmission_volume_refraction(n, v, roughness, s.diffuse, specular.rgb, specular.w, in.world,
@@ -26,7 +26,6 @@
 use super::mipmap::{mip_level_count, MipmapError, MipmapGenerator};
 use std::sync::Arc;
 
-pub const WGSL: &str = include_str!("transmission.wgsl");
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub const SAMPLES: u32 = 4;
 const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -361,7 +360,7 @@ fn fs_transmission_probe(@builtin(position) at: vec4<f32>) -> @location(0) vec4<
         let _module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("transmission probe"),
             source: wgpu::ShaderSource::Wgsl(
-                [super::super::render::lit_source().as_str(), probe]
+                [crate::shaders::lit_source().as_str(), probe]
                     .concat()
                     .into(),
             ),
