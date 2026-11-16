@@ -1400,6 +1400,13 @@ impl SharedDeviceRenderer {
         packet: &GameRenderPacket,
         target: &wgpu::Texture,
     ) -> bool {
+        if !(packet.width > 0.0 && packet.height > 0.0) && !packet.draw_commands.is_empty() {
+            let blank = GameRenderPacket {
+                draw_commands: Vec::new(),
+                ..packet.clone()
+            };
+            return self.render_packet_to_texture(&blank, target);
+        }
         if self.render_depth == 0 {
             self.frame_epoch = self.use_clock;
             if let Some(glyphs) = self.glyphs.as_mut() {
@@ -3141,6 +3148,36 @@ mod vector_layer_tests {
 
     fn rasterized(r: &SharedDeviceRenderer) -> u64 {
         r.glyphs.as_ref().map_or(0, |g| g.rasterized())
+    }
+
+    #[test]
+    fn a_text_larger_than_an_atlas_page_is_refused_before_it_rasterizes() {
+        let Some(mut r) = renderer() else { return };
+        let Some(_) = gpu_alpha(&mut r, &word("W", 0.0, 0.0, 2048.0)) else {
+            return;
+        };
+        assert_eq!(rasterized(&r), 0, "no glyph bitmap is made for a page it cannot fit");
+        let _ = gpu_alpha(&mut r, &word("W", 8.0, 40.0, 20.0));
+        assert!(rasterized(&r) > 0, "control: a page-sized text rasterizes");
+    }
+
+    #[test]
+    fn a_packet_without_area_draws_nothing() {
+        let Some(mut r) = renderer() else { return };
+        let red = DrawCommand::Quad {
+            rect: Rect { x: 0.0, y: 0.0, w: SIDE as f32, h: SIDE as f32 },
+            color: RED,
+        };
+        let flat = GameRenderPacket { height: 0.0, ..text_packet(vec![red.clone(), word("W", 8.0, 0.0, 15.0)]) };
+        let Some(blank) = draw(&mut r, &flat, SIDE) else {
+            return;
+        };
+        assert!(blank.chunks_exact(4).all(|p| p[0] < 15), "a world with no height paints nothing");
+        assert_eq!(rasterized(&r), 0, "and makes no glyph bitmaps");
+        let Some(drawn) = draw(&mut r, &text_packet(vec![red]), SIDE) else {
+            return;
+        };
+        assert!(drawn.chunks_exact(4).all(|p| p[0] > 240), "control: the same quad in a sized world paints");
     }
 
     #[test]
