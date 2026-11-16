@@ -3,11 +3,11 @@
 //! drawn by [`canvas`].
 
 use super::canvas::{self, CanvasSpec};
-use orbital_canvas_base::diagnostics::gap_once;
 use super::shape::{parse_shapes, Align, Shape, ShapeType};
+use crate::scene::{Emit, MappedScene};
+use orbital_canvas_base::diagnostics::gap_once;
 use orbital_canvas_map::error::CanvasSceneError;
 use orbital_canvas_map::game_canvas_2d::get_string;
-use crate::scene::{Emit, MappedScene};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -54,13 +54,15 @@ fn parse_list<T: for<'de> Deserialize<'de>>(props: &Value, key: &str) -> Vec<T> 
     };
     items
         .iter()
-        .filter_map(|item| match orbital_core_base::json_value::from_json_value::<T>(&item) {
-            Ok(v) => Some(v),
-            Err(err) => {
-                gap_once("algo-graph-invalid", &format!("{key} entry skipped: {err}"));
-                None
-            }
-        })
+        .filter_map(
+            |item| match orbital_core_base::json_value::from_json_value::<T>(item) {
+                Ok(v) => Some(v),
+                Err(err) => {
+                    gap_once("algo-graph-invalid", &format!("{key} entry skipped: {err}"));
+                    None
+                }
+            },
+        )
         .collect()
 }
 
@@ -711,9 +713,8 @@ mod tests {
             "control: root n0 gives 100px rows"
         );
         let mut cyc = tree_scene();
-        cyc["edges"]
-            .as_array_mut()
-            .map(|e| e.push(json!({"from": "n4", "to": "n0"})));
+        if let Some(e) = cyc["edges"]
+            .as_array_mut() { e.push(json!({"from": "n4", "to": "n0"})) }
         assert_eq!(
             of(&derive_shapes(&cyc, 600.0, 300.0), ShapeType::Circle).len(),
             5

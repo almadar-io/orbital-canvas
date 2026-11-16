@@ -20,9 +20,9 @@ pub mod state_machine;
 pub mod state_views;
 pub mod svg_atoms;
 
+use crate::scene::MappedScene;
 use orbital_canvas_map::error::CanvasSceneError;
 use orbital_canvas_map::game_canvas_2d::get_f32;
-use crate::scene::MappedScene;
 use serde_json::Value;
 
 /// Every diagram pattern that is not an `svg-*` atom ([`svg_atoms::ATOMS`]).

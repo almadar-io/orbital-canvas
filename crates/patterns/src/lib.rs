@@ -5,15 +5,15 @@
 //! Directories under `src/` are organizational only: every module is declared here at the crate root with its
 //! `#[path]`, so public paths stay flat and this file is the one map of where each module lives.
 
-#[path = "learning/mod.rs"]
-pub mod learning;
 #[path = "diagram/mod.rs"]
 pub mod diagram;
+#[path = "learning/mod.rs"]
+pub mod learning;
 
-#[path = "scene3d/learning_scene3d.rs"]
-pub mod learning_scene3d;
 #[path = "scene3d/learning_overlay3d.rs"]
 pub mod learning_overlay3d;
+#[path = "scene3d/learning_scene3d/mod.rs"]
+pub mod learning_scene3d;
 
 // scene: the dispatcher every host maps through
 #[path = "scene/scene.rs"]

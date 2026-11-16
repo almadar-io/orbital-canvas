@@ -144,7 +144,8 @@ fn units(
     }
     let mut out: Vec<Unit> = Vec::new();
     for (k, cluster) in shaped.clusters.iter().enumerate() {
-        let alone = orbital_canvas_paint::vector::shape(&line[cluster.bytes.clone()], size, bold, family);
+        let alone =
+            orbital_canvas_paint::vector::shape(&line[cluster.bytes.clone()], size, bold, family);
         let inside = &shaped.glyphs[cluster.glyphs.clone()];
         let separable = alone.glyphs.len() == inside.len()
             && alone

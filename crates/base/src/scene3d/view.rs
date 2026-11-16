@@ -4,8 +4,8 @@
 //! to the scene's own click events, `Canvas3DHost`'s scene-edit gestures (select, drag with a live preview cell,
 //! move on drop), `FollowCamera3D`'s easing toward the follow pose, and the host's imperative camera handle.
 
-use super::model::{Camera, MaterialKind, Projection, Scene3D};
 use super::camera::view_projection;
+use super::model::{Camera, MaterialKind, Projection, Scene3D};
 use glam::{Mat4, Vec3};
 use std::collections::BTreeMap;
 use std::f32::consts::{PI, TAU};

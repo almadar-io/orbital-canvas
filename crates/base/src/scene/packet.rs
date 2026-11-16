@@ -138,7 +138,10 @@ pub struct MorphContour {
 pub enum AnimationClock {
     #[default]
     Time,
-    Scroll { from: f32, to: f32 },
+    Scroll {
+        from: f32,
+        to: f32,
+    },
 }
 
 /// 2D camera state.

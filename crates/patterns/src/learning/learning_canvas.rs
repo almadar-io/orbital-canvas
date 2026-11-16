@@ -4,10 +4,10 @@
 use super::canvas::{self, CanvasSpec};
 use super::shape::parse_shapes;
 use super::theme::css_of;
-use orbital_canvas_map::error::CanvasSceneError;
-use orbital_canvas_map::game_canvas_2d::paint_drawables;
 use crate::scene::MappedScene;
 use orbital_canvas_base::projector::{Projection, Projector};
+use orbital_canvas_map::error::CanvasSceneError;
+use orbital_canvas_map::game_canvas_2d::paint_drawables;
 use serde_json::Value;
 
 pub fn map(props: &Value, viewport: Option<(f32, f32)>) -> Result<MappedScene, CanvasSceneError> {

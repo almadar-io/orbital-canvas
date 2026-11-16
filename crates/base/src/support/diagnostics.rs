@@ -28,7 +28,13 @@ mod tests {
     #[test]
     fn a_gap_is_logged_once_per_key() {
         assert!(first_sighting("diagnostics-test-a"));
-        assert!(!first_sighting("diagnostics-test-a"), "the same key logs once");
-        assert!(first_sighting("diagnostics-test-b"), "control: another key logs");
+        assert!(
+            !first_sighting("diagnostics-test-a"),
+            "the same key logs once"
+        );
+        assert!(
+            first_sighting("diagnostics-test-b"),
+            "control: another key logs"
+        );
     }
 }

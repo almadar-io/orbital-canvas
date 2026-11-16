@@ -95,7 +95,8 @@ impl WebSceneCanvas {
     /// [`Self::input`] from one of several pointers (`PointerEvent.pointerId`): a further finger reaches the
     /// region that holds capture, and a multi-touch gesture's events carry `touches`.
     pub fn input_pointer(&mut self, kind: &str, x: f32, y: f32, button: i32, pointer_id: i32) {
-        self.host.input_pointer(kind, x, y, button, None, i64::from(pointer_id));
+        self.host
+            .input_pointer(kind, x, y, button, None, i64::from(pointer_id));
     }
 
     /// The wheel at a point in CSS pixels with its pixel deltas; true when the canvas declares `wheelEvent`
@@ -169,8 +170,16 @@ impl WebSceneCanvas {
         ctrl: bool,
         meta: bool,
     ) {
-        self.host
-            .key_input(target, key, KeyMods { shift, alt, ctrl, meta });
+        self.host.key_input(
+            target,
+            key,
+            KeyMods {
+                shift,
+                alt,
+                ctrl,
+                meta,
+            },
+        );
     }
 
     /// An assistive technology acted on a node: `focus`, `activate`, `increment` or `decrement`.

@@ -8,12 +8,12 @@ use super::state_machine::{
     TransitionInfo,
 };
 use super::{props_f32, props_str};
-use orbital_canvas_map::error::CanvasSceneError;
 use crate::learning::canvas::theme_for;
 use crate::learning::theme::DiagramTheme;
-use orbital_canvas_base::transform::Xf;
 use crate::scene::MappedScene;
 use orbital_canvas_base::packet::TextAlign;
+use orbital_canvas_base::transform::Xf;
+use orbital_canvas_map::error::CanvasSceneError;
 use serde_json::Value;
 
 const MESSAGE_W: f32 = 320.0;
@@ -313,8 +313,10 @@ mod tests {
 
     /// The same trait as the raw `Trait` the jazari pattern takes, inside its orbital schema.
     fn jazari_props() -> Value {
-        let f: Value =
-            orbital_core_base::json_value::from_json_str(include_str!("fixtures/jazari-similarity-run.json")).unwrap();
+        let f: Value = orbital_core_base::json_value::from_json_str(include_str!(
+            "fixtures/jazari-similarity-run.json"
+        ))
+        .unwrap();
         json!({
             "type": "jazari-state-machine",
             "schema": {"orbitals": [{"entity": {"name": "SimilarityComparison", "fields": [{"name": "query"}, {"name": "status"}]}, "traits": [f["trait"].clone()]}]}

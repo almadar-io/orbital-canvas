@@ -1,11 +1,11 @@
 //! The 2D puppet-rig projection shared by native canvas hosts.
 
-use orbital_canvas_paint::asset;
 use orbital_canvas_base::packet::{DrawCommand, Vec2};
 use orbital_canvas_base::projector::{Projector, ScenePos};
 use orbital_canvas_base::skinning_2d::{self, BoneDef as Bone, Pose, SkinError, SkinMesh as Mesh};
 #[cfg(test)]
 use orbital_canvas_base::skinning_2d::{SkinVertex as Vertex, SkinWeight as Weight};
+use orbital_canvas_paint::asset;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -45,10 +45,11 @@ struct RigBundle {
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(value: &Value) -> Result<T, SkinMeshError> {
-    orbital_core_base::json_value::from_json_value(&value).map_err(|err| SkinMeshError::InvalidMesh(err.to_string()))
+    orbital_core_base::json_value::from_json_value(value)
+        .map_err(|err| SkinMeshError::InvalidMesh(err.to_string()))
 }
 
-fn frame_pose<'a>(clip: &'a Clip, frame: Option<u64>) -> Option<&'a Pose> {
+fn frame_pose(clip: &Clip, frame: Option<u64>) -> Option<&Pose> {
     frame.and_then(|frame| {
         (!clip.frames.is_empty()).then(|| &clip.frames[frame as usize % clip.frames.len()])
     })
@@ -70,70 +71,87 @@ fn hue_color(bone: usize) -> [f32; 4] {
     [rgb[0] + m, rgb[1] + m, rgb[2] + m, 1.0]
 }
 
-fn emit_pass(
-    mesh: &Mesh,
-    bones: &[Bone],
-    pose: &Pose,
+/// What stays the same across a skinned mesh's passes (its ghost and its live pose).
+struct SkinnedDrawable<'a> {
+    mesh: &'a Mesh,
+    bones: &'a [Bone],
     origin: (f32, f32),
-    projector: &Projector,
-    to_screen: &dyn Fn(f32, f32) -> (f32, f32),
-    texture: &str,
+    projector: &'a Projector,
+    to_screen: &'a dyn Fn(f32, f32) -> (f32, f32),
+    texture: &'a str,
     pixel_uv: bool,
     overlay: bool,
-    opacity: f32,
-    out: &mut Vec<DrawCommand>,
-) -> Result<(), SkinError> {
-    let bind = skinning_2d::compute_world_matrices(bones, &Pose::new())?;
-    let current = skinning_2d::compute_world_matrices(bones, pose)?;
-    let points = skinning_2d::skin_vertices(mesh, &bind, &current)?;
-    for (index, triangle) in mesh.triangles.iter().enumerate() {
-        let missing = |vertex: usize| SkinError::TriangleIndex {
-            triangle: index,
-            index: vertex,
-        };
-        let vertices = triangle
-            .iter()
-            .map(|i| mesh.vertices.get(*i).ok_or_else(|| missing(*i)))
-            .collect::<Result<Vec<_>, _>>()?;
-        let skinned = triangle
-            .iter()
-            .map(|i| points.get(*i).ok_or_else(|| missing(*i)))
-            .collect::<Result<Vec<_>, _>>()?;
-        let points: [Vec2; 3] = std::array::from_fn(|i| {
-            let (x, y) = to_screen(
-                origin.0 + skinned[i][0] as f32 * projector.tile_width,
-                origin.1 + skinned[i][1] as f32 * projector.tile_width,
-            );
-            Vec2 { x, y }
-        });
-        if overlay {
-            let bone = vertices[0]
-                .weights
+}
+
+impl SkinnedDrawable<'_> {
+    fn emit_pass(
+        &self,
+        pose: &Pose,
+        opacity: f32,
+        out: &mut Vec<DrawCommand>,
+    ) -> Result<(), SkinError> {
+        let SkinnedDrawable {
+            mesh,
+            bones,
+            origin,
+            projector,
+            to_screen,
+            texture,
+            pixel_uv,
+            overlay,
+        } = *self;
+        let bind = skinning_2d::compute_world_matrices(bones, &Pose::new())?;
+        let current = skinning_2d::compute_world_matrices(bones, pose)?;
+        let points = skinning_2d::skin_vertices(mesh, &bind, &current)?;
+        for (index, triangle) in mesh.triangles.iter().enumerate() {
+            let missing = |vertex: usize| SkinError::TriangleIndex {
+                triangle: index,
+                index: vertex,
+            };
+            let vertices = triangle
                 .iter()
-                .filter(|weight| weight.w > 0.0)
-                .max_by(|a, b| a.w.total_cmp(&b.w))
-                .map(|weight| weight.bone)
-                .ok_or(SkinError::NoPositiveWeight {
-                    vertex: triangle[0],
-                })?;
-            let mut color = hue_color(bone);
-            color[3] = opacity;
-            out.push(DrawCommand::Poly {
-                points: points.to_vec(),
-                color,
+                .map(|i| mesh.vertices.get(*i).ok_or_else(|| missing(*i)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let skinned = triangle
+                .iter()
+                .map(|i| points.get(*i).ok_or_else(|| missing(*i)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let points: [Vec2; 3] = std::array::from_fn(|i| {
+                let (x, y) = to_screen(
+                    origin.0 + skinned[i][0] as f32 * projector.tile_width,
+                    origin.1 + skinned[i][1] as f32 * projector.tile_width,
+                );
+                Vec2 { x, y }
             });
-        } else {
-            let uv = std::array::from_fn(|i| [vertices[i].u as f32, vertices[i].v as f32]);
-            out.push(DrawCommand::TexturedTriangle {
-                texture: texture.to_string(),
-                points,
-                uv,
-                uv_in_pixels: pixel_uv,
-                opacity,
-            });
+            if overlay {
+                let bone = vertices[0]
+                    .weights
+                    .iter()
+                    .filter(|weight| weight.w > 0.0)
+                    .max_by(|a, b| a.w.total_cmp(&b.w))
+                    .map(|weight| weight.bone)
+                    .ok_or(SkinError::NoPositiveWeight {
+                        vertex: triangle[0],
+                    })?;
+                let mut color = hue_color(bone);
+                color[3] = opacity;
+                out.push(DrawCommand::Poly {
+                    points: points.to_vec(),
+                    color,
+                });
+            } else {
+                let uv = std::array::from_fn(|i| [vertices[i].u as f32, vertices[i].v as f32]);
+                out.push(DrawCommand::TexturedTriangle {
+                    texture: texture.to_string(),
+                    points,
+                    uv,
+                    uv_in_pixels: pixel_uv,
+                    opacity,
+                });
+            }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Project one authored puppet rig. `Ok(None)` means its mesh or texture is still loading.
@@ -230,20 +248,24 @@ pub fn paint(
         .iter()
         .any(|vertex| vertex.u < 0.0 || vertex.u > 1.0 || vertex.v < 0.0 || vertex.v > 1.0);
     let mut out = Vec::new();
+    let drawable = SkinnedDrawable {
+        mesh: &mesh,
+        bones: &bones,
+        origin,
+        projector,
+        to_screen,
+        texture,
+        pixel_uv,
+        overlay,
+    };
     if let (Some(ghost), Some(clip)) = (node.get("ghost"), clip) {
         if let Some(ghost_pose) = frame_pose(clip, ghost.get("frame").and_then(Value::as_u64)) {
             let opacity = ghost.get("opacity").and_then(Value::as_f64).unwrap_or(1.0) as f32;
-            emit_pass(
-                &mesh, &bones, ghost_pose, origin, projector, to_screen, texture, pixel_uv,
-                overlay, opacity, &mut out,
-            )?;
+            drawable.emit_pass(ghost_pose, opacity, &mut out)?;
         }
     }
     let opacity = node.get("opacity").and_then(Value::as_f64).unwrap_or(1.0) as f32;
-    emit_pass(
-        &mesh, &bones, live_pose, origin, projector, to_screen, texture, pixel_uv, overlay,
-        opacity, &mut out,
-    )?;
+    drawable.emit_pass(live_pose, opacity, &mut out)?;
     Ok(Some(out))
 }
 
@@ -339,19 +361,17 @@ mod tests {
         let pose = Pose::from([("root".into(), 90.0), ("child".into(), 0.0)]);
         let projector = Projector::new(1.0, 0.0, Projection::Flat);
         let mut commands = Vec::new();
-        emit_pass(
-            &mesh,
-            &bones,
-            &pose,
-            (0.0, 0.0),
-            &projector,
-            &|x, y| (x, y),
-            "texture.png",
-            true,
-            false,
-            0.4,
-            &mut commands,
-        )
+        SkinnedDrawable {
+            mesh: &mesh,
+            bones: &bones,
+            origin: (0.0, 0.0),
+            projector: &projector,
+            to_screen: &|x, y| (x, y),
+            texture: "texture.png",
+            pixel_uv: true,
+            overlay: false,
+        }
+        .emit_pass(&pose, 0.4, &mut commands)
         .unwrap();
         let [DrawCommand::TexturedTriangle {
             texture,

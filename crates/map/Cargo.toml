@@ -6,6 +6,10 @@ license = "BUSL-1.1"
 repository = "https://github.com/almadar-io/orbital-canvas"
 description = "orbital-canvas layer: map (scene to packet)"
 
+[features]
+# Fixtures (`emitter::fixtures`) for the tests of crates that host a mapped scene.
+test-support = []
+
 [dependencies]
 orbital-canvas-base = { path = "../base" }
 orbital-canvas-paint = { path = "../paint" }
@@ -21,3 +25,4 @@ glam = "0.30"
 orbital-canvas-base = { path = "../base", features = ["test-support"] }
 orbital-canvas-paint = { path = "../paint", features = ["test-support"] }
 pretty_assertions = "1.4"
+image = { version = "0.25", default-features = false, features = ["png"] }

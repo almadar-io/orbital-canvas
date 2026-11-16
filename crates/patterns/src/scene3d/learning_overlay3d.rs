@@ -3,9 +3,9 @@
 //! [`DrawCommand::Scene3D`], and the click bridge that turns a picked mesh id into the molecule's
 //! `onShapeClick({ id, index })` payload (`get3DClickPayload`).
 
-use orbital_canvas_map::error::CanvasSceneError;
 use crate::learning;
 use orbital_canvas_base::packet::DrawCommand;
+use orbital_canvas_map::error::CanvasSceneError;
 use serde_json::{json, Map, Value};
 
 type Fields = Map<String, Value>;

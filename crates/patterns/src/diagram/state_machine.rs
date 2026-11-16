@@ -72,10 +72,23 @@ fn glyphs_of(v: &Value, transitions: Option<&Value>) -> std::collections::HashMa
     let mut out: std::collections::HashMap<String, String> = v
         .get("glyphs")
         .and_then(Value::as_object)
-        .map(|m| m.iter().filter_map(|(k, d)| Some((k.clone(), d.as_str()?.to_string()))).collect())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, d)| Some((k.clone(), d.as_str()?.to_string())))
+                .collect()
+        })
         .unwrap_or_default();
-    for e in transitions.and_then(Value::as_array).into_iter().flatten().filter_map(|t| t.get("effects")?.as_array()).flatten() {
-        if let (Some(op), Some(d)) = (e.get("type").and_then(Value::as_str), e.get("glyph").and_then(Value::as_str)) {
+    for e in transitions
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.get("effects")?.as_array())
+        .flatten()
+    {
+        if let (Some(op), Some(d)) = (
+            e.get("type").and_then(Value::as_str),
+            e.get("glyph").and_then(Value::as_str),
+        ) {
             out.insert(op.to_string(), d.to_string());
         }
     }
@@ -110,7 +123,7 @@ fn source_names(value: Option<&Value>) -> Vec<String> {
 
 fn guard_of(v: Option<&Value>) -> Option<String> {
     v.filter(|g| !g.is_null())
-        .and_then(|g| orbital_core_base::json_value::from_json_value::<SExpression>(&g).ok())
+        .and_then(|g| orbital_core_base::json_value::from_json_value::<SExpression>(g).ok())
         .map(|g| format_sexpr(&g))
 }
 
@@ -797,7 +810,14 @@ impl Diagram<'_> {
             let mut cx = tx + mono_text_width(&tr.event, LABEL_PX) + EFFECT_GAP;
             for fx in &tr.effects {
                 let (mx, my) = (cx + EFFECT_CHIP / 2.0, py + PILL_H / 2.0);
-                effect_glyph::chip(pen, fx, self.trait_data.glyphs.get(fx).map(String::as_str), mx, my, EFFECT_CHIP);
+                effect_glyph::chip(
+                    pen,
+                    fx,
+                    self.trait_data.glyphs.get(fx).map(String::as_str),
+                    mx,
+                    my,
+                    EFFECT_CHIP,
+                );
                 cx += EFFECT_CHIP + EFFECT_GAP;
             }
             if let Some(g) = &tr.guard {
@@ -1803,7 +1823,7 @@ impl OrbitalDiagram<'_> {
             .enumerate()
             .filter(|(_, (t, i))| t == trait_name && *i == index)
             .map(|(n, _)| n + 1)
-            .last()
+            .next_back()
     }
 
     fn first_step(&self, trait_name: &str) -> Option<usize> {
@@ -1921,7 +1941,7 @@ impl OrbitalDiagram<'_> {
                     Some(&Ink::new(tint(focus, 28.0), 4.0)),
                 );
             }
-            let fill = if self.depth_of(b) % 2 == 0 {
+            let fill = if self.depth_of(b).is_multiple_of(2) {
                 surface
             } else {
                 wash

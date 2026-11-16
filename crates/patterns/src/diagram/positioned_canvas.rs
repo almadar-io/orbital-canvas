@@ -5,10 +5,10 @@
 
 use super::draw::{frame, tint, Ink, Pen};
 use super::{props_f32, props_str};
-use orbital_canvas_map::error::CanvasSceneError;
 use crate::learning::canvas::theme_for;
 use crate::scene::{Drag, Emit, Hit, MappedScene};
 use orbital_canvas_base::packet::{Rect, TextAlign};
+use orbital_canvas_map::error::CanvasSceneError;
 use serde_json::{json, Value};
 
 #[derive(Clone, Copy, PartialEq, Eq)]

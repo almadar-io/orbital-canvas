@@ -7,12 +7,12 @@
 //! circle regions need a clip/composite primitive); it is skipped and logged.
 
 use super::theme::{DiagramTheme, FillStyle, Marker, Rgba, Weight};
-use orbital_canvas_base::transform::Xf;
 use orbital_canvas_base::diagnostics::gap_once;
-use orbital_canvas_base::path_data::parse_path_data;
 use orbital_canvas_base::packet::{
     DrawCommand, Halo, LineCap, LineJoin, PathSegment, Rect, Stroke, TextAlign, Vec2,
 };
+use orbital_canvas_base::path_data::parse_path_data;
+use orbital_canvas_base::transform::Xf;
 use serde::Deserialize;
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
@@ -251,13 +251,15 @@ pub fn parse_shapes(value: Option<&serde_json::Value>) -> Vec<Shape> {
     };
     items
         .iter()
-        .filter_map(|item| match orbital_core_base::json_value::from_json_value::<Shape>(&item) {
-            Ok(shape) => Some(shape),
-            Err(err) => {
-                gap_once("shape-invalid", &format!("shape skipped: {err}"));
-                None
-            }
-        })
+        .filter_map(
+            |item| match orbital_core_base::json_value::from_json_value::<Shape>(item) {
+                Ok(shape) => Some(shape),
+                Err(err) => {
+                    gap_once("shape-invalid", &format!("shape skipped: {err}"));
+                    None
+                }
+            },
+        )
         .collect()
 }
 
@@ -1131,7 +1133,7 @@ mod tests {
 
     fn venn(inside: &[&str], outside: &[&str]) -> Shape {
         let mut v: Shape = orbital_core_base::json_value::from_json_value(
-            &(json!({"type": "venn-region", "fill": "series-2", "fillStyle": "solid"}))
+            &(json!({"type": "venn-region", "fill": "series-2", "fillStyle": "solid"})),
         )
         .unwrap();
         v.inside = Some(inside.iter().map(|s| s.to_string()).collect());

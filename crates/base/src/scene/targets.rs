@@ -211,8 +211,19 @@ mod tests {
             hash_commands(commands, &mut hasher).expect("serializable");
             hasher.finish()
         };
-        assert_eq!(key(&[sprite("a"), sprite("b")]), key(&[sprite("a"), sprite("b")]));
-        assert_ne!(key(&[sprite("a"), sprite("b")]), key(&[sprite("b"), sprite("a")]), "order matters");
-        assert_ne!(key(&[sprite("a")]), key(&[sprite("c")]), "control: other content");
+        assert_eq!(
+            key(&[sprite("a"), sprite("b")]),
+            key(&[sprite("a"), sprite("b")])
+        );
+        assert_ne!(
+            key(&[sprite("a"), sprite("b")]),
+            key(&[sprite("b"), sprite("a")]),
+            "order matters"
+        );
+        assert_ne!(
+            key(&[sprite("a")]),
+            key(&[sprite("c")]),
+            "control: other content"
+        );
     }
 }

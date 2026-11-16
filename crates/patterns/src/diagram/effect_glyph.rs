@@ -218,13 +218,21 @@ fn unknown(pen: &mut Pen, x: f32, y: f32, s: f32, c: Rgba) {
 mod tests {
     use super::*;
     use crate::learning::theme::DiagramTheme;
-    use orbital_canvas_base::transform::Xf;
     use orbital_canvas_base::packet::DrawCommand;
+    use orbital_canvas_base::transform::Xf;
 
     fn draw(op: &str) -> Vec<DrawCommand> {
         let theme = DiagramTheme::heritage(false);
         let mut pen = Pen::new(&theme, Xf::identity());
-        glyph(&mut pen, op, None, 10.0, 10.0, 6.0, theme.tone("info").unwrap());
+        glyph(
+            &mut pen,
+            op,
+            None,
+            10.0,
+            10.0,
+            6.0,
+            theme.tone("info").unwrap(),
+        );
         pen.cmds
     }
 
@@ -253,7 +261,15 @@ mod tests {
     fn the_registry_glyph_the_data_carries_is_drawn_in_place_of_any_mark_kept_here() {
         let theme = DiagramTheme::heritage(false);
         let mut pen = Pen::new(&theme, Xf::identity());
-        glyph(&mut pen, "persist", Some("M-1 0 L1 0"), 10.0, 10.0, 6.0, theme.tone("info").unwrap());
+        glyph(
+            &mut pen,
+            "persist",
+            Some("M-1 0 L1 0"),
+            10.0,
+            10.0,
+            6.0,
+            theme.tone("info").unwrap(),
+        );
         let ends: Vec<(f32, f32)> = pen
             .cmds
             .iter()
@@ -261,15 +277,26 @@ mod tests {
                 DrawCommand::Path { segments, .. } => segments
                     .iter()
                     .filter_map(|seg| match seg {
-                        orbital_canvas_base::packet::PathSegment::MoveTo { x, y } | orbital_canvas_base::packet::PathSegment::LineTo { x, y } => Some((*x, *y)),
+                        orbital_canvas_base::packet::PathSegment::MoveTo { x, y }
+                        | orbital_canvas_base::packet::PathSegment::LineTo { x, y } => {
+                            Some((*x, *y))
+                        }
                         _ => None,
                     })
                     .collect::<Vec<_>>(),
                 _ => Vec::new(),
             })
             .collect();
-        assert_eq!(ends, vec![(4.0, 10.0), (16.0, 10.0)], "the unit path scaled by the half-size about the point");
-        assert_eq!(format!("{:?}", draw("persist")), format!("{:?}", draw("set")), "control: without data, its category's mark");
+        assert_eq!(
+            ends,
+            vec![(4.0, 10.0), (16.0, 10.0)],
+            "the unit path scaled by the half-size about the point"
+        );
+        assert_eq!(
+            format!("{:?}", draw("persist")),
+            format!("{:?}", draw("set")),
+            "control: without data, its category's mark"
+        );
     }
 
     #[test]
@@ -285,7 +312,10 @@ mod tests {
         .unwrap();
         assert_eq!(t.glyphs.get("set").map(String::as_str), Some("M0 0 L1 1"));
         assert_eq!(t.glyphs.get("emit").map(String::as_str), Some("M1 1 L0 0"));
-        assert!(!t.glyphs.contains_key("log"), "control: an effect with no glyph carries none");
+        assert!(
+            !t.glyphs.contains_key("log"),
+            "control: an effect with no glyph carries none"
+        );
     }
 
     #[test]

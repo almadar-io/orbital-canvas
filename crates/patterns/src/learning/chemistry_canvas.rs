@@ -6,9 +6,9 @@
 use super::canvas::{self, CanvasSpec};
 use super::shape::{parse_shapes, Align, Dash, Shape};
 use super::theme::DiagramTheme;
+use crate::scene::MappedScene;
 use orbital_canvas_map::error::CanvasSceneError;
 use orbital_canvas_map::game_canvas_2d::get_f32;
-use crate::scene::MappedScene;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::f32::consts::PI;
@@ -331,7 +331,10 @@ mod tests {
         })
     }
 
-    fn texts(scene: &MappedScene) -> Vec<(String, (f32, f32), f32, [f32; 4])> {
+    type TextRow = (String, (f32, f32), f32, [f32; 4]);
+    type SegLine = ((f32, f32), (f32, f32), orbital_canvas_base::packet::Stroke);
+
+    fn texts(scene: &MappedScene) -> Vec<TextRow> {
         scene
             .packet
             .draw_commands
@@ -349,7 +352,7 @@ mod tests {
             .collect()
     }
 
-    fn seg_lines(scene: &MappedScene) -> Vec<((f32, f32), (f32, f32), orbital_canvas_base::packet::Stroke)> {
+    fn seg_lines(scene: &MappedScene) -> Vec<SegLine> {
         scene
             .packet
             .draw_commands

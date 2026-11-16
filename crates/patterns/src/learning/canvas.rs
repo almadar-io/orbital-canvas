@@ -4,11 +4,11 @@
 
 use super::shape::{self, PaintCtx, Point, Shape, ShapeType};
 use super::theme::DiagramTheme;
+use crate::scene::{Emit, Hit, MappedScene};
+use orbital_canvas_base::packet::{DrawCommand, GameRenderPacket, Rect};
 use orbital_canvas_base::transform::Xf;
 use orbital_canvas_map::error::CanvasSceneError;
 use orbital_canvas_map::game_canvas_2d::{get_f32, get_string};
-use crate::scene::{Emit, Hit, MappedScene};
-use orbital_canvas_base::packet::{DrawCommand, GameRenderPacket, Rect};
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone)]
@@ -101,7 +101,9 @@ pub fn parse_particles(v: Option<&Value>) -> Result<Option<Particles>, CanvasSce
         (None, Some(buffer)) => {
             let field = |key: &str| buffer.get(key).and_then(Value::as_u64);
             match (field("id"), field("device")) {
-                (Some(id), Some(device)) => orbital_canvas_base::packet::ParticleSource::Gpu { id, device },
+                (Some(id), Some(device)) => {
+                    orbital_canvas_base::packet::ParticleSource::Gpu { id, device }
+                }
                 _ => return Err(bad(".buffer: not a GpuBuffer handle".into())),
             }
         }

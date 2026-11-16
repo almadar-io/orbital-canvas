@@ -9,7 +9,10 @@ pub const PRELUDE_3D: &str = include_str!("prelude.wgsl");
 /// The cube-map helpers the environment and its image-based lighting share.
 pub const CUBE_UV: &str = include_str!("cube_uv.wgsl");
 /// Three's image-based lighting, appended to the lit pass.
-pub const IBL: &str = concat!(include_str!("cube_uv.wgsl"), include_str!("environment_ibl.wgsl"));
+pub const IBL: &str = concat!(
+    include_str!("cube_uv.wgsl"),
+    include_str!("environment_ibl.wgsl")
+);
 /// Three's transmission, appended after the image-based lighting.
 pub const TRANSMISSION: &str = include_str!("transmission.wgsl");
 

@@ -5,17 +5,17 @@
 //! [`DrawCommand::Scene3D`] they cover.
 
 use crate::canvas_scene3d::SceneTheme;
-use orbital_canvas_base::color::parse_css_color;
 use crate::error::CanvasSceneError;
+use glam::{DMat4, DVec3, Mat4, Vec3, Vec4};
+use orbital_canvas_base::color::parse_css_color;
 use orbital_canvas_base::packet::{
     DrawCommand, Halo, LineCap, LineJoin, PathSegment, Rect, Stroke, TextAlign, Vec2,
 };
 use orbital_canvas_base::scene3d::model::{
     Flat, Interaction, Material, MaterialKind, MeshInstance, Scene3D, Side,
 };
-use orbital_canvas_base::scene3d::view_projection;
 use orbital_canvas_base::scene3d::view::{js_round, EditMode};
-use glam::{DMat4, DVec3, Mat4, Vec3, Vec4};
+use orbital_canvas_base::scene3d::view_projection;
 use serde_json::{json, Map, Value};
 
 type Fields = Map<String, Value>;
@@ -182,9 +182,12 @@ pub fn selection_ring(
         (position[1] as f32 - interaction.min_z) * cell,
     );
     let inner = SELECTION_RADIUS - RING_WIDTH;
-    let mesh =
-        orbital_canvas_base::scene3d::tessellate::ring([inner, inner], [SELECTION_RADIUS; 2], RING_SEGMENTS)
-            .map_err(|e| CanvasSceneError::Unsupported3DContract(format!("selection ring: {e}")))?;
+    let mesh = orbital_canvas_base::scene3d::tessellate::ring(
+        [inner, inner],
+        [SELECTION_RADIUS; 2],
+        RING_SEGMENTS,
+    )
+    .map_err(|e| CanvasSceneError::Unsupported3DContract(format!("selection ring: {e}")))?;
     Ok(MeshInstance {
         mesh,
         transform: (Mat4::from_translation(world)

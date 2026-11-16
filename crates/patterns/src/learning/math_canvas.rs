@@ -5,10 +5,10 @@
 use super::canvas::{self, CanvasSpec};
 use super::shape::{parse_shapes, Dash, Point, Shape, ShapeType};
 use super::theme::{css_of, DiagramTheme};
-use orbital_canvas_map::error::CanvasSceneError;
-use orbital_canvas_map::game_canvas_2d::{get_f32, get_string, paint_drawables};
 use crate::scene::MappedScene;
 use orbital_canvas_base::projector::{PlotAxes, Projector};
+use orbital_canvas_map::error::CanvasSceneError;
+use orbital_canvas_map::game_canvas_2d::{get_f32, get_string, paint_drawables};
 use serde_json::Value;
 
 use super::shape::Align;

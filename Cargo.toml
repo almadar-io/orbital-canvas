@@ -19,55 +19,25 @@ orbital-canvas-base = { path = "crates/base" }
 orbital-canvas-paint = { path = "crates/paint" }
 orbital-canvas-map = { path = "crates/map" }
 orbital-canvas-patterns = { path = "crates/patterns" }
-orbital-core-base = { git = "https://github.com/almadar-io/orbital-core", branch = "main", features = ["wgsl"] }
+orbital-canvas-render = { path = "crates/render" }
+orbital-core-base = { git = "https://github.com/almadar-io/orbital-core", branch = "main" }
 wgpu = "26"
 pollster = "0.4"
 # Every default format but `avif`, which is only the AV1 encoder (rav1e); canvas encodes PNG only.
 image = { version = "0.25", default-features = false, features = ["rayon", "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
-# SVG sprites: rasterized at on-screen size x density (see svg.rs). `text` and
-# system fonts stay off - sprites carry no live text, and the mobile targets
-# have no font db to scan; embedded raster images in an SVG stay on.
-resvg = { version = "0.45", default-features = false, features = ["raster-images"] }
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# physics-canvas `particles.data` arrives as base64 bytes.
-base64 = "0.22"
-# Every CSS color a browser paints (named, transparent, hsl, hwb), as the web hosts accept them.
-csscolorparser = { version = "0.7", default-features = false, features = ["named-colors"] }
-thiserror = "1.0"
-anyhow = "1.0"
 tracing = "0.1"
-# Vector layer: paths, strokes and text are rasterized on the CPU (anti-aliased,
-# dashes, joins) and composited as a texture in draw order. Same crate resvg uses.
-tiny-skia = "0.11"
-ttf-parser = "0.25"
-fontdb = { version = "0.23", default-features = false, features = ["std", "fs"], optional = true }
-# Text: rustybuzz shapes (joining, ligatures, marks), unicode-bidi orders mixed
-# directions into visual runs, unicode-script picks the font per run.
-rustybuzz = "0.20"
-unicode-bidi = "0.3"
-unicode-script = "0.5"
 raw-window-handle = "0.6"
-bytemuck = { version = "1.16", features = ["derive"] }
-# 3D transforms (scene3d): pure Rust, no_std-capable, builds for wasm.
-glam = "0.30"
-# GLB models (scene3d::gltf): parse only; `utils` gives the accessor readers, `names` the clip names. No `import`
-# (it pulls file I/O and image decoding we do through crate::asset), so it builds for wasm32.
-gltf = { version = "1.4", default-features = false, features = ["utils", "names"] }
-ureq = { version = "2.9", default-features = false, features = ["json"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # WebGL2 is the fallback where a browser has no WebGPU (owner ruling 2026-11-06): plain scenes draw, no compute.
 wgpu = { version = "26", features = ["webgl", "fragile-send-sync-non-atomic-wasm"] }
-js-sys = "0.3"
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["Window", "Response", "Headers", "HtmlCanvasElement"] }
 
-
 [dev-dependencies]
+# The kernel the native orb embeds: every workspace crate's tests share its one build (P-036 pins).
 orbital-core = { git = "https://github.com/almadar-io/orbital-core", branch = "main", features = ["native"] }
-pretty_assertions = "1.4"
 orbital-canvas-base = { path = "crates/base", features = ["test-support"] }
 orbital-canvas-paint = { path = "crates/paint", features = ["test-support"] }
+orbital-canvas-map = { path = "crates/map", features = ["test-support"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

@@ -302,7 +302,11 @@ mod tests {
         let mut out = Vec::new();
         for k in 0..4 {
             let (x, y) = pts[(corner + k) % 4];
-            out.push(if k == 0 { PathSegment::MoveTo { x, y } } else { PathSegment::LineTo { x, y } });
+            out.push(if k == 0 {
+                PathSegment::MoveTo { x, y }
+            } else {
+                PathSegment::LineTo { x, y }
+            });
         }
         out.push(PathSegment::Close);
         out
@@ -310,7 +314,11 @@ mod tests {
 
     fn spread(c: &MorphContour) -> f32 {
         let (cx, cy) = (5.0, 5.0);
-        c.points.iter().map(|p| (p.x - cx).hypot(p.y - cy)).sum::<f32>() / c.points.len() as f32
+        c.points
+            .iter()
+            .map(|p| (p.x - cx).hypot(p.y - cy))
+            .sum::<f32>()
+            / c.points.len() as f32
     }
 
     #[test]
@@ -318,10 +326,16 @@ mod tests {
         let a = contours(&square_from_corner(0));
         let mut b = contours(&square_from_corner(2));
         let folded = blend(&a, &b, 0.5);
-        assert!(spread(&folded[0]) < 2.0, "control: unaligned, the halfway points fold to the centre");
+        assert!(
+            spread(&folded[0]) < 2.0,
+            "control: unaligned, the halfway points fold to the centre"
+        );
         align_to(&a, &mut b);
         let mid = blend(&a, &b, 0.5);
-        assert!((spread(&mid[0]) - spread(&a[0])).abs() < 0.1, "aligned, halfway is the same square");
+        assert!(
+            (spread(&mid[0]) - spread(&a[0])).abs() < 0.1,
+            "aligned, halfway is the same square"
+        );
     }
 
     #[test]

@@ -3,11 +3,10 @@
 pub use orbital_canvas_map::scene::*;
 
 use crate::{diagram, learning};
-use orbital_canvas_base::packet::{GameRenderPacket, Rect};
+use orbital_canvas_base::packet::GameRenderPacket;
 use orbital_canvas_map::error::CanvasSceneError;
 use orbital_canvas_map::game_canvas_2d;
 use serde_json::Value;
-use std::collections::HashMap;
 
 /// Patterns the scene mapper draws itself: the learning canvases, the diagram patterns and the
 /// game canvases.
@@ -132,7 +131,9 @@ fn scene3d_packet(
         None => orbital_canvas_map::canvas_scene3d::SceneTheme::default(),
     };
     let scene = if pattern == "canvas" {
-        orbital_canvas_map::canvas_scene3d::scene_from_canvas_node_themed(&node, width, height, &theme)?
+        orbital_canvas_map::canvas_scene3d::scene_from_canvas_node_themed(
+            &node, width, height, &theme,
+        )?
     } else {
         if let Some(map) = node.as_object_mut() {
             map.insert("type".into(), Value::String(pattern.into()));
@@ -187,6 +188,8 @@ pub fn scene_size(node: &Value) -> Result<(f32, f32), CanvasSceneError> {
 
 #[cfg(test)]
 mod tests {
+    use orbital_canvas_base::packet::Rect;
+
     fn scene3d(node: serde_json::Value) -> orbital_canvas_base::scene3d::Scene3D {
         let mapped = super::map_scene(&node, Some((600.0, 400.0))).expect("a 3D scene");
         match mapped.packet.draw_commands.as_slice() {
@@ -358,7 +361,11 @@ mod tests {
         assert_eq!(scene_size(&orbital).unwrap(), (1200.0, 760.0));
         let plain = json!({"type": "canvas", "mode": "2d", "projection": "free",
             "worldWidth": 1200, "worldHeight": 760, "drawables": []});
-        assert_eq!(scene_size(&plain).unwrap(), (800.0, 600.0), "control: today's games keep width/height");
+        assert_eq!(
+            scene_size(&plain).unwrap(),
+            (800.0, 600.0),
+            "control: today's games keep width/height"
+        );
     }
 
     #[test]

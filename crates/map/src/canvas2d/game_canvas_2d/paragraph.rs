@@ -1,0 +1,146 @@
+//! Paragraph layout: lines broken to a width as the web breaks them, and ellipsis.
+
+/// The lines of a paragraph and each line's advance width, in the units of `size`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Paragraph {
+    pub lines: Vec<String>,
+    /// The index in the text of each line's first character.
+    pub starts: Vec<usize>,
+    pub widths: Vec<f32>,
+}
+
+/// Lay `text` out in lines of at most `width`. Line breaks fall at the opportunities of [`break_segments`]; a
+/// segment wider than the line overflows it (or is cut with an ellipsis when `truncate`). `max_lines` keeps the
+/// first lines, the last ending in an ellipsis when `truncate`. Widths come from the shaper's advances.
+/// How a paragraph breaks: its line width and the wrap, line-cap and ellipsis rules.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParagraphBox {
+    pub width: f32,
+    pub wrap: bool,
+    pub max_lines: Option<usize>,
+    pub truncate: bool,
+}
+
+pub(crate) fn layout_paragraph(
+    text: &str,
+    size: f32,
+    bold: bool,
+    family: orbital_canvas_base::packet::TextFamily,
+    frame: ParagraphBox,
+) -> Paragraph {
+    let ParagraphBox {
+        width,
+        wrap,
+        max_lines,
+        truncate,
+    } = frame;
+    let measure = |s: &str| orbital_canvas_paint::vector::shape(s, size, bold, family).width;
+    let mut lines: Vec<String> = Vec::new();
+    let mut starts: Vec<usize> = Vec::new();
+    let mut hard_start = 0;
+    for hard in text.split('\n') {
+        let hard_chars = hard.chars().count();
+        if !wrap {
+            lines.push(hard.trim_end().to_string());
+            starts.push(hard_start);
+            hard_start += hard_chars + 1;
+            continue;
+        }
+        let mut line = String::new();
+        let mut line_start = hard_start;
+        let mut segment_start = hard_start;
+        for segment in break_segments(hard) {
+            let candidate = format!("{line}{segment}");
+            if line.is_empty() || measure(candidate.trim_end()) <= width {
+                line = candidate;
+            } else {
+                lines.push(line.trim_end().to_string());
+                starts.push(line_start);
+                line = segment.to_string();
+                line_start = segment_start;
+            }
+            segment_start += segment.chars().count();
+        }
+        lines.push(line.trim_end().to_string());
+        starts.push(line_start);
+        hard_start += hard_chars + 1;
+    }
+    let mut cut = false;
+    if let Some(max) = max_lines {
+        if lines.len() > max {
+            lines.truncate(max);
+            starts.truncate(max);
+            cut = true;
+        }
+    }
+    if truncate {
+        let last = lines.len().saturating_sub(1);
+        for (i, line) in lines.iter_mut().enumerate() {
+            if (i == last && cut) || measure(line.as_str()) > width {
+                *line = ellipsize(line, width, &measure);
+            }
+        }
+    }
+    let widths = lines.iter().map(|line| measure(line.as_str())).collect();
+    Paragraph {
+        lines,
+        starts,
+        widths,
+    }
+}
+
+/// `line` with its tail replaced by an ellipsis so that it fits `width`.
+pub(super) fn ellipsize(line: &str, width: f32, measure: &dyn Fn(&str) -> f32) -> String {
+    let mut kept: Vec<char> = line.trim_end().chars().collect();
+    loop {
+        let mut candidate: String = kept.iter().collect();
+        candidate.push('\u{2026}');
+        if kept.is_empty() || measure(&candidate) <= width {
+            return candidate;
+        }
+        kept.pop();
+        while kept.last().is_some_and(|c| c.is_whitespace()) {
+            kept.pop();
+        }
+    }
+}
+
+/// Split one hard line into pieces a line may break between: after spaces (UAX 14 LB18, none before a space or
+/// around a no-break space), after a hyphen unless a digit follows (LB21, LB25) or a zero-width space, and between
+/// ideographs, kana and Hangul syllables (LB31).
+pub(super) fn break_segments(text: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut previous: Option<char> = None;
+    for (i, c) in text.char_indices() {
+        if let Some(p) = previous {
+            if breaks_between(p, c) {
+                segments.push(&text[start..i]);
+                start = i;
+            }
+        }
+        previous = Some(c);
+    }
+    if start < text.len() {
+        segments.push(&text[start..]);
+    }
+    segments
+}
+
+pub(super) fn is_ideographic(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0x20000..=0x2FFFF)
+}
+
+pub(super) fn breaks_between(previous: char, next: char) -> bool {
+    if previous == '\u{00A0}' || next == '\u{00A0}' || next.is_whitespace() {
+        return false;
+    }
+    if previous.is_whitespace() || previous == '\u{200B}' {
+        return true;
+    }
+    if matches!(previous, '-' | '\u{2010}' | '\u{2013}') {
+        return !next.is_ascii_digit();
+    }
+    is_ideographic(previous) || is_ideographic(next)
+}

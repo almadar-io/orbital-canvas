@@ -6,11 +6,11 @@
 use super::draw::{frame, with_alpha, Ink, Pen};
 use super::graph_layout::{force_layout, static_layout, LayoutMode, Point};
 use super::{props_f32, props_str};
-use orbital_canvas_map::error::CanvasSceneError;
 use crate::learning::canvas::theme_for;
-use orbital_canvas_base::transform::Xf;
 use crate::scene::{Emit, MappedScene};
 use orbital_canvas_base::packet::TextAlign;
+use orbital_canvas_base::transform::Xf;
+use orbital_canvas_map::error::CanvasSceneError;
 use serde_json::{json, Value};
 
 const DEFAULT_NODE_SIZE: f32 = 8.0;

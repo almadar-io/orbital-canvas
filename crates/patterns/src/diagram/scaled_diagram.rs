@@ -4,9 +4,9 @@
 //! child is laid out at the scale directly, so its hit regions and text scale with it.
 
 use super::draw::frame;
-use orbital_canvas_map::error::CanvasSceneError;
-use orbital_canvas_base::diagnostics::gap_once;
 use crate::scene::{is_scene_pattern, map_scene, scene_size, MappedScene};
+use orbital_canvas_base::diagnostics::gap_once;
+use orbital_canvas_map::error::CanvasSceneError;
 use serde_json::Value;
 
 /// A diagram narrower than this is not a "real diagram worth scaling" (`MIN_DIAGRAM_WIDTH`).

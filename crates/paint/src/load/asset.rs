@@ -65,7 +65,9 @@ enum State {
 }
 
 static CACHE: OnceLock<RwLock<HashMap<String, State>>> = OnceLock::new();
-static DIMS: OnceLock<RwLock<HashMap<String, Option<(u32, u32)>>>> = OnceLock::new();
+/// Each image's decoded size, or `None` when it has none.
+type Dims = RwLock<HashMap<String, Option<(u32, u32)>>>;
+static DIMS: OnceLock<Dims> = OnceLock::new();
 /// Monotonic counter bumped on every fetch completion (Ready or Failed).
 /// Consumers that cache mapper output (e.g. the dioxus paint source) rebuild
 /// when this changes — the Rust analogue of React's asset-store subscription

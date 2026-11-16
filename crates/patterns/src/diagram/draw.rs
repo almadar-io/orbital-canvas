@@ -3,15 +3,15 @@
 //! (`var(--color-primary)`) maps to the tone that variable feeds in `canvas_theme`.
 
 use crate::learning::canvas::fit;
-use orbital_canvas_base::path_data::parse_path_data;
 use crate::learning::theme::{DiagramTheme, Rgba};
-use orbital_canvas_base::diagnostics::gap_once;
-use orbital_canvas_base::transform::Xf;
 use crate::scene::{Drag, Emit, Hit, MappedScene};
+use orbital_canvas_base::diagnostics::gap_once;
 use orbital_canvas_base::packet::{
     Animation, DrawCommand, Easing, GameRenderPacket, Keyframe, LineCap, LineJoin, PathSegment,
     Rect, Stroke, TextAlign, Vec2,
 };
+use orbital_canvas_base::path_data::parse_path_data;
+use orbital_canvas_base::transform::Xf;
 use std::f32::consts::TAU;
 
 /// Pixels from an SVG text baseline up to the middle of its em box.
@@ -209,7 +209,11 @@ impl<'a> Pen<'a> {
 
     /// A glyph's unit path (-1..1, y down) drawn `half` scene units each side of (`x`, `y`).
     pub fn unit_path(&mut self, d: &str, x: f32, y: f32, half: f32, ink: &Ink) {
-        let xf = Xf { s: self.xf.s * half, ox: self.xf.ox + x * self.xf.s, oy: self.xf.oy + y * self.xf.s };
+        let xf = Xf {
+            s: self.xf.s * half,
+            ox: self.xf.ox + x * self.xf.s,
+            oy: self.xf.oy + y * self.xf.s,
+        };
         match parse_path_data(d, xf) {
             Some(segments) => self.path(segments, None, Some(ink)),
             None => gap_once("glyph-path-data", "malformed glyph path — skipped"),
@@ -378,7 +382,16 @@ impl<'a> Pen<'a> {
         align: TextAlign,
         weight: u16,
     ) {
-        self.text_face(x, middle_y, text, size, color, align, weight, orbital_canvas_base::packet::TextFamily::Sans);
+        self.text_face(
+            x,
+            middle_y,
+            text,
+            size,
+            color,
+            align,
+            weight,
+            orbital_canvas_base::packet::TextFamily::Sans,
+        );
     }
 
     /// [`Self::text_middle`] in the monospace face (`font-family: mono` on the web).
@@ -392,7 +405,16 @@ impl<'a> Pen<'a> {
         align: TextAlign,
         weight: u16,
     ) {
-        self.text_face(x, middle_y, text, size, color, align, weight, orbital_canvas_base::packet::TextFamily::Mono);
+        self.text_face(
+            x,
+            middle_y,
+            text,
+            size,
+            color,
+            align,
+            weight,
+            orbital_canvas_base::packet::TextFamily::Mono,
+        );
     }
 
     fn text_face(

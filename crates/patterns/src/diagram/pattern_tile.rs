@@ -1,9 +1,9 @@
 use super::atlas_sprites;
 use super::draw::{frame, Pen};
 use super::{props_f32, props_str};
-use orbital_canvas_map::error::CanvasSceneError;
 use crate::learning::canvas::theme_for;
 use crate::scene::MappedScene;
+use orbital_canvas_map::error::CanvasSceneError;
 use orbital_core_base::language_data;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -63,9 +63,10 @@ fn geometry() -> Result<&'static Geometry, CanvasSceneError> {
                 "pattern-tile geometry missing from installed contract".into(),
             )
         })?;
-    let parsed: Geometry = orbital_core_base::json_value::from_json_value(&source).map_err(|error| {
-        CanvasSceneError::NothingToDraw(format!("pattern-tile geometry invalid: {error}"))
-    })?;
+    let parsed: Geometry =
+        orbital_core_base::json_value::from_json_value(&source).map_err(|error| {
+            CanvasSceneError::NothingToDraw(format!("pattern-tile geometry invalid: {error}"))
+        })?;
     Ok(GEOMETRY.get_or_init(|| parsed))
 }
 
@@ -301,7 +302,10 @@ mod tests {
         assert!(svg.find("<path").unwrap() < svg.find("<circle").unwrap());
         assert!(svg.contains("fill=\"#ff0000\" fill-opacity=\"0.75\""));
         let url = svg_data_url(&svg);
-        assert_eq!(orbital_canvas_paint::asset::image_info(&url), Some((50, 75)));
+        assert_eq!(
+            orbital_canvas_paint::asset::image_info(&url),
+            Some((50, 75))
+        );
     }
 
     #[test]
@@ -336,8 +340,9 @@ mod tests {
             )
             .expect("all modes produce an SVG raster")
         };
-        let alpha =
-            |raster: &orbital_canvas_paint::svg::Raster, x: usize, y: usize| raster.rgba[(y * 100 + x) * 4 + 3];
+        let alpha = |raster: &orbital_canvas_paint::svg::Raster, x: usize, y: usize| {
+            raster.rgba[(y * 100 + x) * 4 + 3]
+        };
         for mode in ["background", "frame"] {
             let image = raster(mode);
             assert!(alpha(&image, 5, 45) > 200, "{mode} starts with a tile");

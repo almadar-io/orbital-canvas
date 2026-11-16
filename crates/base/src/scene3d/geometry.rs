@@ -19,13 +19,15 @@ fn finite_positive(values: &[(f32, &str)]) -> Result<(), GeometryError> {
     Ok(())
 }
 
+/// One face of a cuboid: its u, v and w axes, the u and v directions, and the plane's width, height and depth.
+type CuboidSide = (usize, usize, usize, f32, f32, f32, f32, f32);
+
 /// three.js `BoxGeometry(width, height, depth)` with one segment per side: six faces in three's order (+x, -x, +y,
 /// -y, +z, -z), each with its own normal and UVs.
 pub fn cuboid(width: f32, height: f32, depth: f32) -> Result<MeshData, GeometryError> {
     finite_positive(&[(width, "width"), (height, "height"), (depth, "depth")])?;
     let mut mesh = MeshData::default();
-    // (u axis, v axis, w axis, udir, vdir, plane width, plane height, plane depth)
-    let sides: [(usize, usize, usize, f32, f32, f32, f32, f32); 6] = [
+    let sides: [CuboidSide; 6] = [
         (2, 1, 0, -1.0, -1.0, depth, height, width),
         (2, 1, 0, 1.0, -1.0, depth, height, -width),
         (0, 2, 1, 1.0, 1.0, width, depth, height),

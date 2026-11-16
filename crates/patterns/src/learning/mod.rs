@@ -17,11 +17,9 @@ pub mod learning_canvas;
 pub mod math_canvas;
 pub mod physics_canvas;
 
-use orbital_canvas_map::error::CanvasSceneError;
 use crate::scene::MappedScene;
+use orbital_canvas_map::error::CanvasSceneError;
 use serde_json::Value;
-
-
 
 pub(crate) const PATTERNS: &[&str] = &[
     "algo-graph-canvas",

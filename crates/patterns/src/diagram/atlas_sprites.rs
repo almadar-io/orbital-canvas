@@ -6,13 +6,13 @@
 
 use super::draw::{frame, Pen};
 use super::{props_f32, props_str};
+use crate::learning::canvas::theme_for;
+use crate::scene::MappedScene;
+use orbital_canvas_base::diagnostics::gap_once;
+use orbital_canvas_base::packet::{DrawCommand, Rect};
+use orbital_canvas_map::error::CanvasSceneError;
 use orbital_canvas_paint::asset;
 use orbital_canvas_paint::atlas;
-use orbital_canvas_map::error::CanvasSceneError;
-use crate::learning::canvas::theme_for;
-use orbital_canvas_base::diagnostics::gap_once;
-use crate::scene::MappedScene;
-use orbital_canvas_base::packet::{DrawCommand, Rect};
 use serde_json::Value;
 
 const PLACEHOLDER: f32 = 16.0;
@@ -163,13 +163,9 @@ fn style_px(props: &Value, key: &str) -> Option<f32> {
         return Some(n as f32);
     }
     let text = v.as_str()?;
-    match text
+    text
         .strip_suffix("px")
         .and_then(|n| n.trim().parse::<f32>().ok())
-    {
-        Some(n) => Some(n),
-        None => None,
-    }
 }
 
 fn panel_extent(props: &Value, key: &str) -> Result<f32, CanvasSceneError> {
@@ -286,7 +282,8 @@ mod tests {
     /// A 96x48 sheet (48x48 `panel.png` with 6px corner swatches, 48x48 `gem.png`) and its
     /// TextureAtlas JSON, both as data URLs so the fixture is self-contained.
     fn sheet() -> Value {
-        orbital_core_base::json_value::from_json_str(include_str!("fixtures/atlas-sheet.json")).unwrap()
+        orbital_core_base::json_value::from_json_str(include_str!("fixtures/atlas-sheet.json"))
+            .unwrap()
     }
 
     fn asset_of(sprite: &str) -> Value {

@@ -26,7 +26,7 @@ pub enum Projection {
 impl Projection {
     /// Parse the `.lolo` `projection` prop. Unknown strings → gap log + `Free`
     /// would be a heuristic, so callers must only pass the four authored values.
-    pub fn from_str(s: &str) -> Option<Projection> {
+    pub fn parse(s: &str) -> Option<Projection> {
         match s {
             "isometric" | "iso" => Some(Projection::Isometric),
             "hex" => Some(Projection::Hex),
@@ -55,7 +55,7 @@ pub enum Anchor {
 }
 
 impl Anchor {
-    pub fn from_str(s: &str) -> Option<Anchor> {
+    pub fn parse(s: &str) -> Option<Anchor> {
         match s {
             "top-left" => Some(Anchor::TopLeft),
             "ground" => Some(Anchor::Ground),

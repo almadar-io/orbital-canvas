@@ -1,0 +1,33 @@
+[package]
+name = "orbital-canvas-render"
+version = "18.0.0"
+edition = "2021"
+license = "BUSL-1.1"
+repository = "https://github.com/almadar-io/orbital-canvas"
+description = "orbital-canvas layer: render (wgpu)"
+
+[dependencies]
+orbital-canvas-base = { path = "../base" }
+orbital-canvas-paint = { path = "../paint" }
+orbital-core-base = { git = "https://github.com/almadar-io/orbital-core", branch = "main" }
+wgpu = "26"
+pollster = "0.4"
+bytemuck = { version = "1.16", features = ["derive"] }
+glam = "0.30"
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# WebGL2 is the fallback where a browser has no WebGPU (owner ruling 2026-11-06): plain scenes draw, no compute.
+wgpu = { version = "26", features = ["webgl", "fragile-send-sync-non-atomic-wasm"] }
+
+[dev-dependencies]
+orbital-canvas-base = { path = "../base", features = ["test-support"] }
+orbital-canvas-paint = { path = "../paint", features = ["test-support"] }
+# End-to-end tests map a scene and paint it.
+orbital-canvas-map = { path = "../map" }
+orbital-canvas-patterns = { path = "../patterns" }
+pretty_assertions = "1.4"

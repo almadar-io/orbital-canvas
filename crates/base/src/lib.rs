@@ -8,17 +8,17 @@
 pub const PORTABLE_MAX_TEXTURE_SIDE: u32 = 2048;
 
 // scene: what one frame draws
+#[path = "scene/fx_projection.rs"]
+pub mod fx_projection;
 #[path = "scene/packet.rs"]
 pub mod packet;
 #[path = "scene/path_data.rs"]
 pub mod path_data;
 #[path = "scene/targets.rs"]
 pub mod targets;
-#[path = "scene/fx_projection.rs"]
-pub mod fx_projection;
 
 // motion: how drawables change over time
-#[path = "motion/animate.rs"]
+#[path = "motion/animate/mod.rs"]
 pub mod animate;
 #[path = "motion/morph.rs"]
 pub mod morph;

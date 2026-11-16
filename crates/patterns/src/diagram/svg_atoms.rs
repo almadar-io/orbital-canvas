@@ -6,10 +6,10 @@
 
 use super::draw::{frame, with_alpha, Ink, Motion, Pen};
 use super::{props_f32, props_str};
-use orbital_canvas_map::error::CanvasSceneError;
 use crate::learning::canvas::theme_for;
 use crate::scene::MappedScene;
 use orbital_canvas_base::packet::{Easing, Keyframe, TextAlign};
+use orbital_canvas_map::error::CanvasSceneError;
 use serde_json::Value;
 use std::f32::consts::{FRAC_PI_2, TAU};
 

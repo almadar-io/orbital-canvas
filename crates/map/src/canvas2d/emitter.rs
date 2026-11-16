@@ -219,20 +219,17 @@ pub fn any_live(node: &Value, epoch_now_ms: f64) -> bool {
     live
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::game_canvas_2d::from_props_mapped;
-    use orbital_canvas_base::packet::{DrawCommand, GameRenderPacket};
-    use crate::SceneHost;
-    use serde_json::json;
+/// An emitter node for the tests here and in the crates that host a mapped scene.
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures {
+    use serde_json::{json, Value};
 
-    fn emitter(extra: Value) -> Value {
+    pub fn emitter(extra: Value) -> Value {
         let mut node = json!({
             "type": "draw-emitter", "id": "sparks", "position": {"x": 100, "y": 100},
             "template": [{"type": "draw-shape", "shape": "rect", "anchor": "top-left",
                 "position": {"x": 0, "y": 0}, "width": 10, "height": 10, "fill": "#ff0000"}],
-            "rate": 10, "lifetime": 1.0, "speed": [50, 50], "spread": [0, 6.2831], "seed": 7,
+            "rate": 10, "lifetime": 1.0, "speed": [50, 50], "spread": [0, std::f64::consts::TAU], "seed": 7,
             "over": {}
         });
         for (key, value) in extra.as_object().unwrap() {
@@ -240,6 +237,15 @@ mod tests {
         }
         node
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::emitter;
+    use super::*;
+    use crate::game_canvas_2d::from_props_mapped;
+    use orbital_canvas_base::packet::{DrawCommand, GameRenderPacket};
+    use serde_json::json;
 
     fn scene(node: Value) -> Value {
         json!({"width": 400, "height": 400, "scale": 1.0, "projection": "free",
@@ -356,31 +362,5 @@ mod tests {
         assert!(format!("{bad:?}").contains("lifetime"), "{bad:?}");
         let bad = from_props_mapped(&scene(emitter(json!({"speed": [1]}))), 1000.0).unwrap_err();
         assert!(format!("{bad:?}").contains("speed"), "{bad:?}");
-    }
-
-    #[test]
-    fn wants_frames_while_particles_live_and_not_after() {
-        let host = |node: Value, at: f64| {
-            let mut host = SceneHost::new();
-            host.set_epoch_clock(at);
-            host.set_scene(
-                json!({"type": "canvas", "mode": "2d", "projection": "free", "scale": 1.0,
-                "drawables": [node]}),
-            )
-            .unwrap();
-            host
-        };
-        let burst = emitter(json!({"rate": 0, "burst": 4, "startMs": 5000}));
-        assert!(host(burst.clone(), 5400.0).wants_frames());
-        assert!(!host(burst, 6100.0).wants_frames(), "the burst has died");
-        assert!(
-            host(emitter(json!({})), 60_000.0).wants_frames(),
-            "a rate emitter keeps emitting"
-        );
-        let still = json!({"type": "draw-shape", "shape": "rect", "position": {"x": 0, "y": 0}, "width": 4, "height": 4, "fill": "#fff"});
-        assert!(
-            !host(still, 6100.0).wants_frames(),
-            "control: a static scene needs none"
-        );
     }
 }

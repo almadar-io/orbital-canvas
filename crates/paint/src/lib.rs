@@ -5,10 +5,10 @@
 //! `#[path]`, so public paths stay flat and this file is the one map of where each module lives.
 
 // raster: pixels on the CPU
-#[path = "raster/vector.rs"]
-pub mod vector;
 #[path = "raster/svg.rs"]
 pub mod svg;
+#[path = "raster/vector/mod.rs"]
+pub mod vector;
 
 // load: bytes a scene names, fetched and decoded
 #[path = "load/asset.rs"]

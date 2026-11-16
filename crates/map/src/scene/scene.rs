@@ -164,10 +164,22 @@ impl TextHit {
     /// The caret index nearest the point: the line whose band holds `y` (else the nearest line), then its nearest edge.
     pub fn index_at(&self, x: f32, y: f32) -> Option<usize> {
         let line = self.lines.iter().min_by(|a, b| {
-            let dist = |l: &TextHitLine| if y < l.top { l.top - y } else if y > l.bottom { y - l.bottom } else { 0.0 };
+            let dist = |l: &TextHitLine| {
+                if y < l.top {
+                    l.top - y
+                } else if y > l.bottom {
+                    y - l.bottom
+                } else {
+                    0.0
+                }
+            };
             dist(a).total_cmp(&dist(b))
         })?;
-        let (i, _) = line.edges.iter().enumerate().min_by(|(_, a), (_, b)| (*a - x).abs().total_cmp(&(*b - x).abs()))?;
+        let (i, _) = line
+            .edges
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| (*a - x).abs().total_cmp(&(*b - x).abs()))?;
         Some(line.start + i)
     }
 }
@@ -225,4 +237,3 @@ pub fn emits_in(hits: &[Hit], x: f32, y: f32) -> &[Emit] {
         })
         .map_or(&[], |h| h.emits.as_slice())
 }
-

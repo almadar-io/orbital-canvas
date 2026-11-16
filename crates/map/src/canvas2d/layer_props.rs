@@ -1,8 +1,8 @@
 //! Prop parsing for backdrops (rasm floor contract 14.6) and render targets (14.7): `draw-shape.backdrop`,
 //! `draw-group.target`, `draw-sprite.texture: "target:<id>"` and `material.targets`.
 
-use orbital_canvas_base::color::parse_css_color;
 use crate::error::CanvasSceneError;
+use orbital_canvas_base::color::parse_css_color;
 use orbital_canvas_base::packet::{DrawCommand, SdfBackdrop, Vec2};
 use serde_json::Value;
 
@@ -175,8 +175,8 @@ pub(crate) fn check_target_cycles(commands: &[DrawCommand]) -> Result<(), Canvas
 
 #[cfg(test)]
 mod tests {
-    use crate::game_canvas_2d::{from_props, from_props_mapped};
     use super::*;
+    use crate::game_canvas_2d::{from_props, from_props_mapped};
     use orbital_canvas_base::packet::GameRenderPacket;
     use serde_json::json;
 

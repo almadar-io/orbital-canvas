@@ -1,0 +1,715 @@
+//! Pixel checks of the 3D renderer on this machine's adapter; every test returns early when there is none.
+
+use super::render::Renderer3D;
+use glam::Mat4;
+use orbital_canvas_base::scene3d::geometry;
+use orbital_canvas_base::scene3d::model::*;
+
+const SIZE: u32 = 64;
+
+fn renderer() -> Option<Renderer3D> {
+    let shared = crate::device::shared_device().ok()?;
+    Some(Renderer3D::new(shared.device.clone(), shared.queue.clone()))
+}
+
+fn camera(eye: [f32; 3], target: [f32; 3]) -> Camera {
+    Camera {
+        eye,
+        target,
+        up: [0.0, 1.0, 0.0],
+        projection: Projection::Perspective {
+            fov_y_degrees: 45.0,
+        },
+        near: 0.1,
+        far: 100.0,
+    }
+}
+
+fn scene(meshes: Vec<MeshInstance>, lights: Lights, shadows: bool) -> Scene3D {
+    Scene3D {
+        camera: camera([0.0, 6.0, 8.0], [0.0, 0.0, 0.0]),
+        background: [0.0, 0.0, 0.0, 1.0],
+        lights,
+        shadows,
+        tone_mapping: ToneMapping::None,
+        meshes,
+        grid: None,
+        interaction: Interaction::default(),
+        animated: false,
+        environment: None,
+        post: None,
+        time: 0.0,
+    }
+}
+
+fn instance(mesh: MeshData, transform: Mat4, material: Material) -> MeshInstance {
+    MeshInstance {
+        mesh,
+        transform: transform.to_cols_array(),
+        material,
+        cast_shadow: true,
+        receive_shadow: true,
+        id: None,
+        glow: None,
+    }
+}
+
+fn sun(shadow: bool) -> Lights {
+    Lights {
+        ambient: None,
+        hemisphere: None,
+        directional: Some(DirectionalLight {
+            position: [0.0, 10.0, 0.0],
+            target: [0.0, 0.0, 0.0],
+            color: [1.0, 1.0, 1.0],
+            intensity: std::f32::consts::PI,
+            shadow: shadow.then_some(ShadowSettings {
+                map_size: 1024,
+                bias: -0.0005,
+                normal_bias: 0.02,
+                extent: 6.0,
+                near: 0.5,
+                far: 50.0,
+            }),
+        }),
+        points: Vec::new(),
+    }
+}
+
+/// Renders `scene` into an RGBA8 sRGB texture and reads it back.
+fn draw(renderer: &mut Renderer3D, scene: &Scene3D, samples: u32) -> Vec<u8> {
+    let shared = crate::device::shared_device().expect("device");
+    let texture = shared.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("scene3d test target"),
+        size: wgpu::Extent3d {
+            width: SIZE,
+            height: SIZE,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let mut encoder = shared.device.create_command_encoder(&Default::default());
+    renderer
+        .encode(&mut encoder, scene, &texture, samples)
+        .expect("render");
+    crate::texture::copy_texture_to_rgba(
+        &shared.device,
+        &shared.queue,
+        encoder,
+        &texture,
+        SIZE,
+        SIZE,
+    )
+    .expect("readback")
+}
+
+/// Writes the frame to `$SCENE3D_DUMP/<name>.png` when that variable is set, for looking at a failure.
+fn dump(name: &str, rgba: &[u8]) {
+    if let Ok(dir) = std::env::var("SCENE3D_DUMP") {
+        let image = image::RgbaImage::from_raw(SIZE, SIZE, rgba.to_vec()).expect("frame");
+        image.save(format!("{dir}/{name}.png")).expect("png");
+    }
+}
+
+fn pixel(rgba: &[u8], x: u32, y: u32) -> [u8; 4] {
+    let i = ((y * SIZE + x) * 4) as usize;
+    [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+}
+
+fn luma(p: [u8; 4]) -> u32 {
+    p[0] as u32 + p[1] as u32 + p[2] as u32
+}
+
+/// three's ground rotation: a plane built in XY laid flat, facing up.
+fn ground() -> Mat4 {
+    Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2)
+}
+
+fn white() -> Material {
+    Material {
+        kind: MaterialKind::Standard,
+        color: [0.8, 0.8, 0.8],
+        ..Material::default()
+    }
+}
+
+#[test]
+fn a_lit_sphere_is_brighter_on_the_side_facing_its_light() {
+    let Some(mut r) = renderer() else { return };
+    let mut s = scene(
+        vec![instance(
+            geometry::sphere(1.5, 32, 32).unwrap(),
+            Mat4::IDENTITY,
+            white(),
+        )],
+        sun(false),
+        false,
+    );
+    s.camera = camera([0.0, 0.0, 8.0], [0.0, 0.0, 0.0]);
+    let rgba = draw(&mut r, &s, 1);
+    let (top, bottom) = (
+        pixel(&rgba, SIZE / 2, SIZE / 2 - 10),
+        pixel(&rgba, SIZE / 2, SIZE / 2 + 10),
+    );
+    assert!(
+        luma(top) > luma(bottom) + 60,
+        "top {top:?} bottom {bottom:?}"
+    );
+    assert_eq!(
+        pixel(&rgba, 1, 1),
+        [0, 0, 0, 255],
+        "control: the background stays clear"
+    );
+}
+
+#[test]
+fn a_box_casts_a_shadow_on_the_floor_and_control_without_shadows_it_does_not() {
+    let Some(mut r) = renderer() else { return };
+    let floor = instance(
+        geometry::plane(10.0, 10.0).unwrap(),
+        Mat4::IDENTITY * ground(),
+        white(),
+    );
+    let block = instance(
+        geometry::cuboid(2.0, 2.0, 2.0).unwrap(),
+        Mat4::from_translation([0.0, 3.0, 0.0].into()),
+        white(),
+    );
+    let mut shadowed = scene(vec![floor.clone(), block.clone()], sun(true), true);
+    shadowed.camera = camera([0.0, 2.0, 9.0], [0.0, 0.0, 2.0]);
+    let mut lit = shadowed.clone();
+    lit.shadows = false;
+    let (with, without) = (draw(&mut r, &shadowed, 1), draw(&mut r, &lit, 1));
+    dump("shadowed", &with);
+    let screen = |world: [f32; 3]| {
+        let ndc = orbital_canvas_base::scene3d::view_projection(&shadowed, 1.0)
+            .project_point3(world.into());
+        (
+            ((ndc.x * 0.5 + 0.5) * SIZE as f32) as u32,
+            ((0.5 - ndc.y * 0.5) * SIZE as f32) as u32,
+        )
+    };
+    let (under, beside) = (screen([0.0, 0.0, 0.0]), screen([3.5, 0.0, 0.0]));
+    let at = |rgba: &[u8], (x, y): (u32, u32)| pixel(rgba, x, y);
+    assert!(
+        luma(at(&with, under)) + 60 < luma(at(&with, beside)),
+        "shadowed {:?} vs lit floor {:?}",
+        at(&with, under),
+        at(&with, beside)
+    );
+    let (a, b) = (
+        luma(at(&without, under)) as i32,
+        luma(at(&without, beside)) as i32,
+    );
+    assert!(
+        (a - b).abs() <= 6,
+        "control: without shadows the floor is evenly lit ({a} vs {b})"
+    );
+}
+
+#[test]
+fn a_basic_material_ignores_light_and_paints_its_color() {
+    let Some(mut r) = renderer() else { return };
+    let basic = Material {
+        kind: MaterialKind::Basic,
+        color: [srgb_to_linear(0.5), 0.0, 0.0],
+        ..Material::default()
+    };
+    let mut s = scene(
+        vec![instance(
+            geometry::plane(20.0, 20.0).unwrap(),
+            Mat4::IDENTITY * ground(),
+            basic,
+        )],
+        Lights::default(),
+        false,
+    );
+    s.camera = camera([0.0, 5.0, 0.01], [0.0, 0.0, 0.0]);
+    let center = pixel(&draw(&mut r, &s, 1), SIZE / 2, SIZE / 2);
+    assert!(
+        (center[0] as i32 - 128).abs() <= 2 && center[1] == 0 && center[2] == 0,
+        "{center:?}"
+    );
+}
+
+#[test]
+fn a_half_transparent_plane_blends_over_what_is_behind_it() {
+    let Some(mut r) = renderer() else { return };
+    let basic = |rgb: [f32; 3], opacity: f32| Material {
+        kind: MaterialKind::Basic,
+        color: rgb,
+        opacity,
+        ..Material::default()
+    };
+    let back = instance(
+        geometry::plane(20.0, 20.0).unwrap(),
+        Mat4::IDENTITY * ground(),
+        basic([0.0, 0.0, 1.0], 1.0),
+    );
+    let front = instance(
+        geometry::plane(20.0, 20.0).unwrap(),
+        Mat4::from_translation([0.0, 1.0, 0.0].into()) * ground(),
+        basic([1.0, 0.0, 0.0], 0.5),
+    );
+    let mut s = scene(vec![front, back], Lights::default(), false);
+    s.camera = camera([0.0, 5.0, 0.01], [0.0, 0.0, 0.0]);
+    let center = pixel(&draw(&mut r, &s, 1), SIZE / 2, SIZE / 2);
+    assert!(
+        center[0] > 100 && center[2] > 100,
+        "both red and blue show: {center:?}"
+    );
+}
+
+#[test]
+fn multisampling_softens_an_edge_that_a_single_sample_leaves_hard() {
+    let Some(mut r) = renderer() else { return };
+    let basic = Material {
+        kind: MaterialKind::Basic,
+        color: [1.0, 1.0, 1.0],
+        ..Material::default()
+    };
+    let tilted = Mat4::from_rotation_y(0.3);
+    let mut s = scene(
+        vec![instance(
+            geometry::plane(3.0, 3.0).unwrap(),
+            tilted * ground(),
+            basic,
+        )],
+        Lights::default(),
+        false,
+    );
+    s.camera = camera([0.0, 6.0, 0.01], [0.0, 0.0, 0.0]);
+    let partial = |rgba: &[u8]| rgba.chunks(4).filter(|p| p[0] > 10 && p[0] < 245).count();
+    let (hard, soft) = (draw(&mut r, &s, 1), draw(&mut r, &s, 4));
+    assert_eq!(
+        partial(&hard),
+        0,
+        "control: one sample has no partial coverage"
+    );
+    assert!(partial(&soft) > 0, "four samples blend the edge");
+}
+
+#[test]
+fn a_mesh_drawn_twice_uploads_once() {
+    let Some(mut r) = renderer() else { return };
+    let mesh = geometry::sphere(1.0, 12, 12).unwrap();
+    let s = scene(
+        vec![
+            instance(mesh.clone(), Mat4::IDENTITY, white()),
+            instance(
+                mesh,
+                Mat4::from_translation([2.0, 0.0, 0.0].into()),
+                white(),
+            ),
+        ],
+        sun(false),
+        false,
+    );
+    draw(&mut r, &s, 1);
+    assert_eq!(r.cached_meshes(), 1);
+}
+
+#[test]
+fn a_packet_draws_its_3d_scene_first_and_2d_commands_over_it() {
+    let Ok(shared) = crate::device::shared_device() else {
+        return;
+    };
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut painter = crate::renderer::SharedDeviceRenderer::new(
+        shared.device.clone(),
+        shared.queue.clone(),
+        format,
+    );
+    let basic = Material {
+        kind: MaterialKind::Basic,
+        color: [0.0, 0.0, 1.0],
+        ..Material::default()
+    };
+    let mut s = scene(
+        vec![instance(
+            geometry::plane(20.0, 20.0).unwrap(),
+            Mat4::IDENTITY * ground(),
+            basic,
+        )],
+        Lights::default(),
+        false,
+    );
+    s.camera = camera([0.0, 5.0, 0.01], [0.0, 0.0, 0.0]);
+    let packet = orbital_canvas_base::packet::GameRenderPacket {
+        width: SIZE as f32,
+        height: SIZE as f32,
+        draw_commands: vec![
+            orbital_canvas_base::packet::DrawCommand::Scene3D { scene: Box::new(s) },
+            orbital_canvas_base::packet::DrawCommand::Quad {
+                rect: orbital_canvas_base::packet::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 8.0,
+                    h: 8.0,
+                },
+                color: [1.0, 0.0, 0.0, 1.0],
+            },
+        ],
+        ..Default::default()
+    };
+    let target = shared.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("3d over 2d target"),
+        size: wgpu::Extent3d {
+            width: SIZE,
+            height: SIZE,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    assert!(painter.render_packet_to_texture(&packet, &target));
+    let encoder = shared
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let rgba = crate::texture::copy_texture_to_rgba(
+        &shared.device,
+        &shared.queue,
+        encoder,
+        &target,
+        SIZE,
+        SIZE,
+    )
+    .expect("render");
+    let (overlay, scene) = (pixel(&rgba, 2, 2), pixel(&rgba, SIZE / 2, SIZE / 2));
+    assert!(
+        overlay[0] > 200 && overlay[2] < 50,
+        "the 2D quad paints over the scene: {overlay:?}"
+    );
+    assert!(
+        scene[2] > 200 && scene[0] < 50,
+        "the scene shows where nothing covers it: {scene:?}"
+    );
+}
+
+#[test]
+fn a_grid_draws_lines_on_the_ground_seen_from_above_and_control_not_from_below() {
+    let Some(mut r) = renderer() else { return };
+    let grid = Grid {
+        center: [0.0, 0.0, 0.0],
+        size: [20.0, 20.0],
+        cell_size: 1.0,
+        cell_thickness: 1.0,
+        cell_color: [1.0, 1.0, 1.0],
+        section_size: 5.0,
+        section_thickness: 1.5,
+        section_color: [1.0, 1.0, 1.0],
+        fade_distance: 50.0,
+        fade_strength: 1.0,
+        fade_from: 1.0,
+    };
+    let mut s = scene(Vec::new(), Lights::default(), false);
+    s.grid = Some(grid);
+    s.camera = camera([0.0, 6.0, 0.01], [0.0, 0.0, 0.0]);
+    let lit = |rgba: &[u8]| rgba.chunks(4).filter(|p| p[0] > 40).count();
+    let above = draw(&mut r, &s, 1);
+    assert!(lit(&above) > 50, "grid lines show from above");
+    s.camera = camera([0.0, -6.0, 0.01], [0.0, 0.0, 0.0]);
+    assert_eq!(
+        lit(&draw(&mut r, &s, 1)),
+        0,
+        "control: drei draws only the side facing up"
+    );
+}
+
+#[test]
+fn a_mapped_canvas_scene_renders_its_meshes_over_the_grid() {
+    let Some(mut r) = renderer() else { return };
+    let node = serde_json::json!({
+        "type": "canvas",
+        "mode": "3d",
+        "backgroundColor": "#1b1f2a",
+        "drawables": [
+            {"type": "draw-mesh", "shape": "box", "position": {"x": 0, "y": 0}, "material": {"color": "#e05a47"}, "outline": {"color": "#ffffff", "width": 0.06}},
+            {"type": "draw-text", "text": "orbital", "position": {"x": 3, "y": 1}},
+            {"type": "draw-shape", "shape": "ellipse", "position": {"x": 2, "y": 4}, "radiusX": 0.6, "fill": "#c03dd9"},
+            {"type": "draw-mesh", "shape": "sphere", "radius": 0.6, "position": {"x": 3, "y": 1}, "material": {"color": "#4a90d9", "metalness": 0.3, "roughness": 0.4}},
+            {"type": "draw-mesh", "shape": "torus", "radius": 0.6, "tube": 0.2, "position": {"x": 1, "y": 3}, "material": {"color": "#f2c14e"}},
+            {"type": "draw-mesh", "shape": "cone", "radius": 0.5, "height": 1.4, "position": {"x": 4, "y": 4}, "material": {"color": "#5cb85c", "kind": "toon"}}
+        ]
+    });
+    let scene = orbital_canvas_map::canvas_scene3d::scene_from_canvas_node(&node, 512.0, 512.0)
+        .expect("maps");
+    let shared = crate::device::shared_device().expect("device");
+    let texture = shared.device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: 512,
+            height: 512,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let mut encoder = shared.device.create_command_encoder(&Default::default());
+    r.encode(&mut encoder, &scene, &texture, 4).expect("render");
+    let rgba = crate::texture::copy_texture_to_rgba(
+        &shared.device,
+        &shared.queue,
+        encoder,
+        &texture,
+        512,
+        512,
+    )
+    .expect("readback");
+    if let Ok(dir) = std::env::var("SCENE3D_DUMP") {
+        image::RgbaImage::from_raw(512, 512, rgba.clone())
+            .expect("frame")
+            .save(format!("{dir}/mapped.png"))
+            .expect("png");
+    }
+    let colored = rgba
+        .chunks(4)
+        .filter(|p| p[0] as i32 - p[2] as i32 > 60)
+        .count();
+    assert!(
+        colored > 500,
+        "the red box and yellow torus show: {colored} warm pixels"
+    );
+}
+
+#[test]
+fn a_non_srgb_target_clears_to_the_authored_background_and_control_an_srgb_one_too() {
+    let Some(mut r) = renderer() else { return };
+    let mut s = scene(Vec::new(), Lights::default(), false);
+    s.background = [
+        srgb_to_linear(0x1b as f32 / 255.0),
+        srgb_to_linear(0x1f as f32 / 255.0),
+        srgb_to_linear(0x2a as f32 / 255.0),
+        1.0,
+    ];
+    let shared = crate::device::shared_device().expect("device");
+    for format in [
+        wgpu::TextureFormat::Rgba8Unorm,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+    ] {
+        let texture = shared.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let mut encoder = shared.device.create_command_encoder(&Default::default());
+        r.encode(&mut encoder, &s, &texture, 4).expect("render");
+        let rgba = crate::texture::copy_texture_to_rgba(
+            &shared.device,
+            &shared.queue,
+            encoder,
+            &texture,
+            SIZE,
+            SIZE,
+        )
+        .expect("readback");
+        let p = pixel(&rgba, 1, 1);
+        assert!(
+            (p[0] as i32 - 0x1b).abs() <= 1
+                && (p[1] as i32 - 0x1f).abs() <= 1
+                && (p[2] as i32 - 0x2a).abs() <= 1,
+            "{format:?}: {p:?}"
+        );
+    }
+}
+
+fn flat_white(flat: Flat) -> Material {
+    Material {
+        kind: MaterialKind::Flat(flat),
+        color: [1.0, 1.0, 1.0],
+        side: Side::Double,
+        ..Material::default()
+    }
+}
+
+fn png(image: &image::RgbaImage) -> Vec<u8> {
+    let mut out = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .expect("png");
+    out
+}
+
+/// A canvas node mapped at the test target's size.
+fn mapped(node: serde_json::Value) -> Scene3D {
+    orbital_canvas_map::canvas_scene3d::scene_from_canvas_node(&node, SIZE as f32, SIZE as f32)
+        .expect("maps")
+}
+
+fn screen(scene: &Scene3D, world: [f32; 3]) -> (f32, f32) {
+    let ndc =
+        orbital_canvas_base::scene3d::view_projection(scene, 1.0).project_point3(world.into());
+    (
+        (ndc.x * 0.5 + 0.5) * SIZE as f32,
+        (0.5 - ndc.y * 0.5) * SIZE as f32,
+    )
+}
+
+#[test]
+fn a_billboard_faces_the_camera_after_an_orbit_and_control_a_plain_quad_turns_edge_on() {
+    let Some(mut r) = renderer() else { return };
+    let quad =
+        orbital_canvas_base::scene3d::tessellate::quad(2.0, 2.0, [0.0, 0.0, 1.0, 1.0]).unwrap();
+    let billboard = instance(
+        quad.clone(),
+        Mat4::IDENTITY,
+        flat_white(Flat {
+            billboard: true,
+            ..Flat::default()
+        }),
+    );
+    let lit = |rgba: &[u8]| rgba.chunks(4).filter(|p| p[0] > 200).count();
+    for eye in [
+        [0.0, 0.0, 8.0],
+        [8.0, 0.0, 0.0],
+        [0.0, 5.6, 5.6],
+        [-5.6, 0.0, -5.6],
+    ] {
+        let mut s = scene(vec![billboard.clone()], Lights::default(), false);
+        s.camera = camera(eye, [0.0, 0.0, 0.0]);
+        let rgba = draw(&mut r, &s, 1);
+        assert!(
+            lit(&rgba) > 200,
+            "the quad faces a camera at {eye:?}: {}",
+            lit(&rgba)
+        );
+    }
+    let plain = instance(quad, Mat4::IDENTITY, flat_white(Flat::default()));
+    let mut side = scene(vec![plain], Lights::default(), false);
+    side.camera = camera([8.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+    assert!(
+        lit(&draw(&mut r, &side, 1)) < 10,
+        "control: an unturned quad is edge-on from the side"
+    );
+}
+
+#[test]
+fn a_sprite_cuts_out_texels_under_a_tenth_alpha_and_control_without_cutout_blends_them() {
+    let Some(mut r) = renderer() else { return };
+    let url = "test://scene3d/cutout.png";
+    let mut image = image::RgbaImage::new(2, 1);
+    image.put_pixel(0, 0, image::Rgba([255, 255, 255, 13]));
+    image.put_pixel(1, 0, image::Rgba([255, 255, 255, 255]));
+    orbital_canvas_paint::asset::register_asset(url, png(&image).into(), Some("image/png"));
+    let quad =
+        orbital_canvas_base::scene3d::tessellate::quad(4.0, 4.0, [0.0, 0.0, 1.0, 1.0]).unwrap();
+    let sprite = |cutout: bool| {
+        let mut s = scene(
+            vec![instance(
+                quad.clone(),
+                Mat4::IDENTITY,
+                Material {
+                    map: Some(url.into()),
+                    ..flat_white(Flat {
+                        nearest: true,
+                        cutout,
+                        ..Flat::default()
+                    })
+                },
+            )],
+            Lights::default(),
+            false,
+        );
+        s.camera = camera([0.0, 0.0, 8.0], [0.0, 0.0, 0.0]);
+        s
+    };
+    let (cut, soft) = (
+        draw(&mut r, &sprite(true), 1),
+        draw(&mut r, &sprite(false), 1),
+    );
+    let (faint, solid) = ((SIZE / 2 - 8, SIZE / 2), (SIZE / 2 + 8, SIZE / 2));
+    assert_eq!(pixel(&cut, faint.0, faint.1), [0, 0, 0, 255], "cut out");
+    assert!(
+        pixel(&cut, solid.0, solid.1)[0] > 200,
+        "the opaque half draws"
+    );
+    assert!(
+        pixel(&soft, faint.0, faint.1)[0] > 20,
+        "control: without the cutout the faint half blends in: {:?}",
+        pixel(&soft, faint.0, faint.1)
+    );
+}
+
+#[test]
+fn a_mapped_label_draws_its_glyphs_above_its_anchor() {
+    let Some(mut r) = renderer() else { return };
+    let node = |text: &str| {
+        serde_json::json!({"type": "canvas", "mode": "3d", "showGrid": false, "backgroundColor": "#000000",
+            "camera": {"mode": "front"}, "lighting": {"toneMapping": "none"},
+            "drawables": [{"type": "draw-text", "text": text, "position": {"x": 0, "y": 0},
+                "color": "#ffffff", "font": "bold 256px sans-serif"}]})
+    };
+    let s = mapped(node("HH"));
+    let rgba = draw(&mut r, &s, 1);
+    dump("label", &rgba);
+    let white: Vec<(u32, u32)> = (0..SIZE)
+        .flat_map(|y| (0..SIZE).map(move |x| (x, y)))
+        .filter(|&(x, y)| pixel(&rgba, x, y)[..3].iter().all(|c| *c > 200))
+        .collect();
+    assert!(white.len() > 10, "glyph pixels: {}", white.len());
+    let (_, anchor_y) = screen(&s, [0.0, 0.0, 0.0]);
+    let (_, label_y) = screen(&s, [0.0, 1.2, 0.0]);
+    assert!(
+        white.iter().all(|&(_, y)| (y as f32) < anchor_y),
+        "every glyph pixel is above the anchor"
+    );
+    let mean = white.iter().map(|&(_, y)| y as f32).sum::<f32>() / white.len() as f32;
+    assert!(
+        (mean - label_y).abs() < 6.0,
+        "the glyphs center on the lifted label: {mean} vs {label_y}"
+    );
+    let blank = draw(&mut r, &mapped(node("")), 1);
+    assert!(
+        blank.chunks(4).all(|p| p[..3].iter().all(|c| *c < 40)),
+        "control: an empty label draws nothing"
+    );
+}
+
+#[test]
+fn a_mapped_outline_shows_a_rim_around_its_mesh_and_control_none_without_it() {
+    let Some(mut r) = renderer() else { return };
+    let node = |outline: serde_json::Value| {
+        serde_json::json!({"type": "canvas", "mode": "3d", "showGrid": false, "backgroundColor": "#000000",
+            "shadows": false, "lighting": {"toneMapping": "none"},
+            "drawables": [{"type": "draw-mesh", "shape": "sphere", "radius": 1, "pivot": "center",
+                "position": {"x": 0, "y": 0}, "material": {"kind": "basic", "color": "#ff0000"},
+                "outline": outline}]})
+    };
+    let green = |rgba: &[u8]| rgba.chunks(4).filter(|p| p[1] > 150 && p[0] < 80).count();
+    let rimmed = draw(
+        &mut r,
+        &mapped(node(serde_json::json!({"color": "#00ff00", "width": 0.5}))),
+        1,
+    );
+    dump("outline", &rimmed);
+    assert!(green(&rimmed) > 20, "a green rim: {}", green(&rimmed));
+    let red = rimmed.chunks(4).filter(|p| p[0] > 200 && p[1] < 50).count();
+    assert!(red > 100, "the mesh still shows inside its rim: {red}");
+    assert_eq!(
+        green(&draw(&mut r, &mapped(node(serde_json::Value::Null)), 1)),
+        0,
+        "control: no outline, no rim"
+    );
+}

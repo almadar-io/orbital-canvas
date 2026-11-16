@@ -7,12 +7,12 @@
 use super::draw::{frame, Ink, Pen};
 use super::layered::{self, EdgeIn, Metrics, NodeIn};
 use super::state_machine::arrow_head;
+use crate::learning::canvas::theme_for;
+use crate::scene::MappedScene;
+use orbital_canvas_base::diagnostics::gap_once;
+use orbital_canvas_base::packet::TextAlign;
 use orbital_canvas_map::error::CanvasSceneError;
 use orbital_canvas_map::game_canvas_2d::get_string;
-use crate::learning::canvas::theme_for;
-use orbital_canvas_base::diagnostics::gap_once;
-use crate::scene::MappedScene;
-use orbital_canvas_base::packet::TextAlign;
 use orbital_canvas_paint::vector::text_width;
 use serde_json::Value;
 

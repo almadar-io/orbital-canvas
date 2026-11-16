@@ -94,24 +94,24 @@ fn parsed() -> &'static RwLock<HashMap<String, Arc<ParsedAtlas>>> {
 /// Parse atlas JSON bytes, dispatching on shape (`subTextures` → named atlas,
 /// `tileWidth` → uniform tilesheet).
 pub fn parse_atlas(json: &[u8]) -> Result<ParsedAtlas, String> {
-    let value: serde_json::Value =
-        orbital_core_base::json_value::from_json_slice(json).map_err(|e| format!("atlas json: {e}"))?;
+    let value: serde_json::Value = orbital_core_base::json_value::from_json_slice(json)
+        .map_err(|e| format!("atlas json: {e}"))?;
     if value.get("subTextures").is_some() {
-        let atlas: TextureAtlas =
-            orbital_core_base::json_value::from_json_value(&value).map_err(|e| format!("TextureAtlas: {e}"))?;
+        let atlas: TextureAtlas = orbital_core_base::json_value::from_json_value(&value)
+            .map_err(|e| format!("TextureAtlas: {e}"))?;
         return Ok(ParsedAtlas::Texture(atlas));
     }
     if value.get("tileWidth").is_some() {
-        let sheet: Tilesheet =
-            orbital_core_base::json_value::from_json_value(&value).map_err(|e| format!("Tilesheet: {e}"))?;
+        let sheet: Tilesheet = orbital_core_base::json_value::from_json_value(&value)
+            .map_err(|e| format!("Tilesheet: {e}"))?;
         return Ok(ParsedAtlas::Tilesheet(sheet));
     }
     if value.get("frameWidth").is_some()
         && value.get("frameHeight").is_some()
         && value.get("animations").is_some()
     {
-        let sheet: SpriteSheetAtlas =
-            orbital_core_base::json_value::from_json_value(&value).map_err(|e| format!("SpriteSheetAtlas: {e}"))?;
+        let sheet: SpriteSheetAtlas = orbital_core_base::json_value::from_json_value(&value)
+            .map_err(|e| format!("SpriteSheetAtlas: {e}"))?;
         return Ok(ParsedAtlas::SpriteSheet(sheet));
     }
     Err("atlas json is neither a TextureAtlas (subTextures) nor a Tilesheet (tileWidth)".into())
@@ -149,6 +149,7 @@ pub fn parsed_atlas(atlas_url: &str) -> Option<Arc<ParsedAtlas>> {
 /// `atlasSlice.subRectFor`:
 /// - `TextureAtlas`: `sprite` is a SubTexture name (e.g. `"blockBrown.png"`).
 /// - `Tilesheet`: `sprite` is `"col,row"` or a flat row-major index.
+///
 /// Returns `None` when the name/index does not resolve.
 pub fn sub_rect_for(atlas: &ParsedAtlas, sprite: &str) -> Option<Rect> {
     match atlas {
