@@ -1563,7 +1563,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/graph-force/cases.json"
         );
-        serde_json::from_str(&std::fs::read_to_string(path).expect("graph-force fixture")).unwrap()
+        orbital_core_base::json_value::from_json_str(&std::fs::read_to_string(path).expect("graph-force fixture")).unwrap()
     }
 
     /// Max distance between the native and the d3 settled positions of one fixture case.

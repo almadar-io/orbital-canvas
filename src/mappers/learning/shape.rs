@@ -249,7 +249,7 @@ pub fn parse_shapes(value: Option<&serde_json::Value>) -> Vec<Shape> {
     };
     items
         .iter()
-        .filter_map(|item| match serde_json::from_value::<Shape>(item.clone()) {
+        .filter_map(|item| match orbital_core_base::json_value::from_json_value::<Shape>(&item) {
             Ok(shape) => Some(shape),
             Err(err) => {
                 gap_once("shape-invalid", &format!("shape skipped: {err}"));
@@ -1403,8 +1403,8 @@ mod tests {
     }
 
     fn venn(inside: &[&str], outside: &[&str]) -> Shape {
-        let mut v: Shape = serde_json::from_value(
-            json!({"type": "venn-region", "fill": "series-2", "fillStyle": "solid"}),
+        let mut v: Shape = orbital_core_base::json_value::from_json_value(
+            &(json!({"type": "venn-region", "fill": "series-2", "fillStyle": "solid"}))
         )
         .unwrap();
         v.inside = Some(inside.iter().map(|s| s.to_string()).collect());

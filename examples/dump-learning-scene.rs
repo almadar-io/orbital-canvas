@@ -17,7 +17,7 @@ fn main() {
     let density: f32 = args.next().map_or(3.0, |v| v.parse().expect("density"));
     let scheme = args.next().unwrap_or_else(|| "light".into());
     let mut node: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).expect("readable")).expect("valid JSON");
+        orbital_core_base::json_value::from_json_str(&std::fs::read_to_string(&path).expect("readable")).expect("valid JSON");
     node["colorScheme"] = serde_json::Value::String(scheme);
 
     let scene = map_scene(&node, Some((vw, vh))).expect("scene maps");

@@ -2260,7 +2260,7 @@ mod tests {
             ..Default::default()
         };
         let json = serde_json::to_string(&packet).unwrap();
-        let parsed: GameRenderPacket = serde_json::from_str(&json).unwrap();
+        let parsed: GameRenderPacket = orbital_core_base::json_value::from_json_str(&json).unwrap();
         assert_eq!(parsed.pattern, "canvas-2d");
         assert_eq!(parsed.width, 800.0);
     }

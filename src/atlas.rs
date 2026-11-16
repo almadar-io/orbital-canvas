@@ -95,15 +95,15 @@ fn parsed() -> &'static RwLock<HashMap<String, Arc<ParsedAtlas>>> {
 /// `tileWidth` → uniform tilesheet).
 pub fn parse_atlas(json: &[u8]) -> Result<ParsedAtlas, String> {
     let value: serde_json::Value =
-        serde_json::from_slice(json).map_err(|e| format!("atlas json: {e}"))?;
+        orbital_core_base::json_value::from_json_slice(json).map_err(|e| format!("atlas json: {e}"))?;
     if value.get("subTextures").is_some() {
         let atlas: TextureAtlas =
-            serde_json::from_value(value).map_err(|e| format!("TextureAtlas: {e}"))?;
+            orbital_core_base::json_value::from_json_value(&value).map_err(|e| format!("TextureAtlas: {e}"))?;
         return Ok(ParsedAtlas::Texture(atlas));
     }
     if value.get("tileWidth").is_some() {
         let sheet: Tilesheet =
-            serde_json::from_value(value).map_err(|e| format!("Tilesheet: {e}"))?;
+            orbital_core_base::json_value::from_json_value(&value).map_err(|e| format!("Tilesheet: {e}"))?;
         return Ok(ParsedAtlas::Tilesheet(sheet));
     }
     if value.get("frameWidth").is_some()
@@ -111,7 +111,7 @@ pub fn parse_atlas(json: &[u8]) -> Result<ParsedAtlas, String> {
         && value.get("animations").is_some()
     {
         let sheet: SpriteSheetAtlas =
-            serde_json::from_value(value).map_err(|e| format!("SpriteSheetAtlas: {e}"))?;
+            orbital_core_base::json_value::from_json_value(&value).map_err(|e| format!("SpriteSheetAtlas: {e}"))?;
         return Ok(ParsedAtlas::SpriteSheet(sheet));
     }
     Err("atlas json is neither a TextureAtlas (subTextures) nor a Tilesheet (tileWidth)".into())

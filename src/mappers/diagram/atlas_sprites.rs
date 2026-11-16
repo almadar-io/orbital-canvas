@@ -286,7 +286,7 @@ mod tests {
     /// A 96x48 sheet (48x48 `panel.png` with 6px corner swatches, 48x48 `gem.png`) and its
     /// TextureAtlas JSON, both as data URLs so the fixture is self-contained.
     fn sheet() -> Value {
-        serde_json::from_str(include_str!("fixtures/atlas-sheet.json")).unwrap()
+        orbital_core_base::json_value::from_json_str(include_str!("fixtures/atlas-sheet.json")).unwrap()
     }
 
     fn asset_of(sprite: &str) -> Value {

@@ -7,7 +7,9 @@ Every open gap this repo owns lives here. This file is the source of truth; the 
 - **Codes:** new gaps use this repo's prefix `G-ORBITAL-GAME-RENDERER-`. Take the "Next code" below, then bump it in the same edit. Codes are never reused or renamed.
 - **Close by deleting.** Remove the entry in the same commit as the fix.
 
-Next code: `G-ORBITAL-GAME-RENDERER-024`
+Next code: `G-ORBITAL-GAME-RENDERER-025`
+
+- **G-ORBITAL-GAME-RENDERER-024** [mechanical] — A middle dot (U+00B7) inside an Arabic run of a `draw-text` paints as a missing-glyph box: the per-character font choice (`char_font` in `vector.rs`) keeps the run's Arabic face for neutral punctuation that face does not carry, instead of falling back to a face that has it. Seen 2026-11-16 (P-037) on std-restaurant-landing's Arabic eyebrow "مطبخ موسمي · منذ 2014" in a real WebGPU frame on the 4790 catalog; the English line with the same dot paints it. Repro: a `draw-text` whose text is Arabic with " · " between two words. Prevention rung: (3) the verifiers (a golden frame of mixed-script punctuation). Severity: low. Root cause: one-off.
 
 - **G-ORBITAL-GAME-RENDERER-023** [mechanical] — A `draw-group`'s own `offsetX` is ignored: `paint_group` (`mappers/game_canvas_2d.rs`) reads `offsetX` only through the group's `animation` track, so a static `offsetX` on a group never moves it (shapes and texts honour theirs). Found by the 2026-11-14 animation `startMs` lane while writing the group test. Reproduce: a group with `offsetX: 20` and no animation draws its children at the same place as without it. Prevention rung: (3) a renderer test per animatable group field, static and animated.
   Severity: low. Root cause: one-off.

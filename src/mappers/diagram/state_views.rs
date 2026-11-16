@@ -305,7 +305,7 @@ mod tests {
     /// `std-ml-similarity` trait `SimilarityRun` (3 states, 8 transitions, 2 guards) as
     /// `traitLevelFromTrait` yields it, with the machine sitting in `embedding`.
     fn machine() -> Value {
-        serde_json::from_str(include_str!(
+        orbital_core_base::json_value::from_json_str(include_str!(
             "fixtures/state-machine-view-similarity-run.json"
         ))
         .unwrap()
@@ -314,7 +314,7 @@ mod tests {
     /// The same trait as the raw `Trait` the jazari pattern takes, inside its orbital schema.
     fn jazari_props() -> Value {
         let f: Value =
-            serde_json::from_str(include_str!("fixtures/jazari-similarity-run.json")).unwrap();
+            orbital_core_base::json_value::from_json_str(include_str!("fixtures/jazari-similarity-run.json")).unwrap();
         json!({
             "type": "jazari-state-machine",
             "schema": {"orbitals": [{"entity": {"name": "SimilarityComparison", "fields": [{"name": "query"}, {"name": "status"}]}, "traits": [f["trait"].clone()]}]}

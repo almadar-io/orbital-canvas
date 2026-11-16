@@ -110,7 +110,7 @@ fn source_names(value: Option<&Value>) -> Vec<String> {
 
 fn guard_of(v: Option<&Value>) -> Option<String> {
     v.filter(|g| !g.is_null())
-        .and_then(|g| serde_json::from_value::<SExpression>(g.clone()).ok())
+        .and_then(|g| orbital_core_base::json_value::from_json_value::<SExpression>(&g).ok())
         .map(|g| format_sexpr(&g))
 }
 

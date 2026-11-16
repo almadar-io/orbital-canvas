@@ -53,7 +53,7 @@ fn geometry() -> Result<&'static Geometry, CanvasSceneError> {
     let installed = language_data::language_data().map_err(|error| {
         CanvasSceneError::NothingToDraw(format!("pattern-tile geometry: {error}"))
     })?;
-    let registry: Value = serde_json::from_str(&installed.patterns)
+    let registry: Value = orbital_core_base::json_value::from_json_str(&installed.patterns)
         .map_err(|error| CanvasSceneError::NothingToDraw(format!("pattern registry: {error}")))?;
     let source = registry
         .pointer("/patterns/pattern-tile/geometry")
@@ -63,7 +63,7 @@ fn geometry() -> Result<&'static Geometry, CanvasSceneError> {
                 "pattern-tile geometry missing from installed contract".into(),
             )
         })?;
-    let parsed: Geometry = serde_json::from_value(source).map_err(|error| {
+    let parsed: Geometry = orbital_core_base::json_value::from_json_value(&source).map_err(|error| {
         CanvasSceneError::NothingToDraw(format!("pattern-tile geometry invalid: {error}"))
     })?;
     Ok(GEOMETRY.get_or_init(|| parsed))

@@ -76,7 +76,7 @@ mod tests {
     use serde_json::json;
 
     fn machine() -> Value {
-        serde_json::from_str(include_str!(
+        orbital_core_base::json_value::from_json_str(include_str!(
             "fixtures/state-machine-view-similarity-run.json"
         ))
         .unwrap()

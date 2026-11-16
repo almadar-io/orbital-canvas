@@ -117,7 +117,7 @@ fn list<T: for<'de> Deserialize<'de>>(props: &Value, key: &'static str) -> Vec<T
     };
     items
         .iter()
-        .filter_map(|item| match serde_json::from_value::<T>(item.clone()) {
+        .filter_map(|item| match orbital_core_base::json_value::from_json_value::<T>(&item) {
             Ok(v) => Some(v),
             Err(err) => {
                 gap_once(
@@ -554,7 +554,7 @@ pub fn derive_shapes(props: &Value, width: f32, height: f32) -> Vec<Shape> {
 
     let mut out = Vec::new();
     if let Some(field) = props.get("field").filter(|f| !f.is_null()) {
-        match serde_json::from_value::<Field>(field.clone()) {
+        match orbital_core_base::json_value::from_json_value::<Field>(&field) {
             Ok(f) => out.extend(field_shapes(&f, width, height)),
             Err(err) => gap_once("physics-field-invalid", &format!("field skipped: {err}")),
         }

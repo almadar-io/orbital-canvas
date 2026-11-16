@@ -128,7 +128,7 @@ pub unsafe extern "C" fn orbital_canvas_submit(renderer: *mut Canvas, json_packe
                 return;
             }
         };
-        let packet = match serde_json::from_str::<GameRenderPacket>(json) {
+        let packet = match orbital_core_base::json_value::from_json_str::<GameRenderPacket>(json) {
             Ok(p) => p,
             Err(err) => {
                 tracing::error!(error = %err, "failed to parse submit packet");
@@ -168,7 +168,7 @@ pub unsafe extern "C" fn orbital_canvas_set_scene(
                 return 0;
             }
         };
-        let node = match serde_json::from_str::<serde_json::Value>(json) {
+        let node = match orbital_core_base::json_value::from_json_str::<serde_json::Value>(json) {
             Ok(v) => v,
             Err(err) => {
                 set_last_error(&format!("set_scene: scene is not valid JSON: {err}"));
@@ -359,7 +359,7 @@ pub unsafe extern "C" fn orbital_canvas_scene_size(
         let node = match CStr::from_ptr(scene_json)
             .to_str()
             .map_err(|e| e.to_string())
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).map_err(|e| e.to_string()))
+            .and_then(|s| orbital_core_base::json_value::from_json_str::<serde_json::Value>(s).map_err(|e| e.to_string()))
         {
             Ok(v) => v,
             Err(err) => {
@@ -584,7 +584,7 @@ pub unsafe extern "C" fn orbital_canvas_render_scene_rgba(
         let node = match CStr::from_ptr(scene_json)
             .to_str()
             .map_err(|e| e.to_string())
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).map_err(|e| e.to_string()))
+            .and_then(|s| orbital_core_base::json_value::from_json_str::<serde_json::Value>(s).map_err(|e| e.to_string()))
         {
             Ok(v) => v,
             Err(err) => {
@@ -1042,7 +1042,7 @@ mod tests {
         assert!(!ptr.is_null());
         let text = unsafe { CStr::from_ptr(ptr).to_str().unwrap().to_owned() };
         unsafe { orbital_canvas_free_string(ptr) };
-        serde_json::from_str(&text).unwrap()
+        orbital_core_base::json_value::from_json_str(&text).unwrap()
     }
 
     fn input(renderer: *mut Canvas, kind: &str, x: f32, y: f32) {
@@ -1236,7 +1236,7 @@ mod tests {
             .into_owned();
         unsafe { orbital_canvas_free_string(raw) };
         assert!(
-            serde_json::from_str::<Vec<serde_json::Value>>(&text).is_ok(),
+            orbital_core_base::json_value::from_json_str::<Vec<serde_json::Value>>(&text).is_ok(),
             "{text}"
         );
     }

@@ -45,7 +45,7 @@ struct RigBundle {
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(value: &Value) -> Result<T, SkinMeshError> {
-    serde_json::from_value(value.clone()).map_err(|err| SkinMeshError::InvalidMesh(err.to_string()))
+    orbital_core_base::json_value::from_json_value(&value).map_err(|err| SkinMeshError::InvalidMesh(err.to_string()))
 }
 
 fn frame_pose<'a>(clip: &'a Clip, frame: Option<u64>) -> Option<&'a Pose> {
@@ -179,7 +179,7 @@ pub fn paint(
             return Ok(None);
         };
         Some(
-            serde_json::from_slice::<Value>(&bytes)
+            orbital_core_base::json_value::from_json_slice::<Value>(&bytes)
                 .map_err(|err| SkinMeshError::InvalidMesh(err.to_string()))?,
         )
     } else {

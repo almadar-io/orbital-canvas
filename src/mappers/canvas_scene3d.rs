@@ -3006,18 +3006,18 @@ fn skinned_mesh_pos(f: &Fields, path: &str) -> Result<[f64; 3], CanvasSceneError
         return Ok(pos);
     };
     let parse = |e: serde_json::Error| bad(path, format!("draw-skinned-mesh: {e}"));
-    let mesh: SkinMesh = serde_json::from_value(mesh.clone()).map_err(parse)?;
-    let bones: Vec<BoneDef> = serde_json::from_value(Value::Array(bones.clone())).map_err(parse)?;
+    let mesh: SkinMesh = orbital_core_base::json_value::from_json_value(&mesh).map_err(parse)?;
+    let bones: Vec<BoneDef> = orbital_core_base::json_value::from_json_value(&(Value::Array(bones.clone()))).map_err(parse)?;
     let frames: Option<Vec<Pose>> = present(f, "clip")
         .and_then(|c| c.get("frames"))
-        .map(|v| serde_json::from_value(v.clone()))
+        .map(|v| orbital_core_base::json_value::from_json_value(&v))
         .transpose()
         .map_err(parse)?;
     let frame = present(f, "frame").and_then(Value::as_u64);
     let pose = match (frames.as_deref(), frame) {
         (Some(frames), Some(i)) if !frames.is_empty() => frames[i as usize % frames.len()].clone(),
         _ => present(f, "pose")
-            .map(|p| serde_json::from_value::<Pose>(p.clone()))
+            .map(|p| orbital_core_base::json_value::from_json_value::<Pose>(&p))
             .transpose()
             .map_err(parse)?
             .unwrap_or_default(),

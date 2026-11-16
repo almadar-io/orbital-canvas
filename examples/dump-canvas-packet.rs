@@ -53,7 +53,7 @@ fn main() {
         .init();
     let fixture = std::env::args().nth(1).expect("fixture .orb path");
     let out = std::env::args().nth(2).unwrap_or_else(|| "/tmp/canvas-packet.png".into());
-    let schema: serde_json::Value = serde_json::from_str(
+    let schema: serde_json::Value = orbital_core_base::json_value::from_json_str(
         &std::fs::read_to_string(&fixture).expect("fixture readable"),
     )
     .expect("fixture is valid JSON");

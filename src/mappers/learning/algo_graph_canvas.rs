@@ -53,7 +53,7 @@ fn parse_list<T: for<'de> Deserialize<'de>>(props: &Value, key: &str) -> Vec<T> 
     };
     items
         .iter()
-        .filter_map(|item| match serde_json::from_value::<T>(item.clone()) {
+        .filter_map(|item| match orbital_core_base::json_value::from_json_value::<T>(&item) {
             Ok(v) => Some(v),
             Err(err) => {
                 gap_once("algo-graph-invalid", &format!("{key} entry skipped: {err}"));
