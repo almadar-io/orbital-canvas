@@ -128,6 +128,43 @@ pub fn resample(contour: &MorphContour, n: usize) -> MorphContour {
     }
 }
 
+/// Turns each contour of `next` to start, and run, where it best matches the same contour of `reference`: a closed
+/// contour tries every starting point in both directions, an open one both directions; the match with the least summed
+/// squared distance wins. Blending aligned outlines moves each point the shortest way instead of folding the shape.
+pub fn align_to(reference: &[MorphContour], next: &mut [MorphContour]) {
+    for (r, c) in reference.iter().zip(next.iter_mut()) {
+        let n = c.points.len();
+        if n == 0 || r.points.len() != n {
+            continue;
+        }
+        let forward = c.points.clone();
+        let mut backward = c.points.clone();
+        backward.reverse();
+        let cost = |cand: &[Vec2], shift: usize| -> f32 {
+            r.points
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let q = cand[(i + shift) % n];
+                    (p.x - q.x).powi(2) + (p.y - q.y).powi(2)
+                })
+                .sum()
+        };
+        let shifts = if c.closed { n } else { 1 };
+        let mut best = (f32::INFINITY, false, 0usize);
+        for (reversed, cand) in [(false, &forward), (true, &backward)] {
+            for shift in 0..shifts {
+                let d = cost(cand, shift);
+                if d < best.0 {
+                    best = (d, reversed, shift);
+                }
+            }
+        }
+        let source = if best.1 { &backward } else { &forward };
+        c.points = (0..n).map(|i| source[(i + best.2) % n]).collect();
+    }
+}
+
 /// The outline `t` of the way from `a` to `b`; both hold the same number of resampled contours.
 pub fn blend(a: &[MorphContour], b: &[MorphContour], t: f32) -> Vec<MorphContour> {
     a.iter()
@@ -258,6 +295,44 @@ mod tests {
             "control: the start is the first outline"
         );
         assert_eq!(blend(&a, &b, 1.0)[0].points, b[0].points);
+    }
+
+    fn square_from_corner(corner: usize) -> Vec<PathSegment> {
+        let pts = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
+        let mut out = Vec::new();
+        for k in 0..4 {
+            let (x, y) = pts[(corner + k) % 4];
+            out.push(if k == 0 { PathSegment::MoveTo { x, y } } else { PathSegment::LineTo { x, y } });
+        }
+        out.push(PathSegment::Close);
+        out
+    }
+
+    fn spread(c: &MorphContour) -> f32 {
+        let (cx, cy) = (5.0, 5.0);
+        c.points.iter().map(|p| (p.x - cx).hypot(p.y - cy)).sum::<f32>() / c.points.len() as f32
+    }
+
+    #[test]
+    fn an_aligned_outline_blends_without_folding_through_its_centre() {
+        let a = contours(&square_from_corner(0));
+        let mut b = contours(&square_from_corner(2));
+        let folded = blend(&a, &b, 0.5);
+        assert!(spread(&folded[0]) < 2.0, "control: unaligned, the halfway points fold to the centre");
+        align_to(&a, &mut b);
+        let mid = blend(&a, &b, 0.5);
+        assert!((spread(&mid[0]) - spread(&a[0])).abs() < 0.1, "aligned, halfway is the same square");
+    }
+
+    #[test]
+    fn alignment_also_matches_a_contour_drawn_the_other_way_round() {
+        let a = contours(&square_from_corner(0));
+        let mut reversed = square_from_corner(0);
+        reversed[1..4].reverse();
+        let mut b = contours(&reversed);
+        align_to(&a, &mut b);
+        let mid = blend(&a, &b, 0.5);
+        assert!((spread(&mid[0]) - spread(&a[0])).abs() < 0.1);
     }
 
     #[test]

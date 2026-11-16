@@ -190,7 +190,10 @@ fn packet_animation(
             .ok_or_else(|| invalid("animation.keyframes.d", "an outline is SVG path data"))?;
         let segments = parse_path_data(d, path_xf(node, projector, to_screen, zoom))
             .ok_or_else(|| invalid("animation.keyframes.d", format!("malformed SVG path `{d}`")))?;
-        let contours = crate::morph::contours(&segments);
+        let mut contours = crate::morph::contours(&segments);
+        if let Some(previous) = morph.last().map(|f: &crate::packet::MorphFrame| f.contours.clone()) {
+            crate::morph::align_to(&previous, &mut contours);
+        }
         if let Some(first) = morph.first().map(|f: &crate::packet::MorphFrame| f.contours.len()) {
             if contours.len() != first {
                 return Err(invalid(
