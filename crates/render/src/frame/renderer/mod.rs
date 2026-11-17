@@ -504,7 +504,7 @@ impl SharedDeviceRenderer {
                     live,
                     commands,
                 } => {
-                    self.paint_target(id, (*target_w, *target_h), *live, commands, packet);
+                    self.paint_target(id, (*target_w, *target_h), density, *live, commands, packet);
                 }
                 DrawCommand::Text { halo: None, .. } => {
                     self.flush_vector_run(&mut vector_run, packet, target, &mut draws);

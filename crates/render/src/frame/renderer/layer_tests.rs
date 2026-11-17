@@ -471,3 +471,22 @@ fn a_material_samples_its_target_as_target_a() {
         "control: an unknown target, nothing sampled"
     );
 }
+
+#[test]
+fn a_target_is_allocated_at_the_density_of_the_pass_that_paints_it() {
+    let Some(mut r) = renderer() else { return };
+    let Some(_) = draw(&mut r, &frame(vec![target("t", GREEN), reader("t")]), 128) else {
+        return;
+    };
+    let dense = r.targets.read("t").expect("the target was painted");
+    assert_eq!((dense.width, dense.height), (32, 32), "a 16-point target on a 2x pass holds 32 device pixels");
+    let Some(shown) = draw(&mut r, &frame(vec![target("t", GREEN), reader("t")]), 128) else {
+        return;
+    };
+    assert_eq!(px(&shown, 128, 32, 32), [0, 255, 0, 255], "the sprite still paints the whole target at logical size");
+    let Some(_) = draw(&mut r, &frame(vec![target("u", GREEN), reader("u")]), 64) else {
+        return;
+    };
+    let plain = r.targets.read("u").expect("the target was painted");
+    assert_eq!((plain.width, plain.height), (16, 16), "control: at 1x the target holds its logical size");
+}

@@ -3,16 +3,26 @@
 use super::*;
 
 impl SharedDeviceRenderer {
-    /// Paint a `Target` command's children into its texture unless they are what it already holds.
+    /// Paint a `Target` command's children into its texture unless they are what it already holds. `points` is the
+    /// target's logical size; the texture holds it at the `density` of the pass that paints it, so a target shown at
+    /// its logical size is as sharp as the frame around it.
     pub(super) fn paint_target(
         &mut self,
         id: &str,
-        size: (u32, u32),
+        points: (u32, u32),
+        density: f32,
         live: bool,
         commands: &[DrawCommand],
         packet: &GameRenderPacket,
     ) {
         let limit = self.device.limits().max_texture_dimension_2d;
+        let density = if density.is_finite() && density > 0.0 { density } else { 1.0 };
+        let longest = points.0.max(points.1).max(1) as f32;
+        let density = density.min((limit as f32 / longest).max(1.0));
+        let size = (
+            ((points.0 as f32) * density).round().max(1.0) as u32,
+            ((points.1 as f32) * density).round().max(1.0) as u32,
+        );
         if size.0 > limit || size.1 > limit {
             tracing::warn!(target: "almadar::game_renderer", id, ?size, "render target exceeds the device texture limit; skipped");
             return;
@@ -35,8 +45,8 @@ impl SharedDeviceRenderer {
         let slot = self.targets.writer(&self.device, self.format, id, size);
         let child = GameRenderPacket {
             pattern: packet.pattern.clone(),
-            width: size.0 as f32,
-            height: size.1 as f32,
+            width: points.0 as f32,
+            height: points.1 as f32,
             draw_commands: commands.to_vec(),
             time_ms: packet.time_ms,
             ..GameRenderPacket::default()
