@@ -2856,3 +2856,117 @@ fn a_fading_glow_carries_its_opacity_outside_one_unchanging_layer() {
         "control: an unanimated glow has no wrapper"
     );
 }
+
+mod sprung_text {
+    use super::*;
+
+    const EPOCH: f64 = 1_700_000_005_000.0;
+
+    fn scene(x: f64, width: f64, spring: bool, timed: bool) -> serde_json::Value {
+        let mut text = serde_json::json!({
+            "type": "draw-text", "id": "cl1", "color": "#000000", "font": "14px sans-serif",
+            "text": "one two three four five six seven eight nine ten eleven twelve",
+            "position": {"x": x, "y": 200}, "width": width
+        });
+        if spring {
+            text["spring"] = serde_json::json!({"stiffness": 220, "damping": 26});
+        }
+        if timed {
+            text["animation"] = serde_json::json!({"startMs": EPOCH - 4000.0, "durationMs": 870, "loop": false,
+                "keyframes": [{"at": 0, "offsetY": 18, "opacity": 0}, {"at": 1, "offsetY": 0, "opacity": 1}]});
+        }
+        let mut drawables = vec![text];
+        if timed {
+            drawables.push(serde_json::json!({"type": "draw-text", "id": "typed", "text": "hello", "color": "#000000",
+                "font": "12px sans-serif", "position": {"x": 5, "y": 5},
+                "reveal": {"startMs": EPOCH - 4000.0, "perGlyphMs": 100, "durationMs": 100}}));
+        }
+        serde_json::json!({
+            "type": "canvas", "mode": "2d", "projection": "free", "scale": 1,
+            "drawables": drawables
+        })
+    }
+
+    fn lines(host: &SceneHost) -> Vec<(f32, f32, String)> {
+        host.frame_packet()
+            .unwrap()
+            .draw_commands
+            .iter()
+            .filter_map(|c| match c {
+                DrawCommand::Text { pos, text, .. } => Some((pos.x, pos.y, text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn host(timed: bool) -> SceneHost {
+        let mut host = SceneHost::new();
+        host.set_viewport(1280, 720);
+        if timed {
+            host.set_epoch_clock(EPOCH);
+        }
+        host
+    }
+
+    fn pump(host: &mut SceneHost, from: f64, ms: f64) -> f64 {
+        let mut t = from;
+        while t < from + ms {
+            t += 1000.0 / 60.0;
+            host.set_clock(t);
+        }
+        t
+    }
+
+    fn moves_to_the_new_rect(timed: bool) {
+        let mut moved = host(timed);
+        moved.set_scene(scene(175.0, 80.0, true, timed)).unwrap();
+        moved.set_clock(5000.0);
+        let _ = lines(&moved);
+        moved.set_scene(scene(619.2, 598.3, true, timed)).unwrap();
+        assert!(moved.wants_frames(), "the spring is moving");
+        let mid = pump(&mut moved, 5000.0, 100.0);
+        assert!(moved.wants_frames(), "still moving after 100 ms");
+        let x = lines(&moved)[0].0;
+        assert!(x > 176.0 && x < 618.0, "in flight, not jumped: {x}");
+        pump(&mut moved, mid, 3000.0);
+        assert!(moved.springs.settled());
+        let mut fresh = host(timed);
+        fresh.set_scene(scene(619.2, 598.3, true, timed)).unwrap();
+        fresh.set_clock(5000.0);
+        pump(&mut fresh, 5000.0, 3000.0);
+        let (got, want) = (lines(&moved), lines(&fresh));
+        assert!(!want.is_empty());
+        assert_eq!(got, want);
+        assert!((want[0].0 - 619.2).abs() < 0.5, "{want:?}");
+    }
+
+    #[test]
+    fn a_spring_text_ends_at_the_new_rect() {
+        moves_to_the_new_rect(false);
+    }
+
+    #[test]
+    fn a_spring_text_in_a_timed_scene_ends_at_the_new_rect() {
+        moves_to_the_new_rect(true);
+    }
+
+    #[test]
+    fn a_plain_text_jumps_to_the_new_rect() {
+        let mut h = host(false);
+        h.set_scene(scene(175.0, 80.0, false, false)).unwrap();
+        h.set_scene(scene(619.2, 598.3, false, false)).unwrap();
+        let mut fresh = host(false);
+        fresh.set_scene(scene(619.2, 598.3, false, false)).unwrap();
+        assert_eq!(lines(&h), lines(&fresh));
+    }
+
+    #[test]
+    fn an_unchanged_spring_text_stays_put_and_wants_no_frames() {
+        let mut h = host(false);
+        h.set_scene(scene(175.0, 80.0, true, false)).unwrap();
+        let before = lines(&h);
+        h.set_scene(scene(175.0, 80.0, true, false)).unwrap();
+        assert!(h.springs.settled());
+        assert_eq!(lines(&h), before);
+    }
+}

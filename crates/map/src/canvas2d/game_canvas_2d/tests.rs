@@ -2165,10 +2165,10 @@ fn layout_wraps_within_width_truncates_with_an_ellipsis_and_overflows_without_tr
             truncate: false,
         },
     );
-    assert_eq!(
-        overflow.lines,
-        ["alphabet"],
-        "control: overflows without truncate"
+    assert!(
+        overflow.lines.len() >= 2 && overflow.lines.concat() == "alphabet",
+        "{:?}",
+        overflow.lines
     );
 
     let hard = layout_paragraph(
@@ -4097,4 +4097,190 @@ fn a_finished_paint_clock_animation_is_not_live_and_a_looping_one_is() {
         ),
         "control: inside its duration on a scene clock it still plays"
     );
+}
+
+fn broken_words_box(width: f32, wrap: bool, truncate: bool) -> ParagraphBox {
+    ParagraphBox {
+        width,
+        wrap,
+        max_lines: None,
+        truncate,
+    }
+}
+
+fn sans_at(text: &str, size: f32) -> f32 {
+    orbital_canvas_paint::vector::shape(text, size, false, TextFamily::Sans).width
+}
+
+#[test]
+fn a_word_wider_than_its_box_breaks_at_the_last_grapheme_that_fits() {
+    let width = sans_at("Temperature", 12.0) * 0.77;
+    let laid = layout_paragraph(
+        "Temperature",
+        12.0,
+        false,
+        TextFamily::Sans,
+        broken_words_box(width, true, false),
+    );
+    assert!(laid.lines.len() >= 2, "{:?}", laid.lines);
+    assert!(
+        laid.widths.iter().all(|w| *w <= width + 1e-3),
+        "{:?}",
+        laid.widths
+    );
+    assert_eq!(laid.lines.concat(), "Temperature");
+    assert_eq!(laid.starts[1], laid.lines[0].chars().count());
+    assert!(laid.broken);
+
+    let control = layout_paragraph(
+        "Air temperature",
+        12.0,
+        false,
+        TextFamily::Sans,
+        broken_words_box(sans_at("Air temperature", 12.0) + 1.0, true, false),
+    );
+    assert_eq!(control.lines, ["Air temperature"]);
+    assert!(!control.broken);
+}
+
+#[test]
+fn words_that_fit_are_never_broken_and_the_wide_one_starts_its_own_line() {
+    let width = sans_at("Temperature", 12.0) * 0.77;
+    let laid = layout_paragraph(
+        "go Temperature ok",
+        12.0,
+        false,
+        TextFamily::Sans,
+        broken_words_box(width, true, false),
+    );
+    assert_eq!(laid.lines[0], "go");
+    assert!(laid.widths.iter().all(|w| *w <= width + 1e-3));
+    assert_eq!(laid.lines.join("").replace(' ', ""), "goTemperatureok");
+}
+
+#[test]
+fn a_url_without_spaces_breaks_and_wrap_off_is_unchanged() {
+    let url = "api.openair.city/v1/forecast";
+    let width = sans_at(url, 12.0) * 0.5;
+    let laid = layout_paragraph(
+        url,
+        12.0,
+        false,
+        TextFamily::Sans,
+        broken_words_box(width, true, false),
+    );
+    assert!(laid.lines.len() >= 2);
+    assert!(laid.widths.iter().all(|w| *w <= width + 1e-3));
+    assert_eq!(laid.lines.concat(), url);
+    let flat = layout_paragraph(
+        url,
+        12.0,
+        false,
+        TextFamily::Sans,
+        broken_words_box(width, false, false),
+    );
+    assert_eq!(flat.lines, [url]);
+    assert!(!flat.broken);
+}
+
+#[test]
+fn a_grapheme_cluster_is_never_split() {
+    let text = "e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}";
+    let width = sans_at("e\u{0301}e\u{0301}", 12.0) + 0.1;
+    let laid = layout_paragraph(
+        text,
+        12.0,
+        false,
+        TextFamily::Sans,
+        broken_words_box(width, true, false),
+    );
+    assert!(laid.lines.len() >= 2);
+    assert!(
+        laid.lines.iter().all(|l| !l.starts_with('\u{0301}')),
+        "{:?}",
+        laid.lines
+    );
+    assert_eq!(laid.lines.concat(), text);
+}
+
+#[test]
+fn a_right_to_left_word_breaks_in_logical_order() {
+    let text = "الربيعالربيعالربيع";
+    let width = sans_at(text, 12.0) * 0.5;
+    let laid = layout_paragraph(
+        text,
+        12.0,
+        false,
+        TextFamily::Sans,
+        broken_words_box(width, true, false),
+    );
+    assert!(laid.lines.len() >= 2, "{:?}", laid.lines);
+    assert_eq!(laid.lines.concat(), text);
+}
+
+#[test]
+fn truncate_still_ellipsizes_a_wide_word_instead_of_breaking_it() {
+    let width = sans_at("alpha", 12.0) * 0.6;
+    let laid = layout_paragraph(
+        "alphabet",
+        12.0,
+        false,
+        TextFamily::Sans,
+        broken_words_box(width, true, true),
+    );
+    assert_eq!(laid.lines.len(), 1);
+    assert!(laid.lines[0].ends_with('\u{2026}'));
+    assert!(!laid.broken);
+}
+
+#[test]
+fn shrink_prefers_a_smaller_size_over_breaking_and_breaks_only_at_the_floor() {
+    let width = sans_at("Temperature", 24.0) * 0.7;
+    let fit = |min_size: f32| {
+        let node = json!({"width": width, "height": 40.0, "fit": "shrink", "minSize": min_size});
+        read_fit(&node, 1.0).unwrap().unwrap()
+    };
+    let frame = broken_words_box(width, true, false);
+    let (size, shrunk) = fit_paragraph(
+        "Temperature",
+        24.0,
+        false,
+        TextFamily::Sans,
+        frame,
+        1.3,
+        fit(4.0),
+    );
+    assert!((4.0..24.0).contains(&size));
+    assert_eq!(shrunk.lines, ["Temperature"]);
+    assert!(!shrunk.broken);
+
+    let (size, floor) = fit_paragraph(
+        "Temperature",
+        24.0,
+        false,
+        TextFamily::Sans,
+        frame,
+        1.3,
+        fit(20.0),
+    );
+    assert!((size - 20.0).abs() < 1e-3);
+    assert!(floor.lines.len() >= 2 && floor.broken);
+    assert!(floor.widths.iter().all(|w| *w <= width + 1e-3));
+}
+
+#[test]
+fn a_broken_word_paints_and_measures_two_lines() {
+    let width = sans_at("Temperature", 20.0) * 0.77;
+    let node = json!({"type": "draw-text", "text": "Temperature", "color": "#000000",
+        "font": "20px sans-serif", "position": {"x": 0, "y": 0}, "width": width,
+        "id": "t", "measure": true});
+    let (packet, gathered) = from_props_mapped(&free_props(json!([node])), 0.0).unwrap();
+    let texts = packet
+        .draw_commands
+        .iter()
+        .filter(|c| matches!(c, DrawCommand::Text { .. }))
+        .count();
+    assert!(texts >= 2, "{texts}");
+    assert_eq!(gathered.measured[0].lines as usize, texts);
+    assert!(gathered.measured[0].width <= width + 1e-3);
 }

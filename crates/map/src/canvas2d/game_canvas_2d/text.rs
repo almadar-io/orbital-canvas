@@ -601,6 +601,7 @@ pub(super) fn fit_paragraph(
     let laid = |s: f32| layout_paragraph(text, s, bold, family, frame);
     let fits = |s: f32, p: &Paragraph| {
         p.lines.len() as f32 * s * line_height <= fit.height
+            && !p.broken
             && p.widths.iter().all(|w| *w <= frame.width + 1e-3)
     };
     let first = laid(size);

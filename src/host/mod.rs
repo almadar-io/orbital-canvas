@@ -256,6 +256,10 @@ impl SceneHost {
             .settled
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .prepared
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let scene = mapped.packet.draw_commands.iter().find_map(|c| match c {
             DrawCommand::Scene3D { scene } => Some(scene.as_ref().clone()),
             _ => None,

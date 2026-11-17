@@ -1,5 +1,7 @@
 //! Paragraph layout: lines broken to a width as the web breaks them, and ellipsis.
 
+use unicode_segmentation::UnicodeSegmentation;
+
 /// The lines of a paragraph and each line's advance width, in the units of `size`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Paragraph {
@@ -7,10 +9,12 @@ pub(crate) struct Paragraph {
     /// The index in the text of each line's first character.
     pub starts: Vec<usize>,
     pub widths: Vec<f32>,
+    /// A word wider than the box was broken across lines.
+    pub broken: bool,
 }
 
 /// Lay `text` out in lines of at most `width`. Line breaks fall at the opportunities of [`break_segments`]; a
-/// segment wider than the line overflows it (or is cut with an ellipsis when `truncate`). `max_lines` keeps the
+/// word wider than the line is broken at the last grapheme that fits (or cut with an ellipsis when `truncate`). `max_lines` keeps the
 /// first lines, the last ending in an ellipsis when `truncate`. Widths come from the shaper's advances.
 /// How a paragraph breaks: its line width and the wrap, line-cap and ellipsis rules.
 #[derive(Debug, Clone, Copy)]
@@ -38,6 +42,7 @@ pub(crate) fn layout_paragraph(
     let mut lines: Vec<String> = Vec::new();
     let mut starts: Vec<usize> = Vec::new();
     let mut hard_start = 0;
+    let mut broken = false;
     for hard in text.split('\n') {
         let hard_chars = hard.chars().count();
         if !wrap {
@@ -49,7 +54,20 @@ pub(crate) fn layout_paragraph(
         let mut line = String::new();
         let mut line_start = hard_start;
         let mut segment_start = hard_start;
+        let mut pieces: Vec<String> = Vec::new();
         for segment in break_segments(hard) {
+            let split = if truncate {
+                None
+            } else {
+                split_wide_word(segment, width, &measure)
+            };
+            broken |= split.is_some();
+            match split {
+                Some(chunks) => pieces.extend(chunks),
+                None => pieces.push(segment.to_string()),
+            }
+        }
+        for segment in pieces.iter().map(String::as_str) {
             let candidate = format!("{line}{segment}");
             if line.is_empty() || measure(candidate.trim_end()) <= width {
                 line = candidate;
@@ -86,7 +104,32 @@ pub(crate) fn layout_paragraph(
         lines,
         starts,
         widths,
+        broken,
     }
+}
+
+/// `segment` cut into pieces that each fit `width` at the last grapheme that does, when it is wider on a line of its own.
+fn split_wide_word(
+    segment: &str,
+    width: f32,
+    measure: &dyn Fn(&str) -> f32,
+) -> Option<Vec<String>> {
+    let word = segment.trim_end();
+    if measure(word) <= width {
+        return None;
+    }
+    let tail = &segment[word.len()..];
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for grapheme in word.graphemes(true) {
+        if !current.is_empty() && measure(&format!("{current}{grapheme}")) > width {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push_str(grapheme);
+    }
+    current.push_str(tail);
+    chunks.push(current);
+    Some(chunks)
 }
 
 /// `line` with its tail replaced by an ellipsis so that it fits `width`.

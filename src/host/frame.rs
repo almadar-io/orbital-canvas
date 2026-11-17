@@ -144,7 +144,11 @@ impl SceneHost {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if prepared.is_none() {
-                    *prepared = mappers::game_canvas_2d::prepare_canvas_node(scene).ok();
+                    let shown = (!self.springs.is_empty()).then(|| self.springs.apply(scene));
+                    *prepared = mappers::game_canvas_2d::prepare_canvas_node(
+                        shown.as_ref().unwrap_or(scene),
+                    )
+                    .ok();
                 }
                 let remapped = prepared.as_ref().map(|props| {
                     mappers::game_canvas_2d::from_prepared_at(props, viewport, self.epoch_clock_ms)
