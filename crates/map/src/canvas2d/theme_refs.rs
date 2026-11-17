@@ -1,4 +1,4 @@
-//! A 2D canvas drawn in its host's theme (`canvasTheme`). A colour slot (`fill`, `stroke`, `color`, `bgColor`)
+//! A 2D canvas drawn in its host's theme (`canvasTheme`). A colour slot (`fill`, `stroke`, `color`, `bgColor`, `tint`)
 //! naming a theme colour key (first) or a diagram tone takes the theme's colour; a `font` whose family is `display`,
 //! `body` or `mono` takes the theme's family, drawn from its font file when the theme names one.
 //! Without a theme the names stay as given: tones and keys are not CSS colours, and the family keywords fall to
@@ -8,7 +8,7 @@ use orbital_canvas_base::faces::register_face;
 use orbital_canvas_base::packet::TextFamily;
 use serde_json::{Map, Value};
 
-const COLOR_SLOTS: [&str; 4] = ["fill", "stroke", "color", "bgColor"];
+const COLOR_SLOTS: [&str; 5] = ["fill", "stroke", "color", "bgColor", "tint"];
 pub const FAMILY_KEYWORDS: [&str; 3] = ["display", "body", "mono"];
 
 /// Resolve every theme reference under `props` against `theme`.

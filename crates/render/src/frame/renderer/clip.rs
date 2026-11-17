@@ -144,6 +144,7 @@ impl SharedDeviceRenderer {
             0.0,
             1.0,
             (false, false),
+            None,
             (width, height),
         );
         let whole_pixels = |v: f32| v.fract() == 0.0;

@@ -63,6 +63,7 @@ fn sprite(url: &str, src: Rect, dst: Rect) -> DrawCommand {
         opacity: 1.0,
         flip_x: false,
         flip_y: false,
+        tint: None,
     }
 }
 

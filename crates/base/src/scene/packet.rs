@@ -432,6 +432,9 @@ pub enum DrawCommand {
         opacity: f32,
         flip_x: bool,
         flip_y: bool,
+        /// Recolours the sprite's RGB to this colour, keeping its alpha (a single-colour icon); `None` paints it as is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tint: Option<[f32; 4]>,
     },
     /// One deformable textured triangle; UVs are normalized unless the source
     /// mesh declares pixel-space UV coordinates.

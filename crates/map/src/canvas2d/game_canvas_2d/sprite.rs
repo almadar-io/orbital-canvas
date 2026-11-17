@@ -58,7 +58,14 @@ pub(super) fn paint_sprite(
         gap_once("sprite-position", "draw-sprite without position");
         return Ok(());
     };
+    let tint = sprite_tint(node)?;
     if let Some(texture) = node.get("texture").filter(|t| !t.is_null()) {
+        if tint.is_some() {
+            return Err(invalid(
+                "tint",
+                "a target sprite is a render target, which takes no tint",
+            ));
+        }
         let texture = crate::layer_props::target_texture(texture)?;
         crate::layer_props::require_sprite_size(node)?;
         let src = node.get("frame").and_then(parse_xywh).unwrap_or_default();
@@ -70,6 +77,7 @@ pub(super) fn paint_sprite(
             opacity: get_f32(node, "opacity", 1.0),
             flip_x: node.get("flipX").and_then(Value::as_bool).unwrap_or(false),
             flip_y: false,
+            tint: None,
         });
         return Ok(());
     }
@@ -194,8 +202,21 @@ pub(super) fn paint_sprite(
         opacity: get_f32(node, "opacity", 1.0),
         flip_x: node.get("flipX").and_then(Value::as_bool).unwrap_or(false),
         flip_y: false,
+        tint,
     });
     Ok(())
+}
+
+/// A sprite's `tint`: a css colour (a palette name has already taken the theme's colour), or none.
+fn sprite_tint(node: &Value) -> Result<Option<[f32; 4]>, CanvasSceneError> {
+    match node.get("tint") {
+        None | Some(Value::Null) => Ok(None),
+        Some(tint) => tint
+            .as_str()
+            .and_then(parse_css_color)
+            .map(Some)
+            .ok_or_else(|| invalid("tint", "a css colour or a theme palette name")),
+    }
 }
 
 /// The centred part of `whole` with the `width : height` aspect, so the image fills its rect without stretching.
@@ -311,6 +332,7 @@ pub(crate) fn background_sprites(
             opacity: 1.0,
             flip_x: false,
             flip_y: false,
+            tint: None,
         }];
     }
     if bg.get("atlas").is_some() && bg.get("sprite").is_some() {
@@ -349,6 +371,7 @@ pub(crate) fn background_sprites(
                 opacity: 1.0,
                 flip_x: false,
                 flip_y: false,
+                tint: None,
             });
             x += image_w;
         }

@@ -594,6 +594,7 @@ fn affine_group_transform_carries_quad_sprite_and_constant_width_stroke() {
             opacity: 1.0,
             flip_x: false,
             flip_y: false,
+            tint: None,
         },
         DrawCommand::Path {
             segments: vec![

@@ -45,6 +45,7 @@ enum Draw {
         key: SpriteKey,
         verts: Vec<SpriteVertex>,
         additive: bool,
+        tinted: bool,
     },
     MaskedSprite {
         bind_group: wgpu::BindGroup,
@@ -95,6 +96,7 @@ pub struct SharedDeviceRenderer {
     pipeline: wgpu::RenderPipeline,
     sprite_pipeline: wgpu::RenderPipeline,
     additive_sprite_pipeline: wgpu::RenderPipeline,
+    tinted_sprite_pipeline: wgpu::RenderPipeline,
     sprite_layout: wgpu::BindGroupLayout,
     masked_sprite_pipeline: wgpu::RenderPipeline,
     masked_sprite_layout: wgpu::BindGroupLayout,
@@ -155,6 +157,13 @@ impl SharedDeviceRenderer {
                 },
             },
         );
+        let tinted_sprite_pipeline = textured_pipeline(
+            &device,
+            format,
+            &sprite_layout,
+            TINTED_SPRITE_SHADER_SOURCE,
+            wgpu::BlendState::ALPHA_BLENDING,
+        );
         let (masked_sprite_pipeline, masked_sprite_layout) =
             build_masked_sprite_pipeline(&device, format);
         let target_sprite_pipeline = textured_pipeline(
@@ -177,6 +186,7 @@ impl SharedDeviceRenderer {
             pipeline,
             sprite_pipeline,
             additive_sprite_pipeline,
+            tinted_sprite_pipeline,
             sprite_layout,
             masked_sprite_pipeline,
             masked_sprite_layout,
@@ -557,6 +567,7 @@ impl SharedDeviceRenderer {
                         key,
                         verts: verts.to_vec(),
                         additive: false,
+                        tinted: false,
                     });
                 }
                 DrawCommand::Sprite {
@@ -567,6 +578,7 @@ impl SharedDeviceRenderer {
                     opacity,
                     flip_x,
                     flip_y,
+                    tint,
                 } => {
                     self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
                     if let Some(id) =
@@ -596,6 +608,7 @@ impl SharedDeviceRenderer {
                             *rotation,
                             *opacity,
                             (*flip_x, *flip_y),
+                            None,
                             (width, height),
                         );
                         let bind_group =
@@ -634,12 +647,14 @@ impl SharedDeviceRenderer {
                         *rotation,
                         *opacity,
                         (*flip_x, *flip_y),
+                        *tint,
                         (width, height),
                     );
                     draws.push(Draw::Sprite {
                         key,
                         verts: verts.to_vec(),
                         additive: false,
+                        tinted: tint.is_some(),
                     });
                 }
                 _ => {}
@@ -714,6 +729,7 @@ impl SharedDeviceRenderer {
                             key,
                             verts,
                             additive,
+                            tinted,
                         } => {
                             let Some(sprite) = self.sprites.get(key) else {
                                 continue;
@@ -728,6 +744,8 @@ impl SharedDeviceRenderer {
                             self.keep(&buffer);
                             pass.set_pipeline(if *additive {
                                 &self.additive_sprite_pipeline
+                            } else if *tinted {
+                                &self.tinted_sprite_pipeline
                             } else {
                                 &self.sprite_pipeline
                             });

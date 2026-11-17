@@ -153,12 +153,14 @@ impl SharedDeviceRenderer {
             0.0,
             1.0,
             (false, false),
+            None,
             (width as u32, height as u32),
         );
         draws.push(Draw::Sprite {
             key,
             verts: verts.to_vec(),
             additive,
+            tinted: false,
         });
     }
 

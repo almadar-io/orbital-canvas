@@ -254,6 +254,100 @@ pub(super) fn number_array(value: &Value, field: &str) -> Result<Vec<f32>, Canva
         .collect()
 }
 
+/// The inner outline of a shape with an `inset`: the same shape `gap` px inside, stroke only, radii reduced by the gap.
+fn inset_outline(node: &Value, inset: &Value) -> Result<Option<Value>, CanvasSceneError> {
+    let stroke = inset
+        .get("stroke")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("inset.stroke", "needs a colour"))?;
+    let width = inset
+        .get("strokeWidth")
+        .and_then(Value::as_f64)
+        .filter(|w| w.is_finite() && *w >= 0.0)
+        .ok_or_else(|| invalid("inset.strokeWidth", "needs a width of zero or more"))?;
+    let gap = inset
+        .get("gap")
+        .and_then(Value::as_f64)
+        .filter(|g| g.is_finite() && *g > 0.0)
+        .ok_or_else(|| invalid("inset.gap", "needs a gap above zero"))?;
+    let shape = node
+        .get("shape")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut inner = node.clone();
+    let Some(fields) = inner.as_object_mut() else {
+        return Ok(None);
+    };
+    for key in [
+        "inset",
+        "fill",
+        "gradient",
+        "strokeGradient",
+        "fillPattern",
+        "material",
+        "shadow",
+        "backdrop",
+        "blur",
+        "hit",
+        "strokeDash",
+        "strokeDashOffset",
+        "animation",
+    ] {
+        fields.remove(key);
+    }
+    fields.insert("stroke".into(), Value::String(stroke.to_owned()));
+    fields.insert("strokeWidth".into(), width.into());
+    let number = |key: &str| node.get(key).and_then(Value::as_f64).unwrap_or(0.0);
+    match shape {
+        "rect" | "capsule" => {
+            let (w, h) = (number("width") - 2.0 * gap, number("height") - 2.0 * gap);
+            if w <= 0.0 || h <= 0.0 {
+                return Ok(None);
+            }
+            fields.insert("offsetX".into(), (number("offsetX") + gap).into());
+            fields.insert("offsetY".into(), (number("offsetY") + gap).into());
+            fields.insert("width".into(), w.into());
+            fields.insert("height".into(), h.into());
+            if let Some(radius) = node
+                .get("corners")
+                .and_then(|c| c.get("radius"))
+                .and_then(Value::as_array)
+            {
+                let reduced: Vec<Value> = radius
+                    .iter()
+                    .map(|r| {
+                        r.as_f64()
+                            .map_or(Value::Null, |r| (r - gap).max(0.0).into())
+                    })
+                    .collect();
+                if let Some(corners) = fields.get_mut("corners").and_then(Value::as_object_mut) {
+                    corners.insert("radius".into(), Value::Array(reduced));
+                }
+            }
+        }
+        "ellipse" => {
+            let rx = number("radiusX") - gap;
+            let ry = node
+                .get("radiusY")
+                .and_then(Value::as_f64)
+                .unwrap_or(number("radiusX"))
+                - gap;
+            if rx <= 0.0 || ry <= 0.0 {
+                return Ok(None);
+            }
+            fields.insert("radiusX".into(), rx.into());
+            fields.insert("radiusY".into(), ry.into());
+        }
+        other => {
+            return Err(invalid(
+                "inset",
+                format!("`{other}` has no inset (rect, capsule, ellipse)"),
+            ))
+        }
+    }
+    Ok(Some(inner))
+}
+
 /// Project one draw-shape: the SDF pass takes the shapes that need it, every other shape keeps the vector path.
 pub(super) fn paint_shape(
     node: &Value,
@@ -264,6 +358,37 @@ pub(super) fn paint_shape(
     gathered: &mut Gathered,
     out: &mut Vec<DrawCommand>,
 ) -> Result<(), CanvasSceneError> {
+    if let Some(inset) = node.get("inset").filter(|v| !v.is_null()) {
+        let animated = animated_shape(node, epoch_now_ms);
+        let resolved = animated.as_ref().unwrap_or(node);
+        let inner = inset_outline(resolved, inset)?;
+        let mut outer = resolved.clone();
+        if let Some(fields) = outer.as_object_mut() {
+            fields.remove("inset");
+            fields.remove("animation");
+        }
+        paint_shape(
+            &outer,
+            projector,
+            to_screen,
+            zoom,
+            epoch_now_ms,
+            gathered,
+            out,
+        )?;
+        if let Some(inner) = inner {
+            paint_shape(
+                &inner,
+                projector,
+                to_screen,
+                zoom,
+                epoch_now_ms,
+                gathered,
+                out,
+            )?;
+        }
+        return Ok(());
+    }
     let sdf = node
         .get("shape")
         .and_then(Value::as_str)

@@ -131,6 +131,7 @@ pub(super) fn paint_group(
             opacity: 1.0,
             flip_x: false,
             flip_y: false,
+            tint: None,
         })
         .collect();
     orbital_canvas_base::animate::transform_group_commands(
@@ -158,6 +159,7 @@ pub(super) fn paint_group(
             opacity: 1.0,
             flip_x: false,
             flip_y: false,
+            tint: None,
         })
         .collect();
     orbital_canvas_base::animate::transform_group_commands(
@@ -492,6 +494,11 @@ pub(super) fn commands_bounds(commands: &[DrawCommand]) -> Option<Rect> {
                     walk_commands(std::slice::from_ref(command.as_ref()), add)
                 }
                 DrawCommand::AdditiveGroup { commands } => walk_commands(commands, add),
+                DrawCommand::Sprite { texture, dst, .. }
+                    if texture.starts_with(orbital_canvas_base::targets::TARGET_PREFIX) =>
+                {
+                    add(dst.x, dst.y, dst.x + dst.w, dst.y + dst.h)
+                }
                 DrawCommand::Text { .. } => {
                     if let orbital_canvas_paint::vector::RunBounds::Box { x0, y0, x1, y1 } =
                         orbital_canvas_paint::vector::command_bounds(command)

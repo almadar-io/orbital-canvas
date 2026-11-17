@@ -175,7 +175,7 @@ pub(super) fn started_animations(node: &Value, f: &mut dyn FnMut(&Value)) {
 fn started_animations_in(node: &Value, folded: bool, f: &mut dyn FnMut(&Value)) {
     if matches!(
         node.get("type").and_then(Value::as_str),
-        Some("draw-shape" | "draw-group" | "draw-text")
+        Some("draw-shape" | "draw-group" | "draw-text" | "draw-scene3d")
     ) {
         if let Some(animation) = node.get("animation").filter(|a| {
             has_start(a) && (folded || !orbital_canvas_base::animate::plays_on_epoch_packet(a))
@@ -340,7 +340,7 @@ pub fn has_active_fx(node: &Value) -> bool {
     }
     if matches!(
         node.get("type").and_then(Value::as_str),
-        Some("draw-shape" | "draw-group" | "draw-text")
+        Some("draw-shape" | "draw-group" | "draw-text" | "draw-scene3d")
     ) && node.get("animation").is_some_and(|animation| {
         !has_start(animation)
             && animation
@@ -352,6 +352,11 @@ pub fn has_active_fx(node: &Value) -> bool {
                 .and_then(Value::as_array)
                 .is_some_and(|v| !v.is_empty())
     }) {
+        return true;
+    }
+    if node.get("type").and_then(Value::as_str) == Some("draw-scene3d")
+        && node.get("scene").is_some_and(scene_moves)
+    {
         return true;
     }
     if node

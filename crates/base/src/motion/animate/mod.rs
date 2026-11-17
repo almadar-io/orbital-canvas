@@ -726,6 +726,7 @@ impl Xform {
                 opacity,
                 flip_x,
                 flip_y,
+                tint,
             } => {
                 let center = self.point(Vec2 {
                     x: dst.x + dst.w / 2.0,
@@ -752,6 +753,7 @@ impl Xform {
                     opacity: *opacity * self.opacity,
                     flip_x: *flip_x,
                     flip_y: *flip_y,
+                    tint: *tint,
                 }
             }
             DrawCommand::SdfBackdrop { shape, backdrop } => DrawCommand::SdfBackdrop {

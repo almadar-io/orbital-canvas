@@ -73,6 +73,7 @@ fn sprite_packet(url: &str, logical: f32) -> GameRenderPacket {
             opacity: 1.0,
             flip_x: false,
             flip_y: false,
+            tint: None,
         }],
         ..Default::default()
     }
@@ -170,6 +171,7 @@ fn svg_pattern_and_gradient_mask_reach_gpu_pixels() {
             opacity: 1.0,
             flip_x: false,
             flip_y: false,
+            tint: None,
         }],
         ..Default::default()
     };
@@ -317,4 +319,61 @@ fn png_sprite_still_decodes_once_at_native_size() {
     assert!(c[2] > 200 && c[0] < 60, "png drawn, got {c:?}");
     let _ = draw(&mut r, &sprite_packet(&url, 8.0), 24);
     assert_eq!(r.sprites.len(), 1, "png cache hit on repeat");
+}
+
+/// Left half black at half alpha; 4x4 intrinsic.
+const HALF_ALPHA_BLACK: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="2" height="4" fill="#000000" fill-opacity="0.5"/></svg>"##;
+
+fn tinted_packet(url: &str, tint: Option<[f32; 4]>) -> GameRenderPacket {
+    let mut packet = sprite_packet(url, 8.0);
+    if let Some(DrawCommand::Sprite { tint: slot, .. }) = packet.draw_commands.first_mut() {
+        *slot = tint;
+    }
+    packet
+}
+
+#[test]
+fn a_tinted_black_icon_paints_the_tint_at_the_icons_own_alpha() {
+    let Some(mut r) = renderer() else { return };
+    let url = fixture("tint-half-black.svg", HALF_ALPHA_BLACK.as_bytes());
+    let Some(plain) = draw(&mut r, &tinted_packet(&url, None), 8) else {
+        return;
+    };
+    let Some(red) = draw(&mut r, &tinted_packet(&url, Some([1.0, 0.0, 0.0, 1.0])), 8) else {
+        return;
+    };
+    let before = px(&plain, 8, 1, 4);
+    let after = px(&red, 8, 1, 4);
+    assert!(
+        before[0] < 8 && before[1] < 8 && before[2] < 8,
+        "control: untinted, the icon stays black {before:?}"
+    );
+    assert!(
+        after[0] > 100 && after[1] < 8 && after[2] < 8,
+        "the icon paints red {after:?}"
+    );
+    assert_eq!(after[3], before[3], "alpha is the icon's own");
+    assert!(
+        (100..=156).contains(&after[3]),
+        "the half-alpha icon stays half alpha {after:?}"
+    );
+    assert_eq!(px(&red, 8, 6, 4)[3], 0, "the transparent half stays clear");
+}
+
+#[test]
+fn a_tint_alpha_scales_the_icon_alpha() {
+    let Some(mut r) = renderer() else { return };
+    let url = fixture("tint-opaque-blue.svg", HALF_BLUE.as_bytes());
+    let Some(full) = draw(&mut r, &tinted_packet(&url, Some([0.0, 1.0, 0.0, 1.0])), 8) else {
+        return;
+    };
+    let Some(half) = draw(&mut r, &tinted_packet(&url, Some([0.0, 1.0, 0.0, 0.5])), 8) else {
+        return;
+    };
+    let (full, half) = (px(&full, 8, 1, 4), px(&half, 8, 1, 4));
+    assert!(
+        full[1] > 240 && full[0] < 8 && full[2] < 8 && full[3] > 240,
+        "{full:?}"
+    );
+    assert!((100..=156).contains(&half[3]) && half[1] > 100, "{half:?}");
 }

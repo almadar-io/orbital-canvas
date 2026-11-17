@@ -88,6 +88,8 @@ pub struct Gathered {
     /// Groups being walked that fold their children into one command (a clip, a render target, a smooth union): an
     /// epoch animation under one stays with the mapper, since its command range does not survive the fold.
     folding: u32,
+    /// `draw-scene3d` drawables without an `id` so far, which name their targets by order.
+    scene3d_count: usize,
 }
 
 fn invalid(field: &str, detail: impl Into<String>) -> CanvasSceneError {
@@ -630,6 +632,15 @@ fn walk_paint(
             gathered,
             out,
         )?,
+        Some("draw-scene3d") => paint_scene3d_gathering(
+            node,
+            projector,
+            to_screen,
+            zoom,
+            epoch_now_ms,
+            gathered,
+            out,
+        )?,
         Some("draw-shape") => paint_shape(
             node,
             projector,
@@ -829,6 +840,7 @@ fn collect_positions_from(node: &Value, origin: ScenePos, sink: &mut dyn FnMut(S
         Some("draw-sprite")
         | Some("draw-shape")
         | Some("draw-text")
+        | Some("draw-scene3d")
         | Some("draw-skinned-mesh") => {
             if let Some(p) = node.get("position").and_then(parse_scene_pos) {
                 sink(add(p));
@@ -884,6 +896,7 @@ mod animation;
 mod editing;
 mod group;
 mod paragraph;
+mod scene3d;
 mod shape;
 mod sprite;
 mod text;
@@ -891,6 +904,7 @@ pub use self::animation::*;
 use self::editing::*;
 use self::group::*;
 pub(crate) use self::paragraph::*;
+use self::scene3d::*;
 use self::shape::*;
 pub(crate) use self::sprite::*;
 pub(crate) use self::text::*;

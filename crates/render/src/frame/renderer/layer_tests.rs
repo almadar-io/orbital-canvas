@@ -311,6 +311,7 @@ fn reader(id: &str) -> DrawCommand {
         opacity: 1.0,
         flip_x: false,
         flip_y: false,
+        tint: None,
     }
 }
 

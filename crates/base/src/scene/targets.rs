@@ -185,6 +185,7 @@ pub mod fixtures {
             opacity: 1.0,
             flip_x: false,
             flip_y: false,
+            tint: None,
         }
     }
 

@@ -1379,6 +1379,7 @@ fn shared_device_renderer_draws_fetched_sprite() {
             opacity: 1.0,
             flip_x: false,
             flip_y: false,
+            tint: None,
         }],
         ..Default::default()
     };
@@ -2546,5 +2547,164 @@ mod contrast_audit {
             return;
         };
         assert!(found.is_empty());
+    }
+}
+
+mod embedded_scene3d {
+    use super::*;
+
+    fn node(animated: bool) -> serde_json::Value {
+        let mut mesh = serde_json::json!({"type": "draw-mesh", "shape": "box",
+            "position": {"x": 0, "y": 0},
+            "material": {"kind": "standard", "color": "#ff0000"}});
+        if animated {
+            mesh["animation"] = serde_json::json!({"durationMs": 1000, "keyframes": [
+                {"at": 0, "rotateY": 0}, {"at": 1, "rotateY": 6.0}]});
+        }
+        serde_json::json!({"type": "canvas", "projection": "free", "scale": 1.0,
+            "backgroundColor": "#00000000",
+            "drawables": [{"type": "draw-scene3d", "id": "orb",
+                "position": {"x": 16, "y": 16}, "width": 32, "height": 32,
+                "scene": {"camera": {"mode": "front", "zoom": 2.4, "fov": 40,
+                    "target": {"x": 0, "y": 0, "z": 0.5}}, "drawables": [mesh]}}]})
+    }
+
+    fn host(animated: bool) -> SceneHost {
+        let mut host = SceneHost::new();
+        host.set_viewport(64, 64);
+        host.set_scene(node(animated)).unwrap();
+        host.set_clock(0.0);
+        host
+    }
+
+    fn meshes(packet: &GameRenderPacket) -> serde_json::Value {
+        let scene = packet
+            .draw_commands
+            .iter()
+            .find_map(|c| match c {
+                DrawCommand::Target { commands, .. } => match commands.as_slice() {
+                    [DrawCommand::Scene3D { scene }] => Some(scene),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the embedded scene");
+        serde_json::to_value(&scene.meshes).unwrap()
+    }
+
+    #[test]
+    fn motion_plays_the_embedded_scene_and_reduced_motion_shows_its_rest_pose() {
+        let mut moving = host(true);
+        moving.set_epoch_clock(1000.0);
+        let first = meshes(&moving.frame_packet().unwrap());
+        moving.set_epoch_clock(1250.0);
+        let later = meshes(&moving.frame_packet().unwrap());
+        assert_ne!(first, later, "with motion the pose follows the clock");
+
+        let mut still = host(true);
+        still.set_motion(false);
+        still.set_epoch_clock(1000.0);
+        let one = meshes(&still.frame_packet().unwrap());
+        still.set_epoch_clock(1250.0);
+        let two = meshes(&still.frame_packet().unwrap());
+        assert_eq!(one, two, "reduced motion: the same pose at every instant");
+        assert_eq!(
+            one,
+            meshes(&host(false).frame_packet().unwrap()),
+            "reduced motion: the pose is the unanimated scene's"
+        );
+    }
+
+    #[test]
+    fn a_moving_embedded_scene_asks_for_frames_and_a_still_one_or_reduced_motion_does_not() {
+        let mut moving = host(true);
+        moving.set_epoch_clock(1000.0);
+        moving.refresh_assets();
+        assert!(moving.wants_frames(), "a spinning object needs frames");
+        moving.set_motion(false);
+        moving.refresh_assets();
+        assert!(!moving.wants_frames(), "reduced motion stops the loop");
+        let mut still = host(false);
+        still.set_epoch_clock(1000.0);
+        still.refresh_assets();
+        assert!(!still.wants_frames(), "control: a still scene needs none");
+    }
+
+    #[test]
+    fn the_host_paints_the_embedded_scene_inside_its_rect_and_scroll_moves_it() {
+        let Ok(mut canvas) = Canvas::new_headless() else {
+            return;
+        };
+        canvas.set_viewport(64, 64);
+        canvas.set_scene(node(false)).unwrap();
+        let packet = canvas.frame_packet().unwrap();
+        let Ok(pixels) = canvas.render_packet_to_rgba(&packet) else {
+            return;
+        };
+        let inside = |p: &[u8]| {
+            p.chunks_exact(4)
+                .enumerate()
+                .filter(|(_, px)| px[3] > 0)
+                .map(|(i, _)| ((i % 64) as u32, (i / 64) as u32))
+                .collect::<Vec<_>>()
+        };
+        let drawn = inside(&pixels);
+        assert!(drawn.len() > 100, "the box paints: {}", drawn.len());
+        assert!(
+            drawn
+                .iter()
+                .all(|&(x, y)| (16..48).contains(&x) && (16..48).contains(&y)),
+            "nothing outside the rect"
+        );
+        let moved = packet.scrolled(16.0);
+        let Ok(scrolled) = canvas.render_packet_to_rgba(&moved) else {
+            return;
+        };
+        let top = |points: &[(u32, u32)]| points.iter().map(|p| p.1).min().unwrap();
+        assert_eq!(
+            top(&inside(&scrolled)) + 16,
+            top(&drawn),
+            "the page moved it up"
+        );
+    }
+
+    #[test]
+    fn a_tinted_icon_paints_in_the_tint_through_the_host() {
+        let Ok(mut canvas) = Canvas::new_headless() else {
+            return;
+        };
+        let svg = "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2216%22%20height%3D%2216%22%3E%3Crect%20width%3D%2216%22%20height%3D%2216%22%20fill%3D%22%23000000%22%2F%3E%3C%2Fsvg%3E";
+        let scene = |tint: Option<&str>| {
+            let mut sprite = serde_json::json!({"type": "draw-sprite", "position": {"x": 8, "y": 8},
+                "width": 16, "height": 16, "asset": {"url": svg}});
+            if let Some(tint) = tint {
+                sprite["tint"] = tint.into();
+            }
+            serde_json::json!({"type": "canvas", "projection": "free", "scale": 1.0,
+                "backgroundColor": "#00000000", "drawables": [sprite]})
+        };
+        canvas.set_viewport(32, 32);
+        let centre = |canvas: &mut Canvas, tint: Option<&str>| {
+            canvas.set_scene(scene(tint)).unwrap();
+            canvas.settle_assets(std::time::Duration::from_secs(2));
+            let packet = canvas.frame_packet()?;
+            let pixels = canvas.render_packet_to_rgba(&packet).ok()?;
+            let i = (16 * 32 + 16) * 4;
+            Some([pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]])
+        };
+        let Some(red) = centre(&mut canvas, Some("#ff0000")) else {
+            return;
+        };
+        assert!(
+            red[0] > 240 && red[1] < 8 && red[2] < 8 && red[3] > 240,
+            "{red:?}"
+        );
+        let Some(plain) = centre(&mut canvas, None) else {
+            return;
+        };
+        assert!(
+            plain[0] < 8 && plain[3] > 240,
+            "control: untinted stays black {plain:?}"
+        );
     }
 }

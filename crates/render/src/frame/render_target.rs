@@ -52,12 +52,22 @@ struct Entry {
     version: u64,
 }
 
+impl Entry {
+    fn textures(&self) -> impl Iterator<Item = &wgpu::Texture> {
+        self.slots.iter().flatten().map(|slot| &slot.texture)
+    }
+}
+
 /// The targets of one renderer: two textures each, so a reader that resolves before its writer keeps last frame's.
 #[derive(Default)]
 pub(crate) struct TargetStore {
     entries: HashMap<String, Entry>,
     frame: u64,
     serial: u64,
+    /// Textures a resize replaced, destroyed when the next frame begins (this one may still draw them).
+    retired: Vec<wgpu::Texture>,
+    /// Textures made so far.
+    created: u64,
 }
 
 impl TargetStore {
@@ -65,7 +75,16 @@ impl TargetStore {
     pub(crate) fn begin_frame(&mut self) {
         self.frame += 1;
         let frame = self.frame;
-        self.entries.retain(|_, e| e.painted_frame + 1 >= frame);
+        for texture in self.retired.drain(..) {
+            texture.destroy();
+        }
+        self.entries.retain(|_, e| {
+            let kept = e.painted_frame + 1 >= frame;
+            if !kept {
+                e.textures().for_each(wgpu::Texture::destroy);
+            }
+            kept
+        });
     }
 
     pub(crate) fn version(&self, id: &str) -> u64 {
@@ -117,6 +136,10 @@ impl TargetStore {
             .is_some_and(|t| (t.width, t.height) == size);
         if !fits {
             self.serial += 1;
+            self.created += 1;
+            if let Some(old) = entry.slots[slot].take() {
+                self.retired.push(old.texture);
+            }
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("render target"),
                 size: wgpu::Extent3d {
@@ -147,6 +170,16 @@ impl TargetStore {
         entry.slots[slot].clone().expect("slot just filled")
     }
 
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn textures_created(&self) -> u64 {
+        self.created
+    }
+
     /// Record that `id` was painted this frame with `hash`.
     pub(crate) fn painted(&mut self, id: &str, hash: u64) {
         if let Some(e) = self.entries.get_mut(id) {
@@ -154,6 +187,17 @@ impl TargetStore {
             e.hash = hash;
             e.version += 1;
         }
+    }
+}
+
+// The web backend frees nothing on drop.
+impl Drop for TargetStore {
+    fn drop(&mut self) {
+        self.retired.iter().for_each(wgpu::Texture::destroy);
+        self.entries
+            .values()
+            .flat_map(Entry::textures)
+            .for_each(wgpu::Texture::destroy);
     }
 }
 

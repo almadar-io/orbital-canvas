@@ -4,7 +4,9 @@ use super::*;
 
 /// Build the 6 vertices (two triangles) for one sprite command: `src` in
 /// pixels → UVs over the sheet; `dst` in pixels → NDC, rotated about its
-/// center; `opacity` rides the vertex alpha; flips swap the UV extents.
+/// center; `opacity` rides the vertex alpha; a `tint` is the vertex colour the tinted pipeline paints in the
+/// sheet's place; flips swap the UV extents.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn sprite_vertices(
     src: &Rect,
     dst: &Rect,
@@ -12,6 +14,7 @@ pub(super) fn sprite_vertices(
     rotation: f32,
     opacity: f32,
     (flip_x, flip_y): (bool, bool),
+    tint: Option<[f32; 4]>,
     (target_w, target_h): (u32, u32),
 ) -> [SpriteVertex; 6] {
     let tw = sheet_w.max(1) as f32;
@@ -43,7 +46,11 @@ pub(super) fn sprite_vertices(
         corner(dst.w, dst.h), // br
     ];
 
-    let color = [1.0, 1.0, 1.0, opacity.clamp(0.0, 1.0)];
+    let opacity = opacity.clamp(0.0, 1.0);
+    let color = match tint {
+        Some([r, g, b, a]) => [r, g, b, a * opacity],
+        None => [1.0, 1.0, 1.0, opacity],
+    };
     let v = |pos: [f32; 2], uv: [f32; 2]| SpriteVertex {
         position: pos,
         uv,

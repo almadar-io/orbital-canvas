@@ -3452,3 +3452,494 @@ fn a_draw_text_halo_reaches_the_text_command() {
         );
     }
 }
+
+fn inset_look(gap: f64) -> Value {
+    json!({"stroke": "#00ff00", "strokeWidth": 1, "gap": gap})
+}
+
+#[test]
+fn an_inset_paints_a_second_outline_of_the_same_rect_gap_px_inside_with_the_radii_reduced() {
+    let cornered = |extra: Value| {
+        let mut base = json!({"stroke": "#0000ff", "strokeWidth": 3,
+            "corners": {"radius": [8, 8, 8, 8], "kind": "round"}});
+        for (key, value) in extra.as_object().unwrap() {
+            base[key] = value.clone();
+        }
+        packet_for(free_props(json!([rect_shape(base)])))
+    };
+    let control = cornered(json!({}));
+    assert_eq!(
+        sdf_commands(&control).len(),
+        1,
+        "control: no inset, one outline"
+    );
+
+    let inset = cornered(json!({"inset": inset_look(4.0)}));
+    match sdf_commands(&inset).as_slice() {
+        [outer, DrawCommand::Sdf {
+            rect,
+            corners,
+            corner_kind,
+            fill,
+            stroke: Some(stroke),
+            shadow: None,
+            material: None,
+            ..
+        }] => {
+            assert_eq!(
+                format!("{outer:?}"),
+                format!("{:?}", sdf_commands(&control)[0]),
+                "the outer outline is unchanged"
+            );
+            assert_eq!(
+                *rect,
+                Rect {
+                    x: 14.0,
+                    y: 24.0,
+                    w: 56.0,
+                    h: 24.0
+                }
+            );
+            assert_eq!((*corners, *corner_kind), ([4.0; 4], 0));
+            assert_eq!(*fill, [0.0; 4], "the inset never fills");
+            assert_eq!(stroke.width, 1.0);
+            assert_eq!(stroke.color, [0.0, 1.0, 0.0, 1.0]);
+        }
+        other => panic!("an outer and an inner outline, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_notched_rect_inset_follows_the_notch_and_a_gap_wider_than_the_rect_paints_no_inner_line() {
+    let notched = packet_for(free_props(json!([rect_shape(json!({
+        "stroke": "#0000ff", "strokeWidth": 2,
+        "corners": {"radius": [6, 6, 6, 6], "kind": "notch"},
+        "inset": inset_look(2.0)}))])));
+    match sdf_commands(&notched).as_slice() {
+        [_, DrawCommand::Sdf {
+            corners,
+            corner_kind,
+            ..
+        }] => assert_eq!((*corners, *corner_kind), ([4.0; 4], 2)),
+        other => panic!("notched outer and inner, got {other:?}"),
+    }
+    let too_wide = packet_for(free_props(json!([rect_shape(json!({
+        "stroke": "#0000ff", "corners": {"radius": [6, 6, 6, 6], "kind": "round"},
+        "inset": inset_look(16.0)}))])));
+    assert_eq!(
+        sdf_commands(&too_wide).len(),
+        1,
+        "16 px gap leaves no inner rect in a 32 px tall rect"
+    );
+}
+
+#[test]
+fn an_inset_on_a_plain_rect_and_an_ellipse_keeps_the_outer_commands_and_adds_inner_ones() {
+    let plain = |extra: Value| packet_for(free_props(json!([rect_shape(extra)])));
+    let without = plain(json!({"stroke": "#0000ff", "strokeWidth": 2}));
+    let with = plain(json!({"stroke": "#0000ff", "strokeWidth": 2, "inset": inset_look(3.0)}));
+    assert!(with.draw_commands.len() > without.draw_commands.len());
+    assert_eq!(
+        format!("{:?}", &with.draw_commands[..without.draw_commands.len()]),
+        format!("{:?}", without.draw_commands),
+        "the outer outline is the control's commands"
+    );
+    let ellipse = |extra: Value| {
+        let mut node = json!({"type": "draw-shape", "shape": "ellipse", "position": {"x": 50, "y": 50},
+            "radiusX": 20, "radiusY": 10, "fill": "#ff0000", "stroke": "#0000ff"});
+        for (key, value) in extra.as_object().unwrap() {
+            node[key] = value.clone();
+        }
+        packet_for(free_props(json!([node])))
+    };
+    assert!(
+        ellipse(json!({"inset": inset_look(3.0)}))
+            .draw_commands
+            .len()
+            > ellipse(json!({})).draw_commands.len()
+    );
+}
+
+#[test]
+fn an_inset_needs_a_stroke_a_width_and_a_gap_above_zero() {
+    for bad in [
+        json!({"strokeWidth": 1, "gap": 2}),
+        json!({"stroke": "#000000", "gap": 2}),
+        json!({"stroke": "#000000", "strokeWidth": 1, "gap": 0}),
+    ] {
+        let err = from_props(&free_props(json!([rect_shape(json!({"inset": bad}))]))).unwrap_err();
+        assert!(
+            matches!(&err, CanvasSceneError::InvalidProp { field, .. } if field.starts_with("inset")),
+            "{err:?}"
+        );
+    }
+}
+
+const ICON: &str = "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2230%22%20height%3D%2210%22%2F%3E";
+
+fn sprite_tints(node: &Value) -> Vec<Option<[f32; 4]>> {
+    from_canvas_node(node)
+        .unwrap()
+        .draw_commands
+        .iter()
+        .filter_map(|c| match c {
+            DrawCommand::Sprite { tint, .. } => Some(*tint),
+            _ => None,
+        })
+        .collect()
+}
+
+fn icon_scene(extra: Value) -> Value {
+    let mut sprite = json!({"type": "draw-sprite", "position": {"x": 0, "y": 0},
+        "asset": {"url": ICON}});
+    for (key, value) in extra.as_object().unwrap() {
+        sprite[key] = value.clone();
+    }
+    json!({"type": "canvas", "projection": "free", "scale": 1.0, "drawables": [sprite]})
+}
+
+#[test]
+fn a_sprite_tint_reaches_the_command_and_a_sprite_without_one_stays_untinted() {
+    assert_eq!(
+        sprite_tints(&icon_scene(json!({"tint": "#ff0000"}))),
+        vec![Some([1.0, 0.0, 0.0, 1.0])]
+    );
+    assert_eq!(
+        sprite_tints(&icon_scene(json!({}))),
+        vec![None],
+        "control: no tint, no recolour"
+    );
+    assert_eq!(
+        sprite_tints(&icon_scene(json!({"tint": null}))),
+        vec![None],
+        "a null tint is none"
+    );
+}
+
+#[test]
+fn a_palette_name_tint_takes_the_theme_colour_like_any_colour_slot() {
+    let mut scene = icon_scene(json!({"tint": "accent"}));
+    scene["canvasTheme"] = json!({"palette": {"accent": "#0000ff"}});
+    assert_eq!(sprite_tints(&scene), vec![Some([0.0, 0.0, 1.0, 1.0])]);
+}
+
+#[test]
+fn a_tint_that_is_no_colour_and_a_tint_on_a_target_sprite_are_refused_by_name() {
+    let field = |scene: &Value| match from_canvas_node(scene).unwrap_err() {
+        CanvasSceneError::InvalidProp { field, .. } => field,
+        other => panic!("not an invalid prop: {other:?}"),
+    };
+    assert_eq!(
+        field(&icon_scene(json!({"tint": "no-such-colour"}))),
+        "tint"
+    );
+    assert_eq!(field(&icon_scene(json!({"tint": 3}))), "tint");
+    let target = icon_scene(json!({"texture": "target:t", "tint": "#ff0000",
+        "width": 4, "height": 4}));
+    assert_eq!(field(&target), "tint");
+}
+
+fn orb(extra: Value) -> Value {
+    let mut node = json!({"type": "draw-scene3d", "id": "orb",
+        "position": {"x": 20, "y": 10}, "width": 64, "height": 48,
+        "scene": {"drawables": [{"type": "draw-mesh", "shape": "sphere",
+            "position": {"x": 0, "y": 0},
+            "material": {"kind": "standard", "color": "#ff0000"}}]}});
+    for (key, value) in extra.as_object().unwrap() {
+        node[key] = value.clone();
+    }
+    node
+}
+
+fn scene3d_canvas(drawable: Value) -> Value {
+    json!({"type": "canvas", "projection": "free", "scale": 1.0, "width": 200, "height": 120,
+        "backgroundColor": "#00000000", "drawables": [drawable]})
+}
+
+fn targets_of(packet: &GameRenderPacket) -> Vec<&DrawCommand> {
+    packet
+        .draw_commands
+        .iter()
+        .filter(|c| matches!(c, DrawCommand::Target { .. }))
+        .collect()
+}
+
+fn scene_sprite(packet: &GameRenderPacket) -> (Rect, f32, f32) {
+    packet
+        .draw_commands
+        .iter()
+        .find_map(|c| match c {
+            DrawCommand::Sprite {
+                texture,
+                dst,
+                rotation,
+                opacity,
+                ..
+            } if texture.starts_with("target:scene3d:") => Some((*dst, *rotation, *opacity)),
+            _ => None,
+        })
+        .expect("the scene's sprite")
+}
+
+fn held_scene(command: &DrawCommand) -> &orbital_canvas_base::scene3d::Scene3D {
+    match command {
+        DrawCommand::Target { commands, .. } => match commands.as_slice() {
+            [DrawCommand::Scene3D { scene }] => scene,
+            other => panic!("a target holds the one scene: {other:?}"),
+        },
+        other => panic!("not a target: {other:?}"),
+    }
+}
+
+#[test]
+fn a_scene3d_drawable_maps_to_one_target_holding_the_scene_and_a_sprite_over_its_rect() {
+    let packet = from_canvas_node(&scene3d_canvas(orb(json!({})))).unwrap();
+    let targets = targets_of(&packet);
+    let [target @ DrawCommand::Target {
+        id,
+        width,
+        height,
+        live,
+        ..
+    }] = targets.as_slice()
+    else {
+        panic!("one target: {:?}", packet.draw_commands)
+    };
+    assert_eq!(
+        (id.as_str(), *width, *height, *live),
+        ("scene3d:orb", 128, 96, false),
+        "the texture is the rect times the default pixel ratio 2"
+    );
+    assert_eq!(held_scene(target).meshes.len(), 1);
+    assert!(
+        held_scene(target).grid.is_none(),
+        "no ground grid by default"
+    );
+    let (dst, rotation, opacity) = scene_sprite(&packet);
+    assert_eq!(
+        (dst.x, dst.y, dst.w, dst.h, rotation, opacity),
+        (20.0, 10.0, 64.0, 48.0, 0.0, 1.0)
+    );
+    let fine = from_canvas_node(&scene3d_canvas(orb(json!({"pixelRatio": 3})))).unwrap();
+    assert!(matches!(
+        targets_of(&fine)[..],
+        [DrawCommand::Target {
+            width: 192,
+            height: 144,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn a_scene_without_a_scene3d_drawable_has_no_target_and_no_scene() {
+    let plain = scene3d_canvas(json!({"type": "draw-shape", "shape": "rect",
+        "position": {"x": 0, "y": 0}, "width": 4, "height": 4, "fill": "#ff0000"}));
+    let packet = from_canvas_node(&plain).unwrap();
+    assert!(targets_of(&packet).is_empty());
+    assert!(!packet
+        .draw_commands
+        .iter()
+        .any(|c| matches!(c, DrawCommand::Scene3D { .. } | DrawCommand::Sprite { .. })));
+}
+
+#[test]
+fn drawables_without_an_id_get_distinct_targets_in_order() {
+    let mut canvas = scene3d_canvas(orb(json!({})));
+    let mut first = orb(json!({}));
+    first.as_object_mut().unwrap().remove("id");
+    let second = first.clone();
+    canvas["drawables"] = json!([first, second, orb(json!({}))]);
+    let packet = from_canvas_node(&canvas).unwrap();
+    let ids: Vec<&str> = targets_of(&packet)
+        .iter()
+        .filter_map(|c| match c {
+            DrawCommand::Target { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, ["scene3d:#0", "scene3d:#1", "scene3d:orb"]);
+}
+
+#[test]
+fn a_palette_name_in_a_mesh_colour_takes_the_theme_colour_and_a_literal_stays() {
+    let colour = |drawable: Value| {
+        let mut canvas = scene3d_canvas(drawable);
+        canvas["canvasTheme"] = json!({"palette": {"brand": "#00ff00"}});
+        let packet = from_canvas_node(&canvas).unwrap();
+        held_scene(targets_of(&packet)[0]).meshes[0].material.color
+    };
+    let named = orb(json!({}));
+    let mut named = named;
+    named["scene"]["drawables"][0]["material"]["color"] = json!("brand");
+    assert_eq!(colour(named), [0.0, 1.0, 0.0]);
+    assert_eq!(
+        colour(orb(json!({}))),
+        [1.0, 0.0, 0.0],
+        "control: a literal stays"
+    );
+}
+
+#[test]
+fn the_page_scroll_moves_the_scene_sprite_and_leaves_its_target() {
+    let packet = from_canvas_node(&scene3d_canvas(orb(json!({})))).unwrap();
+    let before = serde_json::to_value(targets_of(&packet)[0]).unwrap();
+    let scrolled = packet.clone().scrolled(15.0);
+    let (dst, ..) = scene_sprite(&scrolled);
+    assert_eq!((dst.x, dst.y), (20.0, -5.0));
+    assert_eq!(
+        serde_json::to_value(targets_of(&scrolled)[0]).unwrap(),
+        before
+    );
+    let (still, ..) = scene_sprite(&packet.scrolled(0.0));
+    assert_eq!(still.y, 10.0, "control: no scroll, no move");
+}
+
+fn spinning() -> Value {
+    json!({"durationMs": 1000, "keyframes": [
+        {"at": 0, "rotateY": 0}, {"at": 1, "rotateY": 6.0}]})
+}
+
+#[test]
+fn the_scenes_own_animation_plays_on_the_clock_and_rests_without_one() {
+    let mut node = orb(json!({}));
+    node["scene"]["drawables"][0]["animation"] = spinning();
+    let canvas = scene3d_canvas(node.clone());
+    let at = |ms: f64| {
+        let packet = from_canvas_node_at(&canvas, ms).unwrap();
+        serde_json::to_value(&held_scene(targets_of(&packet)[0]).meshes).unwrap()
+    };
+    assert_ne!(at(1000.0), at(1250.0), "two instants, two poses");
+    assert_eq!(at(1250.0), at(2250.0), "a looping animation repeats");
+    let mut still = node;
+    still["scene"]["drawables"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("animation");
+    let unanimated = from_canvas_node_at(&scene3d_canvas(still), 1250.0).unwrap();
+    assert_eq!(
+        at(0.0),
+        serde_json::to_value(&held_scene(targets_of(&unanimated)[0]).meshes).unwrap(),
+        "no clock is the rest pose, which is the unanimated scene"
+    );
+}
+
+#[test]
+fn the_drawables_own_animation_moves_and_rotates_the_whole_object() {
+    let animation = json!({"durationMs": 1000, "keyframes": [
+        {"at": 0, "rotateZ": 0, "scale": 1, "offsetX": 0, "opacity": 1},
+        {"at": 1, "rotateZ": 1.0, "scale": 2, "offsetX": 10, "opacity": 0.5}]});
+    let canvas = scene3d_canvas(orb(json!({"animation": animation})));
+    let at = |ms: f64| scene_sprite(&from_canvas_node_at(&canvas, ms).unwrap());
+    let (rest, rest_rotation, rest_opacity) = at(0.0);
+    assert_eq!(
+        (rest.x, rest.w, rest_rotation, rest_opacity),
+        (20.0, 64.0, 0.0, 1.0)
+    );
+    let (mid, rotation, opacity) = at(500.0);
+    assert!((rotation - 0.5).abs() < 1e-4 && (opacity - 0.75).abs() < 1e-4);
+    assert!(
+        (mid.w - 96.0).abs() < 1e-3,
+        "scale about the centre: {mid:?}"
+    );
+    assert!(
+        (mid.x + mid.w / 2.0 - (20.0 + 32.0 + 5.0)).abs() < 1e-3,
+        "{mid:?}"
+    );
+    let target = from_canvas_node_at(&canvas, 500.0).unwrap();
+    assert!(matches!(
+        targets_of(&target)[..],
+        [DrawCommand::Target { width: 128, .. }]
+    ));
+}
+
+#[test]
+fn a_scroll_clocked_animation_on_the_drawable_is_played_by_the_packet() {
+    let animation = json!({"clock": "scroll", "from": 0, "to": 100,
+        "keyframes": [{"at": 0, "rotate": 0}, {"at": 1, "rotate": 90}]});
+    let packet = from_canvas_node(&scene3d_canvas(orb(json!({"animation": animation})))).unwrap();
+    assert_eq!(packet.animations.len(), 1);
+    let sprite_at = packet
+        .draw_commands
+        .iter()
+        .position(|c| matches!(c, DrawCommand::Sprite { .. }))
+        .unwrap();
+    assert!(packet.animations[0].first <= sprite_at && sprite_at < packet.animations[0].end);
+    let mut scrolled = packet.clone();
+    scrolled.scroll = 50.0;
+    let half = scrolled.resolved_at(0.0, 0.0, true).into_owned();
+    let (_, rotation, _) = scene_sprite(&half);
+    assert!(
+        (rotation - std::f32::consts::FRAC_PI_4).abs() < 1e-3,
+        "half the scroll turns it a half of 90 degrees: {rotation}"
+    );
+    let (_, rest, _) = scene_sprite(&packet);
+    assert_eq!(rest, 0.0, "control: the mapper draws the rest frame");
+}
+
+#[test]
+fn a_scene3d_with_a_semantic_is_one_node_over_its_rect_and_a_hit_is_a_region() {
+    let node = orb(json!({"semantic": {"role": "img", "name": "A red orb"}, "hit": true}));
+    let (_, gathered) = from_canvas_node_mapped(&scene3d_canvas(node), 0.0).unwrap();
+    let [semantic] = gathered.semantic.as_slice() else {
+        panic!("one semantic node: {:?}", gathered.semantic)
+    };
+    assert_eq!(
+        (semantic.role.as_str(), semantic.name.as_str()),
+        ("img", "A red orb")
+    );
+    assert_eq!(
+        (
+            semantic.rect.x,
+            semantic.rect.y,
+            semantic.rect.w,
+            semantic.rect.h
+        ),
+        (20.0, 10.0, 64.0, 48.0)
+    );
+    assert_eq!(gathered.regions.len(), 1);
+    let (_, plain) = from_canvas_node_mapped(&scene3d_canvas(orb(json!({}))), 0.0).unwrap();
+    assert!(
+        plain.semantic.is_empty() && plain.regions.is_empty(),
+        "control: neither declared"
+    );
+}
+
+#[test]
+fn a_scene3d_missing_what_it_needs_is_refused_by_field() {
+    let field = |extra: Value, remove: &str| {
+        let mut node = orb(extra);
+        node.as_object_mut().unwrap().remove(remove);
+        match from_canvas_node(&scene3d_canvas(node)).unwrap_err() {
+            CanvasSceneError::InvalidProp { field, .. } => field,
+            other => panic!("not an invalid prop: {other:?}"),
+        }
+    };
+    assert_eq!(field(json!({}), "scene"), "scene");
+    assert_eq!(field(json!({}), "width"), "width");
+    assert_eq!(field(json!({}), "height"), "height");
+    assert_eq!(field(json!({"pixelRatio": 0}), "id"), "pixelRatio");
+    assert_eq!(field(json!({"width": -4}), "id"), "width");
+}
+
+#[test]
+fn only_a_scene3d_that_moves_wants_frames() {
+    let still = scene3d_canvas(orb(json!({})));
+    assert!(
+        !has_active_fx(&still),
+        "control: a still scene needs no frames"
+    );
+    let mut moving = orb(json!({}));
+    moving["scene"]["drawables"][0]["animation"] = spinning();
+    assert!(has_active_fx(&scene3d_canvas(moving)));
+    let shader = orb(json!({"scene": {"drawables": [{"type": "draw-mesh",
+        "position": {"x": 0, "y": 0},
+        "material": {"kind": "shader", "wgsl": "x"}}]}}));
+    assert!(has_active_fx(&scene3d_canvas(shader)));
+    let timed = orb(json!({"animation": {"durationMs": 500,
+        "keyframes": [{"at": 0, "rotateZ": 0}, {"at": 1, "rotateZ": 1}]}}));
+    assert!(
+        has_active_fx(&scene3d_canvas(timed)),
+        "the drawable's own time animation"
+    );
+}
