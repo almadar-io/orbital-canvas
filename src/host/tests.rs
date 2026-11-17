@@ -1436,10 +1436,14 @@ fn pulse_scene() -> serde_json::Value {
 }
 
 fn ring_alpha(p: &GameRenderPacket) -> f32 {
-    match &p.draw_commands[1] {
+    let (fade, ring) = match &p.draw_commands[1] {
+        packet::DrawCommand::Faded { opacity, commands } => (*opacity, &commands[0]),
+        other => (1.0, other),
+    };
+    match ring {
         packet::DrawCommand::Path {
             stroke: Some(s), ..
-        } => s.color[3],
+        } => s.color[3] * fade,
         other => panic!("expected the first ring, got {other:?}"),
     }
 }
@@ -2668,6 +2672,86 @@ mod embedded_scene3d {
         );
     }
 
+    fn page(animated: bool, extra: Option<serde_json::Value>) -> serde_json::Value {
+        let mut page = node(animated);
+        let drawables = page["drawables"].as_array_mut().unwrap();
+        drawables.push(serde_json::json!({"type": "draw-text", "text": "headline",
+            "color": "#000000", "font": "12px sans-serif", "position": {"x": 2, "y": 2}}));
+        drawables.extend(extra);
+        page
+    }
+
+    fn page_host(page: serde_json::Value) -> SceneHost {
+        let mut host = SceneHost::new();
+        host.set_viewport(64, 64);
+        host.set_scene(page).unwrap();
+        host.set_clock(0.0);
+        host
+    }
+
+    fn headline(packet: &GameRenderPacket) -> serde_json::Value {
+        let command = packet
+            .draw_commands
+            .iter()
+            .find(|c| matches!(c, DrawCommand::Text { text, .. } if text == "headline"))
+            .expect("the headline");
+        serde_json::to_value(command).unwrap()
+    }
+
+    #[test]
+    fn a_spinning_object_is_remapped_alone_and_never_the_page() {
+        let mut host = page_host(page(true, None));
+        host.set_epoch_clock(1000.0);
+        let first = host.frame_packet().unwrap();
+        host.set_epoch_clock(1250.0);
+        let later = host.frame_packet().unwrap();
+        assert_ne!(meshes(&first), meshes(&later), "the pose follows the clock");
+        assert_eq!(host.timed_maps(), 0, "the page is not mapped again");
+        assert_eq!(
+            headline(&first),
+            headline(&later),
+            "the rest of the packet is the cached one"
+        );
+        host.refresh_assets();
+        assert!(host.wants_frames(), "the spinner keeps the loop going");
+    }
+
+    #[test]
+    fn reduced_motion_shows_the_rest_pose_on_a_page_with_a_spinner() {
+        let mut host = page_host(page(true, None));
+        host.set_motion(false);
+        host.set_epoch_clock(1000.0);
+        let one = meshes(&host.frame_packet().unwrap());
+        host.set_epoch_clock(1250.0);
+        assert_eq!(one, meshes(&host.frame_packet().unwrap()));
+        assert_eq!(
+            one,
+            meshes(&page_host(page(false, None)).frame_packet().unwrap())
+        );
+        host.refresh_assets();
+        assert!(!host.wants_frames());
+        assert_eq!(host.timed_maps(), 0);
+    }
+
+    #[test]
+    fn a_page_with_a_pulse_beside_the_spinner_still_maps_per_frame() {
+        let pulse = serde_json::json!({"type": "draw-shape", "shape": "rect",
+            "position": {"x": 40, "y": 40}, "width": 8, "height": 8, "fill": "#ff0000",
+            "animation": {"durationMs": 1000, "keyframes": [
+                {"at": 0, "opacity": 0.2}, {"at": 1, "opacity": 1.0}]}});
+        let mut with_pulse = page_host(page(true, Some(pulse.clone())));
+        with_pulse.set_epoch_clock(1000.0);
+        let _ = with_pulse.frame_packet();
+        let _ = with_pulse.frame_packet();
+        assert_eq!(with_pulse.timed_maps(), 2, "a 2D epoch animation maps");
+        let mut only_pulse = page_host(serde_json::json!({"type": "canvas", "projection": "free",
+            "scale": 1.0, "drawables": [pulse]}));
+        only_pulse.set_epoch_clock(1000.0);
+        let _ = only_pulse.frame_packet();
+        let _ = only_pulse.frame_packet();
+        assert_eq!(only_pulse.timed_maps(), 2, "control: no scene3d, as before");
+    }
+
     #[test]
     fn a_tinted_icon_paints_in_the_tint_through_the_host() {
         let Ok(mut canvas) = Canvas::new_headless() else {
@@ -2707,4 +2791,68 @@ mod embedded_scene3d {
             "control: untinted stays black {plain:?}"
         );
     }
+}
+
+fn glow_host(at: f64) -> Canvas {
+    let mut renderer = Canvas::new_headless().unwrap();
+    renderer.set_motion(true);
+    renderer
+        .set_scene(serde_json::json!({
+            "type": "canvas", "mode": "2d", "projection": "free", "scale": 1,
+            "drawables": [{"type": "draw-shape", "shape": "ellipse", "position": {"x": 40, "y": 40},
+                "anchor": "center", "radiusX": 10, "fill": "#ffffff",
+                "shadow": {"color": "#00ff00", "blur": 8},
+                "animation": {"startMs": 5000, "durationMs": 1000,
+                    "keyframes": [{"at": 0, "opacity": 0}, {"at": 1, "opacity": 1}]}}]
+        }))
+        .unwrap();
+    renderer.set_epoch_clock(at);
+    renderer
+}
+
+fn faded_glow(renderer: &Canvas) -> (f32, serde_json::Value) {
+    renderer
+        .frame_packet()
+        .unwrap()
+        .draw_commands
+        .iter()
+        .find_map(|c| match c {
+            packet::DrawCommand::Faded { opacity, commands } => {
+                Some((*opacity, serde_json::to_value(commands).unwrap()))
+            }
+            _ => None,
+        })
+        .expect("the glow plays as a Faded layer")
+}
+
+#[test]
+fn a_fading_glow_carries_its_opacity_outside_one_unchanging_layer() {
+    let (a, content_a) = faded_glow(&glow_host(5250.0));
+    let (b, content_b) = faded_glow(&glow_host(5750.0));
+    assert!(
+        (a - 0.25).abs() < 1e-3 && (b - 0.75).abs() < 1e-3,
+        "{a} {b}"
+    );
+    assert_eq!(
+        content_a, content_b,
+        "the cached content is the same every frame"
+    );
+    let mut still = glow_host(5250.0);
+    still
+        .set_scene(serde_json::json!({
+            "type": "canvas", "mode": "2d", "projection": "free", "scale": 1,
+            "drawables": [{"type": "draw-shape", "shape": "ellipse", "position": {"x": 40, "y": 40},
+                "anchor": "center", "radiusX": 10, "fill": "#ffffff",
+                "shadow": {"color": "#00ff00", "blur": 8}}]
+        }))
+        .unwrap();
+    assert!(
+        !still
+            .frame_packet()
+            .unwrap()
+            .draw_commands
+            .iter()
+            .any(|c| matches!(c, packet::DrawCommand::Faded { .. })),
+        "control: an unanimated glow has no wrapper"
+    );
 }

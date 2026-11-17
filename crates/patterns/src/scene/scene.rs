@@ -110,6 +110,7 @@ pub fn map_scene(
             nodes.sort_by(|a, b| a.order.total_cmp(&b.order));
             nodes
         },
+        live_scenes3d: gathered.live_scenes3d,
         ..MappedScene::drawn(packet)
     })
 }

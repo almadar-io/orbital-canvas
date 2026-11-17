@@ -134,6 +134,17 @@ impl SharedDeviceRenderer {
     /// Upload straight-alpha RGBA8 as a sampled texture with its bind group.
     pub(super) fn upload_rgba(&self, rgba: &[u8], width: u32, height: u32, now: u64) -> GpuSprite {
         let texture = self.upload_rgba_texture(rgba, width, height);
+        self.sprite_from_texture(texture, width, height, now)
+    }
+
+    /// A sprite drawing `texture` (straight-alpha RGBA) through the sprite bind group.
+    pub(super) fn sprite_from_texture(
+        &self,
+        texture: wgpu::Texture,
+        width: u32,
+        height: u32,
+        now: u64,
+    ) -> GpuSprite {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("game vector layer bind group"),

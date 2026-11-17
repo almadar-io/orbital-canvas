@@ -3371,19 +3371,122 @@ fn a_start_ms_fade_and_slide_is_mapped_once_and_played_by_the_packet() {
     );
 }
 
+fn texts_in(commands: &[DrawCommand], out: &mut Vec<(f32, f32, f32)>) {
+    for command in commands {
+        match command {
+            DrawCommand::Text { color, pos, .. } => out.push((color[3], pos.x, pos.y)),
+            DrawCommand::ClipGroup { commands, .. }
+            | DrawCommand::AdditiveGroup { commands }
+            | DrawCommand::Target { commands, .. } => texts_in(commands, out),
+            _ => {}
+        }
+    }
+}
+
+fn all_texts(packet: &GameRenderPacket) -> Vec<(f32, f32, f32)> {
+    let mut found = Vec::new();
+    texts_in(&packet.draw_commands, &mut found);
+    found
+}
+
+fn in_clip(items: Value) -> Value {
+    json!({"type": "draw-group", "position": {"x": 0, "y": 0},
+        "clip": {"x": 0, "y": 0, "width": 100, "height": 100}, "items": items})
+}
+
+fn plain_text(x: f64, animation: Option<Value>) -> Value {
+    let mut text = json!({"type": "draw-text", "text": "hi", "color": "#000000",
+        "font": "12px sans-serif", "position": {"x": x, "y": 5}});
+    if let Some(a) = animation {
+        text["animation"] = a;
+    }
+    text
+}
+
 #[test]
-fn control_a_start_ms_animation_inside_a_clip_stays_with_the_mapper() {
-    let text = animated_text_props(started(json!({"startMs": 5000})))["drawables"][0].clone();
-    let props = free_props(json!([{"type": "draw-group", "position": {"x": 0, "y": 0},
-        "clip": {"x": 0, "y": 0, "width": 100, "height": 100}, "items": [text]}]));
+fn an_epoch_fade_in_a_clip_is_a_packet_animation_with_a_path_and_matches_the_unfolded_one() {
+    let fade = started(json!({"startMs": 5000}));
+    let folded = free_props(json!([in_clip(json!([plain_text(
+        5.0,
+        Some(fade.clone())
+    )]))]));
+    let packet = from_props_at(&folded, 5500.0).unwrap();
+    let [animation] = packet.animations.as_slice() else {
+        panic!("one packet animation: {:?}", packet.animations)
+    };
+    assert!(!animation.path.is_empty(), "{animation:?}");
+    assert!(
+        !has_started_animation(
+            &json!({"type": "canvas", "drawables": folded["drawables"].clone()})
+        ),
+        "nothing left for a re-map"
+    );
+    let plain = free_props(json!([plain_text(5.0, Some(fade))]));
+    for t in [4000.0, 5500.0, 9000.0] {
+        assert_eq!(
+            all_texts(&drawn_at(&folded, t)),
+            all_texts(&drawn_at(&plain, t)),
+            "the clip's text fades as the unfolded one at {t}"
+        );
+    }
+    let alpha = all_texts(&drawn_at(&folded, 5500.0))[0].0;
+    assert!((alpha - 0.625).abs() < 1e-3, "{alpha}");
+}
+
+#[test]
+fn control_an_epoch_fade_outside_any_fold_has_an_empty_path() {
+    let props = free_props(json!([plain_text(
+        5.0,
+        Some(started(json!({"startMs": 5000})))
+    )]));
     let packet = from_props_at(&props, 5500.0).unwrap();
     assert!(
-        packet.animations.is_empty(),
-        "a clip folds its children's range"
+        matches!(packet.animations.as_slice(), [a] if a.path.is_empty()),
+        "{:?}",
+        packet.animations
     );
-    assert!(has_started_animation(
-        &json!({"type": "canvas", "drawables": props["drawables"].clone()})
-    ));
+}
+
+#[test]
+fn nested_clips_compose_the_animation_path() {
+    let fade = started(json!({"startMs": 5000}));
+    let props = free_props(json!([in_clip(json!([
+        plain_text(1.0, None),
+        in_clip(json!([plain_text(2.0, None), plain_text(3.0, Some(fade))]))
+    ]))]));
+    let packet = from_props_at(&props, 5500.0).unwrap();
+    let [animation] = packet.animations.as_slice() else {
+        panic!("one packet animation: {:?}", packet.animations)
+    };
+    assert_eq!(animation.path.len(), 2, "{animation:?}");
+    let alphas: Vec<f32> = all_texts(&drawn_at(&props, 5500.0))
+        .iter()
+        .map(|t| t.0)
+        .collect();
+    assert_eq!(alphas.len(), 3);
+    assert_eq!(alphas[0], 1.0);
+    assert_eq!(alphas[1], 1.0, "the inner sibling rests");
+    assert!((alphas[2] - 0.625).abs() < 1e-3, "{alphas:?}");
+}
+
+#[test]
+fn a_scroll_animation_under_a_clip_moves_only_its_own_commands() {
+    let scroll = json!({"clock": "scroll", "from": 0, "to": 100,
+        "keyframes": [{"at": 0, "offsetY": 0}, {"at": 1, "offsetY": 3}]});
+    let props = free_props(json!([in_clip(json!([
+        plain_text(1.0, None),
+        plain_text(2.0, Some(scroll))
+    ]))]));
+    let packet = from_props(&props).unwrap();
+    let rest = all_texts(&packet);
+    let mut scrolled = packet.clone();
+    scrolled.scroll = 100.0;
+    let moved = all_texts(&scrolled.resolved_at(0.0, 0.0, true));
+    assert_eq!(moved[0].2, rest[0].2, "the sibling does not move");
+    assert!(
+        (moved[1].2 - rest[1].2).abs() > 0.5,
+        "the animated text moves: {rest:?} {moved:?}"
+    );
 }
 
 #[test]
@@ -3929,17 +4032,69 @@ fn only_a_scene3d_that_moves_wants_frames() {
         !has_active_fx(&still),
         "control: a still scene needs no frames"
     );
+    let live = |node: Value| {
+        let (_, gathered) = from_canvas_node_mapped(&scene3d_canvas(node), 0.0).unwrap();
+        gathered.live_scenes3d
+    };
+    assert!(live(orb(json!({}))).is_empty(), "control: nothing moves");
     let mut moving = orb(json!({}));
     moving["scene"]["drawables"][0]["animation"] = spinning();
-    assert!(has_active_fx(&scene3d_canvas(moving)));
+    assert!(
+        !has_active_fx(&scene3d_canvas(moving.clone())),
+        "the page is not remapped for it"
+    );
+    let found = live(moving);
+    assert_eq!(found.len(), 1, "the moving scene is recorded");
+    let (at_rest, at_later) = (
+        found[0].scene_at(0.0).unwrap(),
+        found[0].scene_at(250.0).unwrap(),
+    );
+    assert_ne!(
+        serde_json::to_value(&at_rest.meshes).unwrap(),
+        serde_json::to_value(&at_later.meshes).unwrap(),
+        "the recorded scene plays at the clock"
+    );
     let shader = orb(json!({"scene": {"drawables": [{"type": "draw-mesh",
         "position": {"x": 0, "y": 0},
         "material": {"kind": "shader", "wgsl": "x"}}]}}));
-    assert!(has_active_fx(&scene3d_canvas(shader)));
+    assert!(scene_moves(&shader["scene"]), "a shader material plays too");
     let timed = orb(json!({"animation": {"durationMs": 500,
         "keyframes": [{"at": 0, "rotateZ": 0}, {"at": 1, "rotateZ": 1}]}}));
     assert!(
         has_active_fx(&scene3d_canvas(timed)),
         "the drawable's own time animation"
+    );
+}
+
+#[test]
+fn a_finished_paint_clock_animation_is_not_live_and_a_looping_one_is() {
+    let text = |animation: Value| {
+        json!({"type": "canvas", "drawables": [{"type": "draw-text", "text": "07", "color": "#000000",
+            "font": "16px sans-serif", "position": {"x": 5, "y": 5}, "animation": animation}]})
+    };
+    let frames = json!([{"at": 0, "opacity": 1}, {"at": 1, "opacity": 1}]);
+    let epoch = 1.8e12;
+    let once = text(json!({"durationMs": 1, "loop": false, "keyframes": frames.clone()}));
+    assert!(
+        !active_fx_live(&once, epoch),
+        "a non-looping paint-clock animation has finished on the epoch clock: no frames"
+    );
+    assert!(
+        has_active_fx(&once),
+        "it is still mapped at the clock once, for its end state"
+    );
+    assert!(
+        active_fx_live(
+            &text(json!({"durationMs": 2000, "keyframes": frames.clone()})),
+            epoch
+        ),
+        "control: a looping one keeps moving"
+    );
+    assert!(
+        active_fx_live(
+            &text(json!({"durationMs": 1000, "loop": false, "keyframes": frames})),
+            500.0
+        ),
+        "control: inside its duration on a scene clock it still plays"
     );
 }

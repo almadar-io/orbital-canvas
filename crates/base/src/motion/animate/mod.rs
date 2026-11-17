@@ -332,7 +332,9 @@ impl Animation {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Xform {
+    fade_layers: bool,
     origin: Vec2,
     translation: Vec2,
     scale: f32,
@@ -348,6 +350,7 @@ impl Xform {
     fn new(a: &Animation, s: Sample) -> Self {
         let (sin, cos) = s.rotate.to_radians().sin_cos();
         Self {
+            fade_layers: true,
             origin: a.origin,
             translation: Vec2 {
                 x: s.offset_x,
@@ -366,6 +369,7 @@ impl Xform {
     fn group(origin: Vec2, translation: Vec2, scale: f32, radians: f32, opacity: f32) -> Self {
         let (sin, cos) = radians.sin_cos();
         Self {
+            fade_layers: true,
             origin,
             translation,
             scale,
@@ -525,6 +529,26 @@ impl Xform {
     }
 
     fn command(&self, cmd: &DrawCommand) -> DrawCommand {
+        if let DrawCommand::Faded { opacity, commands } = cmd {
+            let inner = Self {
+                opacity: 1.0,
+                ..*self
+            };
+            return DrawCommand::Faded {
+                opacity: (*opacity * self.opacity).clamp(0.0, 1.0),
+                commands: commands.iter().map(|c| inner.command(c)).collect(),
+            };
+        }
+        if self.fade_layers && self.opacity != 1.0 && is_layer(cmd) {
+            let inner = Self {
+                opacity: 1.0,
+                ..*self
+            };
+            return DrawCommand::Faded {
+                opacity: self.opacity.clamp(0.0, 1.0),
+                commands: vec![inner.command(cmd)],
+            };
+        }
         match cmd {
             DrawCommand::Path {
                 segments,
@@ -597,7 +621,13 @@ impl Xform {
             DrawCommand::AdditiveGroup { commands } => DrawCommand::AdditiveGroup {
                 commands: commands
                     .iter()
-                    .map(|command| self.command(command))
+                    .map(|command| {
+                        Self {
+                            fade_layers: false,
+                            ..*self
+                        }
+                        .command(command)
+                    })
                     .collect(),
             },
             DrawCommand::ClipGroup { clip, commands } => DrawCommand::ClipGroup {
@@ -836,6 +866,21 @@ impl Xform {
     }
 }
 
+/// Commands drawn through the CPU vector layer, whose cache keys on content: a fade must stay outside them.
+fn is_layer(cmd: &DrawCommand) -> bool {
+    match cmd {
+        DrawCommand::Path { .. }
+        | DrawCommand::GradientPath { .. }
+        | DrawCommand::PatternPath { .. }
+        | DrawCommand::Blurred { .. }
+        | DrawCommand::Shadow { .. }
+        | DrawCommand::ClippedPath { .. }
+        | DrawCommand::Line { .. } => true,
+        DrawCommand::Text { halo, .. } => halo.is_some(),
+        _ => false,
+    }
+}
+
 /// Apply one 2D group transform to the range a drawable group just emitted.
 /// The same command geometry path serves packet animations and group nesting.
 pub fn transform_group_commands(
@@ -849,6 +894,43 @@ pub fn transform_group_commands(
     let transform = Xform::group(origin, translation, scale, radians, opacity);
     for command in commands {
         *command = transform.command(command);
+    }
+}
+
+/// Replace each command of `first..end` in the list `path` leads to (a folded command's children at each step; an
+/// `SdfBlend`'s shapes are children 0 and 1) by `f` of it.
+fn play_range(
+    commands: &mut [DrawCommand],
+    path: &[usize],
+    first: usize,
+    end: usize,
+    f: &mut dyn FnMut(&DrawCommand) -> DrawCommand,
+) {
+    let Some((&at, rest)) = path.split_first() else {
+        let end = end.min(commands.len());
+        for command in &mut commands[first.min(end)..end] {
+            *command = f(command);
+        }
+        return;
+    };
+    match commands.get_mut(at) {
+        Some(
+            DrawCommand::ClipGroup { commands, .. }
+            | DrawCommand::AdditiveGroup { commands }
+            | DrawCommand::Target { commands, .. },
+        ) => play_range(commands, rest, first, end, f),
+        Some(DrawCommand::SdfBlend {
+            first: a,
+            second: b,
+            ..
+        }) if rest.is_empty() => {
+            for (i, shape) in [a, b].into_iter().enumerate() {
+                if i >= first && i < end {
+                    **shape = f(shape);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -922,15 +1004,16 @@ impl GameRenderPacket {
             };
             let x = Xform::new(a, a.sample_progress(progress));
             let outline = a.morph_at(progress).map(|c| crate::morph::segments(&c));
-            let end = a.end.min(out.draw_commands.len());
-            for i in a.first.min(end)..end {
-                out.draw_commands[i] = match &outline {
-                    Some(outline) => {
-                        x.command(&crate::morph::with_outline(&self.draw_commands[i], outline))
-                    }
-                    None => x.command(&self.draw_commands[i]),
-                };
-            }
+            play_range(
+                &mut out.draw_commands,
+                &a.path,
+                a.first,
+                a.end,
+                &mut |command| match &outline {
+                    Some(outline) => x.command(&crate::morph::with_outline(command, outline)),
+                    None => x.command(command),
+                },
+            );
         }
         Cow::Owned(out)
     }

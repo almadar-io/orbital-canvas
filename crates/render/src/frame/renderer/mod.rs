@@ -117,6 +117,11 @@ pub struct SharedDeviceRenderer {
     glyphs: Option<crate::glyph_atlas::GlyphPass>,
     layers: crate::backdrop::LayerPool,
     blur: Option<crate::backdrop::BlurPass>,
+    /// The horizontal-pass texture of the last GPU-blurred vector layer, reused while the next one has its size.
+    blur_scratch: Option<wgpu::Texture>,
+    /// Vector layers blurred on the GPU so far (cache observability for tests).
+    #[cfg(test)]
+    gpu_blurred_layers: u64,
     targets: crate::render_target::TargetStore,
     target_sprite_pipeline: wgpu::RenderPipeline,
     /// Layers clip groups paint into, kept across frames; one per clip group of a frame.
@@ -203,6 +208,9 @@ impl SharedDeviceRenderer {
             glyphs: None,
             layers: Default::default(),
             blur: None,
+            blur_scratch: None,
+            #[cfg(test)]
+            gpu_blurred_layers: 0,
             targets: Default::default(),
             target_sprite_pipeline,
             clip_layers: Vec::new(),
@@ -367,8 +375,32 @@ impl SharedDeviceRenderer {
         let mut quad_batch: Vec<Vertex> = Vec::new();
         let mut vector_run: Vec<&DrawCommand> = Vec::new();
 
-        for command in &packet.draw_commands {
+        let mut pending = packet.draw_commands.iter().peekable();
+        while let Some(command) = pending.next() {
             match command {
+                DrawCommand::Faded { opacity, commands } => {
+                    self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
+                    if !quad_batch.is_empty() {
+                        draws.push(Draw::Quads(std::mem::take(&mut quad_batch)));
+                    }
+                    let mut layer: Vec<&DrawCommand> = commands.iter().collect();
+                    while let Some(DrawCommand::Faded {
+                        opacity: next,
+                        commands,
+                    }) = pending.peek()
+                    {
+                        if next != opacity {
+                            break;
+                        }
+                        layer.extend(commands.iter());
+                        pending.next();
+                    }
+                    if *opacity > 0.0 {
+                        self.flush_vector_run_faded(
+                            &mut layer, packet, target, &mut draws, false, *opacity,
+                        );
+                    }
+                }
                 DrawCommand::Clear { color } => {
                     clear_color = wgpu::Color {
                         r: color[0] as f64,
@@ -845,6 +877,7 @@ impl SharedDeviceRenderer {
 pub use crate::texture::copy_texture_to_rgba;
 
 mod backdrops;
+mod blur_layers;
 mod clip;
 mod glyphs;
 mod pipelines;

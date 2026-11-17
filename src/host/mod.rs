@@ -94,6 +94,8 @@ pub struct SceneHost {
     pub(crate) pointer: Option<(f32, f32)>,
     /// Whether a drawable paints a material that reads the clock.
     pub(crate) live_material: bool,
+    /// The embedded 3D scenes of the current packet that play by themselves.
+    pub(crate) live_scenes3d: Vec<mappers::game_canvas_2d::LiveScene3d>,
     /// The pointers held down (ascending id), the one whose press began the gesture, and the `touches` payload
     /// of the event being dispatched when a multi-touch gesture is in progress.
     pub(crate) touches: Vec<Touch>,
@@ -150,6 +152,7 @@ impl SceneHost {
             captured: None,
             pointer: None,
             live_material: false,
+            live_scenes3d: Vec::new(),
             touches: Vec::new(),
             primary_pointer: None,
             touch_payload: None,
@@ -201,6 +204,7 @@ impl SceneHost {
         self.pointer_regions.clear();
         self.measured.clear();
         self.live_material = false;
+        self.live_scenes3d.clear();
         self.packet = Some(packet);
     }
 
@@ -296,6 +300,7 @@ impl SceneHost {
         self.text_hits = mapped.text_hits;
         self.measured = mapped.measured;
         self.semantic = mapped.semantic_nodes;
+        self.live_scenes3d = mapped.live_scenes3d;
         match self.scroll_max() {
             Some(max) => {
                 self.page_scroll.offset = self.page_scroll.offset.min(max);

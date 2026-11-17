@@ -7,6 +7,7 @@ fn pulse() -> Animation {
     Animation {
         first: 0,
         end: 1,
+        path: Vec::new(),
         duration_ms: 2000.0,
         delay_ms: 600.0,
         iterations: None,
@@ -64,8 +65,16 @@ fn packet(cmds: Vec<DrawCommand>, animations: Vec<Animation>) -> GameRenderPacke
     }
 }
 
+/// The command a fade wraps and the opacity it carries.
+fn unfaded(c: &DrawCommand) -> (f32, &DrawCommand) {
+    match c {
+        DrawCommand::Faded { opacity, commands } => (*opacity, &commands[0]),
+        other => (1.0, other),
+    }
+}
+
 fn radius(p: &GameRenderPacket, i: usize) -> f32 {
-    match &p.draw_commands[i] {
+    match unfaded(&p.draw_commands[i]).1 {
         DrawCommand::Path { segments, .. } => match segments[0] {
             PathSegment::Arc { rx, .. } => rx,
             _ => panic!("not an arc"),
@@ -75,16 +84,17 @@ fn radius(p: &GameRenderPacket, i: usize) -> f32 {
 }
 
 fn alpha(p: &GameRenderPacket, i: usize) -> f32 {
-    match &p.draw_commands[i] {
+    let (fade, command) = unfaded(&p.draw_commands[i]);
+    match command {
         DrawCommand::Path {
             stroke: Some(s), ..
-        } => s.color[3],
+        } => s.color[3] * fade,
         _ => panic!("no stroke"),
     }
 }
 
 fn centre(p: &GameRenderPacket, i: usize) -> (f32, f32) {
-    match &p.draw_commands[i] {
+    match unfaded(&p.draw_commands[i]).1 {
         DrawCommand::Path { segments, .. } => match segments[0] {
             PathSegment::Arc { cx, cy, .. } => (cx, cy),
             _ => panic!("not an arc"),
@@ -300,7 +310,7 @@ fn resolving_scales_a_circle_about_the_origin_and_fades_its_stroke() {
     let at0 = p.resolved(0.0, true);
     assert!((radius(&at0, 0) - 12.0).abs() < 1e-3, "40 x 0.3");
     assert!((alpha(&at0, 0) - 0.4).abs() < 1e-3);
-    match &at0.draw_commands[0] {
+    match unfaded(&at0.draw_commands[0]).1 {
         DrawCommand::Path {
             segments,
             stroke: Some(s),
@@ -359,6 +369,7 @@ fn only_the_animated_range_changes() {
         vec![Animation {
             first: 1,
             end: 2,
+            path: Vec::new(),
             delay_ms: 0.0,
             ..pulse()
         }],
@@ -375,6 +386,7 @@ fn a_range_past_the_command_list_is_clamped_not_a_panic() {
         vec![Animation {
             first: 0,
             end: 9,
+            path: Vec::new(),
             delay_ms: 0.0,
             ..pulse()
         }],
@@ -385,6 +397,7 @@ fn a_range_past_the_command_list_is_clamped_not_a_panic() {
         vec![Animation {
             first: 5,
             end: 2,
+            path: Vec::new(),
             delay_ms: 0.0,
             ..pulse()
         }],
@@ -549,7 +562,7 @@ fn text_and_lines_scale_and_fade_with_the_group() {
     )
     .resolved(0.0, true)
     .into_owned();
-    match (&r.draw_commands[0], &r.draw_commands[1]) {
+    match (&r.draw_commands[0], unfaded(&r.draw_commands[1]).1) {
         (
             DrawCommand::Text {
                 size, pos, color, ..
@@ -641,13 +654,18 @@ fn affine_group_transform_carries_quad_sprite_and_constant_width_stroke() {
     let DrawCommand::Path {
         stroke: Some(stroke),
         ..
-    } = &commands[2]
+    } = unfaded(&commands[2]).1
     else {
         panic!("path stroke")
     };
     assert_eq!(stroke.width, 3.0);
     assert_eq!(stroke.dash, vec![2.0, 1.0]);
-    assert_eq!(stroke.color[3], 0.5);
+    assert_eq!(
+        unfaded(&commands[2]).0,
+        0.5,
+        "the fade rides outside the stroke"
+    );
+    assert_eq!(stroke.color[3], 1.0);
 }
 
 #[test]
@@ -794,6 +812,7 @@ fn entry(start_ms: f64, looping: bool) -> Animation {
     Animation {
         first: 0,
         end: 1,
+        path: Vec::new(),
         duration_ms: 1000.0,
         delay_ms: 0.0,
         iterations: if looping { None } else { Some(1) },
@@ -898,4 +917,299 @@ fn a_start_ms_fade_and_slide_plays_on_the_epoch_packet_and_others_stay_with_the_
             "keyframes": [{"at": 0, "opacity": 0}, {"at": 1, "opacity": 1}]})),
         "control: no duration"
     );
+}
+
+fn clip(commands: Vec<DrawCommand>) -> DrawCommand {
+    DrawCommand::ClipGroup {
+        clip: Vec::new(),
+        commands,
+    }
+}
+
+fn stroke_alpha(c: &DrawCommand) -> f32 {
+    let (fade, command) = unfaded(c);
+    match command {
+        DrawCommand::Path {
+            stroke: Some(s), ..
+        } => s.color[3] * fade,
+        other => panic!("no stroke: {other:?}"),
+    }
+}
+
+fn children(c: &DrawCommand) -> &[DrawCommand] {
+    match c {
+        DrawCommand::ClipGroup { commands, .. } => commands,
+        other => panic!("not a clip: {other:?}"),
+    }
+}
+
+#[test]
+fn a_fold_re_addresses_the_ranges_inside_it_and_leaves_those_before_it() {
+    let mut inside = Animation {
+        first: 3,
+        end: 5,
+        ..entry(0.0, false)
+    };
+    inside.folded_under(2);
+    assert_eq!(
+        (inside.first, inside.end, inside.path.clone()),
+        (1, 3, vec![2])
+    );
+    inside.folded_under(0);
+    assert_eq!(
+        (inside.first, inside.end, inside.path.clone()),
+        (1, 3, vec![0, 2]),
+        "an outer fold at the same start composes"
+    );
+    let mut before = Animation {
+        first: 1,
+        end: 2,
+        ..entry(0.0, false)
+    };
+    before.folded_under(2);
+    assert_eq!(
+        (before.first, before.end, before.path.is_empty()),
+        (1, 2, true),
+        "control: a range before the fold is untouched"
+    );
+}
+
+#[test]
+fn an_epoch_fade_in_a_clip_group_plays_only_its_own_command() {
+    let mut a = entry(5000.0, false);
+    a.first = 1;
+    a.end = 2;
+    a.path = vec![1];
+    let p = packet(
+        vec![circle(5.0), clip(vec![circle(10.0), circle(20.0)])],
+        vec![a],
+    );
+    let mid = p.resolved_at(0.0, 5500.0, true).into_owned();
+    let kids = children(&mid.draw_commands[1]);
+    assert_eq!(stroke_alpha(&kids[0]), 1.0, "its sibling in the clip rests");
+    assert!((stroke_alpha(&kids[1]) - 0.5).abs() < 1e-4, "halfway");
+    assert_eq!(alpha(&mid, 0), 1.0, "control: a command outside rests");
+    let end = p.resolved_at(0.0, 0.0, false).into_owned();
+    assert_eq!(
+        stroke_alpha(&children(&end.draw_commands[1])[1]),
+        1.0,
+        "no clock shows the end"
+    );
+}
+
+#[test]
+fn a_scroll_animation_under_nested_clips_moves_only_its_own_command() {
+    let mut a = scrolled(0.0, 100.0);
+    a.first = 1;
+    a.end = 2;
+    a.path = vec![0, 0];
+    let p = packet(
+        vec![clip(vec![clip(vec![circle(10.0), circle(20.0)])])],
+        vec![a],
+    );
+    let moved = p.resolved_at(0.0, 0.0, true).into_owned();
+    let inner = children(&children(&moved.draw_commands[0])[0]).to_vec();
+    assert_eq!(stroke_alpha(&inner[0]), 1.0, "the sibling is not animated");
+    assert_eq!(
+        stroke_alpha(&inner[1]),
+        0.0,
+        "at scroll 0 it holds its start"
+    );
+    let shifted = GameRenderPacket {
+        scroll: 100.0,
+        ..p.clone()
+    };
+    let end = shifted.resolved_at(0.0, 0.0, true).into_owned();
+    let inner = children(&children(&end.draw_commands[0])[0]).to_vec();
+    let y = |c: &DrawCommand| match unfaded(c).1 {
+        DrawCommand::Path { segments, .. } => match segments[0] {
+            PathSegment::Arc { cy, .. } => cy,
+            _ => panic!("arc"),
+        },
+        _ => panic!("path"),
+    };
+    assert_eq!(y(&inner[0]), 70.0, "the sibling stays");
+    assert_eq!(y(&inner[1]), 70.0, "scrolled to the end it rests");
+    let start = p.resolved_at(0.0, 0.0, true).into_owned();
+    let inner = children(&children(&start.draw_commands[0])[0]).to_vec();
+    assert_eq!(y(&inner[0]), 70.0);
+    assert_eq!(
+        y(&inner[1]),
+        110.0,
+        "at the start it sits 40 down: only it moves"
+    );
+}
+
+#[test]
+fn an_epoch_fade_on_one_shape_of_a_blend_leaves_the_other() {
+    let member = |x: f32| DrawCommand::Sdf {
+        kind: crate::packet::SdfKind::Ellipse,
+        rect: crate::packet::Rect {
+            x,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+        },
+        corners: [0.0; 4],
+        corner_kind: 0,
+        arc: [0.0; 3],
+        polygon: [0.0; 2],
+        fill: RED,
+        stroke: None,
+        shadow: None,
+        rotation: 0.0,
+        opacity: 1.0,
+        material: None,
+    };
+    let mut a = entry(5000.0, false);
+    a.first = 1;
+    a.end = 2;
+    a.path = vec![0];
+    let p = packet(
+        vec![DrawCommand::SdfBlend {
+            first: Box::new(member(0.0)),
+            second: Box::new(member(20.0)),
+            radius: 3.0,
+        }],
+        vec![a],
+    );
+    let mid = p.resolved_at(0.0, 5500.0, true).into_owned();
+    let DrawCommand::SdfBlend { first, second, .. } = &mid.draw_commands[0] else {
+        panic!("blend")
+    };
+    let opacity = |c: &DrawCommand| match c {
+        DrawCommand::Sdf { opacity, .. } => *opacity,
+        _ => panic!("sdf"),
+    };
+    assert_eq!(opacity(first), 1.0, "shape 0 rests");
+    assert!(opacity(second) < 1.0, "shape 1 fades");
+}
+
+fn fade(commands: &[DrawCommand], opacity: f32) -> Vec<DrawCommand> {
+    let mut out = commands.to_vec();
+    transform_group_commands(
+        &mut out,
+        Vec2 { x: 0.0, y: 0.0 },
+        Vec2 { x: 0.0, y: 0.0 },
+        1.0,
+        0.0,
+        opacity,
+    );
+    out
+}
+
+fn json(commands: &[DrawCommand]) -> serde_json::Value {
+    serde_json::to_value(commands).unwrap()
+}
+
+fn shadow_of(inner: DrawCommand) -> DrawCommand {
+    DrawCommand::Shadow {
+        commands: vec![inner],
+        color: [0.0, 1.0, 0.0, 0.8],
+        sigma: 6.0,
+    }
+}
+
+#[test]
+fn a_faded_shadow_keeps_its_colours_and_carries_the_opacity_outside() {
+    let shadow = shadow_of(circle(10.0));
+    match fade(std::slice::from_ref(&shadow), 0.5).as_slice() {
+        [DrawCommand::Faded { opacity, commands }] => {
+            assert_eq!(*opacity, 0.5);
+            assert_eq!(json(commands), json(std::slice::from_ref(&shadow)));
+        }
+        other => panic!("expected one Faded: {other:?}"),
+    }
+}
+
+#[test]
+fn faded_commands_nest_by_multiplying_and_unit_opacity_wraps_nothing() {
+    let shadow = shadow_of(circle(10.0));
+    let once = fade(std::slice::from_ref(&shadow), 0.5);
+    match fade(&once, 0.5).as_slice() {
+        [DrawCommand::Faded { opacity, commands }] => {
+            assert_eq!(*opacity, 0.25);
+            assert_eq!(json(commands), json(std::slice::from_ref(&shadow)));
+        }
+        other => panic!("expected one Faded: {other:?}"),
+    }
+    assert_eq!(
+        json(&fade(std::slice::from_ref(&shadow), 1.0)),
+        json(std::slice::from_ref(&shadow)),
+        "control: full opacity leaves the command alone"
+    );
+}
+
+#[test]
+fn a_faded_quad_keeps_the_cheap_colour_multiply() {
+    let quad = DrawCommand::Quad {
+        rect: crate::packet::Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 4.0,
+            h: 4.0,
+        },
+        color: RED,
+    };
+    match fade(&[quad], 0.5).as_slice() {
+        [DrawCommand::Quad { color, .. }] => assert_eq!(*color, [1.0, 0.0, 0.0, 0.5]),
+        other => panic!("expected the quad: {other:?}"),
+    }
+}
+
+#[test]
+fn faded_text_wraps_only_with_a_halo() {
+    let text = |halo| DrawCommand::Text {
+        text: "hi".into(),
+        pos: Vec2 { x: 1.0, y: 1.0 },
+        size: 12.0,
+        color: RED,
+        align: crate::packet::TextAlign::Left,
+        weight: Default::default(),
+        halo,
+        family: Default::default(),
+        color_runs: Vec::new(),
+        rotation: 0.0,
+    };
+    let halo = Some(Halo {
+        color: RED,
+        width: 2.0,
+    });
+    assert!(matches!(
+        fade(&[text(halo)], 0.5).as_slice(),
+        [DrawCommand::Faded { .. }]
+    ));
+    assert!(
+        matches!(fade(&[text(None)], 0.5).as_slice(), [DrawCommand::Text { color, .. }] if color[3] == 0.5),
+        "control: atlas-eligible text multiplies its colour"
+    );
+}
+
+#[test]
+fn a_faded_path_translates_inside_and_keeps_its_opacity() {
+    let path = DrawCommand::Path {
+        segments: vec![PathSegment::MoveTo { x: 1.0, y: 1.0 }],
+        fill: Some(RED),
+        stroke: None,
+    };
+    let mut out = vec![path];
+    transform_group_commands(
+        &mut out,
+        Vec2 { x: 0.0, y: 0.0 },
+        Vec2 { x: 5.0, y: 0.0 },
+        1.0,
+        0.0,
+        0.5,
+    );
+    match out.as_slice() {
+        [DrawCommand::Faded { opacity, commands }] => {
+            assert_eq!(*opacity, 0.5);
+            assert!(matches!(
+                commands.as_slice(),
+                [DrawCommand::Path { segments, fill: Some(c), .. }]
+                    if segments == &vec![PathSegment::MoveTo { x: 6.0, y: 1.0 }] && c[3] == 1.0
+            ));
+        }
+        other => panic!("{other:?}"),
+    }
 }

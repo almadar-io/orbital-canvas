@@ -47,6 +47,9 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     c = vec4<f32>(rgb * straight.a, straight.a);
     c = vec4<f32>(p.tint.rgb * p.tint.a, p.tint.a) + c * (1.0 - p.tint.a);
   }
+  if (p.b.w > 0.5 && c.a > 0.0) {
+    c = vec4<f32>(c.rgb / c.a, c.a);
+  }
   return c;
 }
 "#;
@@ -69,9 +72,13 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 /// The most taps either side of a pixel in one blur pass; a wider kernel widens the stride between taps.
 const MAX_TAPS: f32 = 32.0;
 
-/// Taps per side and the stride between them (texels) for a Gaussian of `sigma` physical pixels.
-pub(crate) fn kernel(sigma: f32) -> (u32, f32) {
-    let radius = (3.0 * sigma.max(0.0)).ceil();
+/// Sigmas a backdrop blur's kernel reaches either side of a pixel.
+pub(crate) const BACKDROP_REACH: f32 = 3.0;
+
+/// Taps per side and the stride between them (texels) for a Gaussian of `sigma` physical pixels, cut off `reach`
+/// sigmas from the pixel.
+pub(crate) fn kernel(sigma: f32, reach: f32) -> (u32, f32) {
+    let radius = (reach * sigma.max(0.0)).ceil();
     if radius > MAX_TAPS {
         (MAX_TAPS as u32, radius / MAX_TAPS)
     } else {
@@ -108,9 +115,13 @@ pub(crate) struct BackdropJob {
     pub(crate) a: wgpu::Texture,
     pub(crate) b: wgpu::Texture,
     pub(crate) sigma: f32,
+    /// Sigmas the kernel reaches either side of a pixel.
+    pub(crate) reach: f32,
     pub(crate) saturate: f32,
     pub(crate) tint: Option<[f32; 4]>,
     pub(crate) region: [u32; 4],
+    /// The last pass writes straight alpha instead of premultiplied (a layer drawn through the sprite pipelines).
+    pub(crate) straight_output: bool,
 }
 
 /// The frame texture and the two blur textures of one size and format, reused across frames.
@@ -284,7 +295,7 @@ impl BlurPass {
         scissor: [u32; 4],
         kept: &mut Vec<wgpu::Buffer>,
     ) {
-        let (taps, stride) = kernel(job.sigma);
+        let (taps, stride) = kernel(job.sigma, job.reach);
         let tint = job.tint.unwrap_or([0.0; 4]);
         let params: [f32; 12] = [
             direction.0 / src.width() as f32,
@@ -294,7 +305,11 @@ impl BlurPass {
             stride,
             job.saturate,
             if last { 1.0 } else { 0.0 },
-            0.0,
+            if last && job.straight_output {
+                1.0
+            } else {
+                0.0
+            },
             tint[0],
             tint[1],
             tint[2],
@@ -356,7 +371,7 @@ impl BlurPass {
         job: &BackdropJob,
         kept: &mut Vec<wgpu::Buffer>,
     ) {
-        let (taps, stride) = kernel(job.sigma);
+        let (taps, stride) = kernel(job.sigma, job.reach);
         let reach = (taps as f32 * stride).ceil() as u32 + 1;
         let [x, y, w, h] = job.region;
         let top = y.saturating_sub(reach);
@@ -431,9 +446,9 @@ mod tests {
 
     #[test]
     fn the_kernel_reaches_three_sigma_and_a_wide_one_strides_instead_of_adding_taps() {
-        assert_eq!(kernel(0.0), (0, 1.0), "no blur is one tap");
-        assert_eq!(kernel(4.0), (12, 1.0));
-        let (taps, stride) = kernel(100.0);
+        assert_eq!(kernel(0.0, BACKDROP_REACH), (0, 1.0), "no blur is one tap");
+        assert_eq!(kernel(4.0, BACKDROP_REACH), (12, 1.0));
+        let (taps, stride) = kernel(100.0, BACKDROP_REACH);
         assert_eq!(taps, 32);
         assert!(
             (taps as f32 * stride - 300.0).abs() < 0.01,

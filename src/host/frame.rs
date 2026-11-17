@@ -64,12 +64,12 @@ impl SceneHost {
                     .as_ref()
                     .is_some_and(|p| p.epoch_live(self.epoch_clock_ms)))
             || (self.motion && (!self.springs.settled() || self.live_material))
+            || (self.motion && self.epoch_clock_ms > 0.0 && !self.live_scenes3d.is_empty())
             || (self.motion
                 && self.epoch_clock_ms > 0.0
-                && self
-                    .scene
-                    .as_ref()
-                    .is_some_and(mappers::game_canvas_2d::has_active_fx))
+                && self.scene.as_ref().is_some_and(|scene| {
+                    mappers::game_canvas_2d::active_fx_live(scene, self.epoch_clock_ms)
+                }))
             || (self.motion
                 && self.epoch_clock_ms > 0.0
                 && self
@@ -92,6 +92,19 @@ impl SceneHost {
 
     /// The current packet as it draws at the clock's scene time.
     pub fn frame_packet(&self) -> Option<GameRenderPacket> {
+        let mut packet = self.mapped_frame_packet()?;
+        if self.motion && self.epoch_clock_ms > 0.0 {
+            for live in &self.live_scenes3d {
+                let Ok(scene) = live.scene_at(self.epoch_clock_ms) else {
+                    continue;
+                };
+                replace_target_scene(&mut packet.draw_commands, &live.id, scene);
+            }
+        }
+        Some(packet)
+    }
+
+    fn mapped_frame_packet(&self) -> Option<GameRenderPacket> {
         if self.motion && self.epoch_clock_ms > 0.0 {
             if let Some(scene) = self.scene.as_ref().filter(|scene| {
                 (mappers::game_canvas_2d::has_active_fx(scene)
@@ -103,7 +116,7 @@ impl SceneHost {
                         Some("canvas" | "canvas-2d")
                     )
             }) {
-                let live = mappers::game_canvas_2d::has_active_fx(scene)
+                let live = mappers::game_canvas_2d::active_fx_live(scene, self.epoch_clock_ms)
                     || mappers::emitter::any_live(scene, self.epoch_clock_ms)
                     || mappers::text_reveal::any_live(scene, self.epoch_clock_ms)
                     || mappers::game_canvas_2d::started_animation_live(scene, self.epoch_clock_ms);
@@ -178,4 +191,49 @@ impl SceneHost {
         self.asset_generation = asset::generation();
         self.relayout();
     }
+}
+
+/// Put `scene` in the render target `id`, wherever the command tree holds it.
+fn replace_target_scene(
+    commands: &mut [DrawCommand],
+    id: &str,
+    scene: orbital_canvas_base::scene3d::Scene3D,
+) -> bool {
+    let mut scene = Some(scene);
+    replace_in(commands, id, &mut scene)
+}
+
+fn replace_in(
+    commands: &mut [DrawCommand],
+    id: &str,
+    scene: &mut Option<orbital_canvas_base::scene3d::Scene3D>,
+) -> bool {
+    for command in commands {
+        match command {
+            DrawCommand::Target {
+                id: target,
+                commands,
+                ..
+            } if target == id => {
+                let Some(scene) = scene.take() else {
+                    return true;
+                };
+                *commands = vec![DrawCommand::Scene3D {
+                    scene: Box::new(scene),
+                }];
+                return true;
+            }
+            DrawCommand::Target { commands, .. }
+            | DrawCommand::Shadow { commands, .. }
+            | DrawCommand::AdditiveGroup { commands }
+            | DrawCommand::Faded { commands, .. }
+            | DrawCommand::ClipGroup { commands, .. } => {
+                if replace_in(commands, id, scene) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }

@@ -23,14 +23,13 @@ pub(super) fn paint_scene3d_gathering(
     out: &mut Vec<DrawCommand>,
 ) -> Result<(), CanvasSceneError> {
     let start = out.len();
-    let anonymous = gathered.scene3d_count;
     paint_scene3d(
         node,
         projector,
         to_screen,
         zoom,
         epoch_now_ms,
-        anonymous,
+        gathered,
         out,
     )?;
     if out.len() == start {
@@ -64,7 +63,7 @@ fn paint_scene3d(
     to_screen: &dyn Fn(f32, f32) -> (f32, f32),
     zoom: f32,
     epoch_now_ms: f64,
-    anonymous: usize,
+    gathered: &mut Gathered,
     out: &mut Vec<DrawCommand>,
 ) -> Result<(), CanvasSceneError> {
     let Some(position) = node.get("position").and_then(parse_scene_pos) else {
@@ -124,27 +123,20 @@ fn paint_scene3d(
         .or_insert_with(|| Value::String("3d".into()));
     canvas.entry("showGrid").or_insert(Value::Bool(false));
     let canvas = Value::Object(canvas);
-    let theme = SceneTheme::default();
-    let mut scene3d = if epoch_now_ms > 0.0 {
-        scene_from_canvas_node_at_epoch(
-            &canvas,
-            rest.w,
-            rest.h,
-            &theme,
-            epoch_now_ms,
-            epoch_now_ms,
-        )?
-    } else {
-        scene_from_canvas_node_themed(&canvas, rest.w, rest.h, &theme)?
-    };
-    if scene3d.time != 0.0 {
-        scene3d.time = (epoch_now_ms.rem_euclid(SHADER_CLOCK_PERIOD_MS) / 1000.0) as f32;
-    }
-
     let id = match node.get("id").and_then(Value::as_str) {
         Some(id) => format!("scene3d:{id}"),
-        None => format!("scene3d:#{anonymous}"),
+        None => format!("scene3d:#{}", gathered.scene3d_count),
     };
+    let recipe = LiveScene3d {
+        id: id.clone(),
+        canvas,
+        width: rest.w,
+        height: rest.h,
+    };
+    let scene3d = recipe.scene_at(epoch_now_ms)?;
+    if node.get("scene").is_some_and(scene_moves) {
+        gathered.live_scenes3d.push(recipe);
+    }
     let pixels = |extent: f32| ((f64::from(extent) * ratio).ceil() as u32).max(1);
     out.push(DrawCommand::Target {
         id: id.clone(),
@@ -179,5 +171,42 @@ pub(super) fn scene_moves(scene: &Value) -> bool {
                 || fields.values().any(scene_moves)
         }
         _ => false,
+    }
+}
+
+/// What rebuilds one embedded 3D scene at another clock: the prepared scene node the 3D mapper reads and the rect
+/// it is laid out in. A host re-maps just this for a frame, never the page around it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveScene3d {
+    /// The id of the [`DrawCommand::Target`] holding the scene.
+    pub id: String,
+    canvas: Value,
+    width: f32,
+    height: f32,
+}
+
+impl LiveScene3d {
+    /// The scene as it draws at an epoch paint clock; zero is the rest pose.
+    pub fn scene_at(
+        &self,
+        epoch_now_ms: f64,
+    ) -> Result<orbital_canvas_base::scene3d::Scene3D, CanvasSceneError> {
+        let theme = SceneTheme::default();
+        let mut scene3d = if epoch_now_ms > 0.0 {
+            scene_from_canvas_node_at_epoch(
+                &self.canvas,
+                self.width,
+                self.height,
+                &theme,
+                epoch_now_ms,
+                epoch_now_ms,
+            )?
+        } else {
+            scene_from_canvas_node_themed(&self.canvas, self.width, self.height, &theme)?
+        };
+        if scene3d.time != 0.0 {
+            scene3d.time = (epoch_now_ms.rem_euclid(SHADER_CLOCK_PERIOD_MS) / 1000.0) as f32;
+        }
+        Ok(scene3d)
     }
 }

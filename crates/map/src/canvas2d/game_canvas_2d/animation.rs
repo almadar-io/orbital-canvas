@@ -147,6 +147,7 @@ pub(super) fn packet_animation(
     Ok(Some(orbital_canvas_base::packet::Animation {
         first: 0,
         end: 0,
+        path: Vec::new(),
         duration_ms,
         delay_ms: 0.0,
         iterations,
@@ -169,17 +170,18 @@ pub(super) fn has_start(animation: &Value) -> bool {
 /// The `startMs` animations under `node` the mapper plays at the epoch clock: every one but those the packet plays
 /// ([`epoch_animation`]), which need no re-map.
 pub(super) fn started_animations(node: &Value, f: &mut dyn FnMut(&Value)) {
-    started_animations_in(node, false, f);
+    started_animations_in(node, f);
 }
 
-fn started_animations_in(node: &Value, folded: bool, f: &mut dyn FnMut(&Value)) {
+fn started_animations_in(node: &Value, f: &mut dyn FnMut(&Value)) {
     if matches!(
         node.get("type").and_then(Value::as_str),
         Some("draw-shape" | "draw-group" | "draw-text" | "draw-scene3d")
     ) {
-        if let Some(animation) = node.get("animation").filter(|a| {
-            has_start(a) && (folded || !orbital_canvas_base::animate::plays_on_epoch_packet(a))
-        }) {
+        if let Some(animation) = node
+            .get("animation")
+            .filter(|a| has_start(a) && !orbital_canvas_base::animate::plays_on_epoch_packet(a))
+        {
             let plays = animation
                 .get("durationMs")
                 .and_then(Value::as_f64)
@@ -193,14 +195,10 @@ fn started_animations_in(node: &Value, folded: bool, f: &mut dyn FnMut(&Value)) 
             }
         }
     }
-    let folded = folded
-        || (node.get("type").and_then(Value::as_str) == Some("draw-group") && folds_children(node));
     for key in ["props", "drawables", "children", "items"] {
         match node.get(key) {
-            Some(Value::Array(items)) => items
-                .iter()
-                .for_each(|i| started_animations_in(i, folded, f)),
-            Some(child @ Value::Object(_)) => started_animations_in(child, folded, f),
+            Some(Value::Array(items)) => items.iter().for_each(|i| started_animations_in(i, f)),
+            Some(child @ Value::Object(_)) => started_animations_in(child, f),
             _ => {}
         }
     }
@@ -249,6 +247,7 @@ pub(super) fn epoch_animation(
     Some(orbital_canvas_base::packet::Animation {
         first: 0,
         end: 0,
+        path: Vec::new(),
         duration_ms,
         delay_ms: 0.0,
         iterations: (!looping).then_some(1),
@@ -314,6 +313,16 @@ pub fn started_animation_live(node: &Value, epoch_now_ms: f64) -> bool {
 /// A live world FX layer needs the host's paint clock even when no authored
 /// packet keyframe animation is present.
 pub fn has_active_fx(node: &Value) -> bool {
+    fx(node, None)
+}
+
+/// [`has_active_fx`] at the epoch clock `epoch_now_ms`: a drawable paint-clock animation that does not loop counts only
+/// while that clock is inside its duration (on a browser's epoch clock it has long finished and shows its end).
+pub fn active_fx_live(node: &Value, epoch_now_ms: f64) -> bool {
+    fx(node, Some(epoch_now_ms))
+}
+
+fn fx(node: &Value, clock: Option<f64>) -> bool {
     let animated_sprite = |sprite: &Value| {
         sprite.get("animation").and_then(Value::as_str).is_some()
             && sprite
@@ -346,17 +355,16 @@ pub fn has_active_fx(node: &Value) -> bool {
             && animation
                 .get("durationMs")
                 .and_then(Value::as_f64)
-                .is_some_and(|v| v > 0.0)
+                .is_some_and(|v| {
+                    v > 0.0
+                        && (animation.get("loop").and_then(Value::as_bool) != Some(false)
+                            || clock.is_none_or(|now| now < v))
+                })
             && animation
                 .get("keyframes")
                 .and_then(Value::as_array)
                 .is_some_and(|v| !v.is_empty())
     }) {
-        return true;
-    }
-    if node.get("type").and_then(Value::as_str) == Some("draw-scene3d")
-        && node.get("scene").is_some_and(scene_moves)
-    {
         return true;
     }
     if node
@@ -377,8 +385,8 @@ pub fn has_active_fx(node: &Value) -> bool {
         .into_iter()
         .filter_map(|key| node.get(key))
         .any(|child| match child {
-            Value::Array(items) => items.iter().any(has_active_fx),
-            Value::Object(_) => has_active_fx(child),
+            Value::Array(items) => items.iter().any(|item| fx(item, clock)),
+            Value::Object(_) => fx(child, clock),
             _ => false,
         })
 }

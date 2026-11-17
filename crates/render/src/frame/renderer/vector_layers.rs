@@ -13,6 +13,10 @@ pub(super) const VECTOR_LAYER_TARGETS: usize = 3;
 /// run scrolling across the edge keeps one layer.
 const WHOLE_RUN_TARGETS: u64 = 2;
 
+/// A run's sub-pixel phase snaps to this many steps per device pixel, so a run drifting by fractions of a pixel
+/// reuses one of a few cached layers instead of re-rasterizing every frame.
+const PHASE_STEPS: f32 = 4.0;
+
 impl SharedDeviceRenderer {
     /// Rasterize a run of consecutive vector commands (paths, lines, text) into
     /// a texture the size of the run's box ([`orbital_canvas_paint::vector::run_bounds`]) and
@@ -37,10 +41,50 @@ impl SharedDeviceRenderer {
         draws: &mut Vec<Draw>,
         additive: bool,
     ) {
+        self.flush_vector_run_faded(run, packet, target, draws, additive, 1.0);
+    }
+
+    /// [`Self::flush_vector_run`] drawn at `opacity`; the opacity is not part of the layer's cache key.
+    pub(super) fn flush_vector_run_faded(
+        &mut self,
+        run: &mut Vec<&DrawCommand>,
+        packet: &GameRenderPacket,
+        target: &wgpu::Texture,
+        draws: &mut Vec<Draw>,
+        additive: bool,
+        opacity: f32,
+    ) {
         if run.is_empty() {
             return;
         }
         let commands = std::mem::take(run);
+        if commands.len() > 1
+            && commands
+                .iter()
+                .any(|command| orbital_canvas_paint::vector::is_blur(command))
+        {
+            let mut segment: Vec<&DrawCommand> = Vec::new();
+            for command in commands {
+                if orbital_canvas_paint::vector::is_blur(command) {
+                    self.flush_vector_run_faded(
+                        &mut segment,
+                        packet,
+                        target,
+                        draws,
+                        additive,
+                        opacity,
+                    );
+                    let mut alone = vec![command];
+                    self.flush_vector_run_faded(
+                        &mut alone, packet, target, draws, additive, opacity,
+                    );
+                } else {
+                    segment.push(command);
+                }
+            }
+            self.flush_vector_run_faded(&mut segment, packet, target, draws, additive, opacity);
+            return;
+        }
         let (tw, th) = (target.width(), target.height());
         let max_dim = self.device.limits().max_texture_dimension_2d;
         if tw > max_dim || th > max_dim {
@@ -51,16 +95,19 @@ impl SharedDeviceRenderer {
         let height = packet.height.max(1.0);
         let sx = tw as f32 / width;
         let sy = th as f32 / height;
+        let mut shift = (0.0_f32, 0.0_f32);
         let (px0, py0, px1, py1): (i64, i64, i64, i64) =
             match orbital_canvas_paint::vector::run_bounds(&commands) {
                 orbital_canvas_paint::vector::RunBounds::Empty => return,
                 orbital_canvas_paint::vector::RunBounds::Anywhere => (0, 0, tw as i64, th as i64),
                 orbital_canvas_paint::vector::RunBounds::Box { x0, y0, x1, y1 } => {
+                    let snap = |v: f32| (v * PHASE_STEPS).round() / PHASE_STEPS - v;
+                    shift = (snap(x0 * sx), snap(y0 * sy));
                     let whole = (
-                        (x0 * sx).floor() as i64,
-                        (y0 * sy).floor() as i64,
-                        (x1 * sx).ceil() as i64,
-                        (y1 * sy).ceil() as i64,
+                        (x0 * sx + shift.0).floor() as i64,
+                        (y0 * sy + shift.1).floor() as i64,
+                        (x1 * sx + shift.0).ceil() as i64,
+                        (y1 * sy + shift.1).ceil() as i64,
                     );
                     let (ww, wh) = (whole.2 - whole.0, whole.3 - whole.1);
                     let fits = ww <= max_dim as i64
@@ -89,6 +136,7 @@ impl SharedDeviceRenderer {
         }
         let (lw, lh) = ((px1 - px0) as u32, (py1 - py0) as u32);
         let (ox, oy) = (px0 as f32 / sx, py0 as f32 / sy);
+        let (rx, ry) = (ox - shift.0 / sx, oy - shift.1 / sy);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&(sx.to_bits(), sy.to_bits()), &mut hasher);
         if commands
@@ -108,7 +156,7 @@ impl SharedDeviceRenderer {
         }
         if let Err(err) = orbital_canvas_base::targets::hash_commands_from(
             commands.iter().copied(),
-            Vec2 { x: ox, y: oy },
+            Vec2 { x: rx, y: ry },
             &mut hasher,
         ) {
             tracing::warn!(target: "almadar::game_renderer", error = %err, "vector command not serializable — skipped");
@@ -126,13 +174,17 @@ impl SharedDeviceRenderer {
         if let Some(sprite) = self.sprites.get_mut(&key) {
             sprite.last_used = now;
         } else {
-            let Some(rgba) =
-                orbital_canvas_paint::vector::rasterize_box(&commands, lw, lh, sx, sy, ox, oy)
-            else {
+            let sprite = match commands.as_slice() {
+                [command] if orbital_canvas_paint::vector::is_blur(command) => {
+                    self.blurred_layer(command, lw, lh, (sx, sy), (rx, ry), now)
+                }
+                _ => orbital_canvas_paint::vector::rasterize_box(&commands, lw, lh, sx, sy, rx, ry)
+                    .map(|rgba| self.upload_rgba(&rgba, lw, lh, now)),
+            };
+            let Some(sprite) = sprite else {
                 tracing::warn!(target: "almadar::game_renderer", lw, lh, "vector layer surface not allocatable — skipped");
                 return;
             };
-            let sprite = self.upload_rgba(&rgba, lw, lh, now);
             self.sprites.insert(key.clone(), sprite);
             self.evict_stale_vector_layers(VECTOR_LAYER_TARGETS * tw as usize * th as usize * 4);
         }
@@ -151,7 +203,7 @@ impl SharedDeviceRenderer {
             },
             (lw, lh),
             0.0,
-            1.0,
+            opacity,
             (false, false),
             None,
             (width as u32, height as u32),

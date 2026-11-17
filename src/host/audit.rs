@@ -70,6 +70,10 @@ fn bare(commands: &[DrawCommand], texts: &mut Vec<TextProbe>, audited: bool) -> 
             DrawCommand::AdditiveGroup { commands } => kept.push(DrawCommand::AdditiveGroup {
                 commands: bare(commands, texts, audited),
             }),
+            DrawCommand::Faded { opacity, commands } => kept.push(DrawCommand::Faded {
+                opacity: *opacity,
+                commands: bare(commands, texts, audited),
+            }),
             DrawCommand::Shadow {
                 commands,
                 color,

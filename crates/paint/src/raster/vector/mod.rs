@@ -99,72 +99,8 @@ fn draw_command(pixmap: &mut Pixmap, command: &DrawCommand, ts: Transform) {
             };
             pixmap.fill_path(&path, &paint, FillRule::Winding, ts, None);
         }
-        DrawCommand::Blurred { command, radius } => {
-            let (width, height) = (pixmap.width(), pixmap.height());
-            let Some(mut layer) = Pixmap::new(width, height) else {
-                return;
-            };
-            draw_command(&mut layer, command, ts);
-            let Some(image) = image::RgbaImage::from_raw(width, height, layer.take()) else {
-                return;
-            };
-            let sigma = radius.max(0.0) * (ts.sx.abs() + ts.sy.abs()) / 2.0;
-            let blurred = image::imageops::blur(&image, sigma);
-            let Some(size) = tiny_skia::IntSize::from_wh(width, height) else {
-                return;
-            };
-            let Some(result) = Pixmap::from_vec(blurred.into_raw(), size) else {
-                return;
-            };
-            pixmap.draw_pixmap(
-                0,
-                0,
-                result.as_ref(),
-                &tiny_skia::PixmapPaint::default(),
-                Transform::identity(),
-                None,
-            );
-        }
-        DrawCommand::Shadow {
-            commands,
-            color,
-            sigma,
-        } => {
-            let (width, height) = (pixmap.width(), pixmap.height());
-            let Some(mut layer) = Pixmap::new(width, height) else {
-                return;
-            };
-            for command in commands {
-                draw_command(&mut layer, command, ts);
-            }
-            let tint = color.map(|c| c.clamp(0.0, 1.0));
-            let mut coverage = layer.take();
-            for px in coverage.chunks_exact_mut(4) {
-                let a = f32::from(px[3]) / 255.0 * tint[3];
-                for (channel, c) in px.iter_mut().zip(tint) {
-                    *channel = (c * a * 255.0).round() as u8;
-                }
-                px[3] = (a * 255.0).round() as u8;
-            }
-            let Some(image) = image::RgbaImage::from_raw(width, height, coverage) else {
-                return;
-            };
-            let sigma = sigma.max(0.0) * (ts.sx.abs() + ts.sy.abs()) / 2.0;
-            let blurred = image::imageops::blur(&image, sigma);
-            let Some(size) = tiny_skia::IntSize::from_wh(width, height) else {
-                return;
-            };
-            let Some(result) = Pixmap::from_vec(blurred.into_raw(), size) else {
-                return;
-            };
-            pixmap.draw_pixmap(
-                0,
-                0,
-                result.as_ref(),
-                &tiny_skia::PixmapPaint::default(),
-                Transform::identity(),
-                None,
-            );
+        DrawCommand::Blurred { .. } | DrawCommand::Shadow { .. } => {
+            blur_onto(pixmap, command, ts);
         }
         DrawCommand::ClippedPath {
             segments,
@@ -256,6 +192,111 @@ fn draw_command(pixmap: &mut Pixmap, command: &DrawCommand, ts: Transform) {
         }
         _ => {}
     }
+}
+
+/// The unblurred premultiplied coverage of a `Blurred` or `Shadow` command over a `width` x `height` surface, and
+/// its blur sigma in device pixels; `None` for any other command or a surface that cannot be allocated.
+fn blur_input(
+    width: u32,
+    height: u32,
+    command: &DrawCommand,
+    ts: Transform,
+) -> Option<(Vec<u8>, f32)> {
+    let mut layer = Pixmap::new(width, height)?;
+    let (spread, tint) = match command {
+        DrawCommand::Blurred { command, radius } => {
+            draw_command(&mut layer, command, ts);
+            (*radius, None)
+        }
+        DrawCommand::Shadow {
+            commands,
+            color,
+            sigma,
+        } => {
+            for command in commands {
+                draw_command(&mut layer, command, ts);
+            }
+            (*sigma, Some(color.map(|c| c.clamp(0.0, 1.0))))
+        }
+        _ => return None,
+    };
+    let mut coverage = layer.take();
+    if let Some(tint) = tint {
+        for px in coverage.chunks_exact_mut(4) {
+            let a = f32::from(px[3]) / 255.0 * tint[3];
+            for (channel, c) in px.iter_mut().zip(tint) {
+                *channel = (c * a * 255.0).round() as u8;
+            }
+            px[3] = (a * 255.0).round() as u8;
+        }
+    }
+    Some((
+        coverage,
+        spread.max(0.0) * (ts.sx.abs() + ts.sy.abs()) / 2.0,
+    ))
+}
+
+fn blur_onto(pixmap: &mut Pixmap, command: &DrawCommand, ts: Transform) {
+    let (width, height) = (pixmap.width(), pixmap.height());
+    let Some((coverage, sigma)) = blur_input(width, height, command, ts) else {
+        return;
+    };
+    let Some(image) = image::RgbaImage::from_raw(width, height, coverage) else {
+        return;
+    };
+    let blurred = if sigma > 0.0 {
+        image::imageops::blur(&image, sigma)
+    } else {
+        image
+    };
+    let Some(size) = tiny_skia::IntSize::from_wh(width, height) else {
+        return;
+    };
+    let Some(result) = Pixmap::from_vec(blurred.into_raw(), size) else {
+        return;
+    };
+    pixmap.draw_pixmap(
+        0,
+        0,
+        result.as_ref(),
+        &tiny_skia::PixmapPaint::default(),
+        Transform::identity(),
+        None,
+    );
+}
+
+/// Sigmas the CPU blur's kernel reaches either side of a pixel (the `image` crate cuts its Gaussian at 2 sigma); a
+/// GPU blur that cuts at the same reach draws the same layer.
+pub const BLUR_REACH: f32 = 2.0;
+
+/// What a GPU blur starts from: premultiplied RGBA8 coverage and the blur sigma in device pixels.
+pub struct BlurInput {
+    pub rgba: Vec<u8>,
+    pub sigma: f32,
+}
+
+/// [`rasterize_box`] of a `Blurred` or `Shadow` command without its blur, for a GPU pass to blur; the CPU draw
+/// uses the same coverage and sigma. `None` for any other command.
+pub fn rasterize_blur_input(
+    command: &DrawCommand,
+    px_w: u32,
+    px_h: u32,
+    sx: f32,
+    sy: f32,
+    ox: f32,
+    oy: f32,
+) -> Option<BlurInput> {
+    let ts = Transform::from_scale(sx, sy).pre_translate(-ox, -oy);
+    let (rgba, sigma) = blur_input(px_w.max(1), px_h.max(1), command, ts)?;
+    Some(BlurInput { rgba, sigma })
+}
+
+/// Whether `command` is a blur ([`rasterize_blur_input`] applies).
+pub fn is_blur(command: &DrawCommand) -> bool {
+    matches!(
+        command,
+        DrawCommand::Blurred { .. } | DrawCommand::Shadow { .. }
+    )
 }
 
 /// Coverage where every `clip` path covers (all pixels when there is none) and no `cut` path does.

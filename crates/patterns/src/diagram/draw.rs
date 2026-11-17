@@ -460,6 +460,7 @@ impl<'a> Pen<'a> {
         self.animations.push(Animation {
             first,
             end,
+            path: Vec::new(),
             duration_ms: motion.duration_ms,
             delay_ms: motion.delay_ms,
             iterations: motion.iterations,

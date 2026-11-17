@@ -214,6 +214,8 @@ pub struct MappedScene {
     pub text_hits: Vec<TextHit>,
     /// The semantic tree, in reading order (`order`, then paint order).
     pub semantic_nodes: Vec<SemanticNode>,
+    /// Embedded 3D scenes that play by themselves; a host re-maps each alone per frame.
+    pub live_scenes3d: Vec<crate::game_canvas_2d::LiveScene3d>,
 }
 
 impl MappedScene {

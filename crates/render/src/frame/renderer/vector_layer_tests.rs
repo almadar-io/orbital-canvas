@@ -843,7 +843,7 @@ fn a_run_moved_by_whole_pixels_reuses_its_layer() {
     assert_eq!(
         r.vector_layer_count(),
         2,
-        "control: a sub-pixel move rasterizes anew"
+        "control: a half-pixel move is another quantized phase"
     );
 }
 
@@ -957,4 +957,315 @@ fn clip_layers_are_kept_across_frames_one_per_group_in_a_frame() {
     assert_eq!(px(&rgba, 16, 1, 1), [255, 0, 0, 255]);
     assert_eq!(px(&rgba, 16, 9, 9), [255, 0, 0, 255]);
     assert_eq!(px(&rgba, 16, 6, 6)[3], 0);
+}
+
+#[test]
+fn a_run_moved_by_a_fraction_of_a_pixel_reuses_its_quantized_layer() {
+    let Some(mut r) = renderer() else { return };
+    let _font = orbital_canvas_paint::vector::FONT_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _ = draw(&mut r, &packet(vec![filled(4.0, RED)]), 16);
+    let _ = draw(&mut r, &packet(vec![filled(4.1, RED)]), 16);
+    assert_eq!(
+        r.vector_layer_count(),
+        1,
+        "a 0.1 px move snaps to the same quarter-pixel phase"
+    );
+    let _ = draw(&mut r, &packet(vec![filled(4.3, RED)]), 16);
+    assert_eq!(
+        r.vector_layer_count(),
+        2,
+        "a 0.3 px move is at most one more layer"
+    );
+    let _ = draw(&mut r, &packet(vec![filled(4.35, RED)]), 16);
+    assert_eq!(r.vector_layer_count(), 2, "and 0.35 shares its phase");
+    let _ = draw(&mut r, &packet(vec![filled(4.0, BLUE)]), 16);
+    assert_eq!(
+        r.vector_layer_count(),
+        3,
+        "control: a different shape still adds a layer"
+    );
+}
+
+#[test]
+fn quantized_placement_stays_within_an_eighth_of_a_pixel() {
+    let Some(mut r) = renderer() else { return };
+    let _font = orbital_canvas_paint::vector::FONT_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(snapped) = draw(&mut r, &packet(vec![filled(4.1, RED)]), 16) else {
+        return;
+    };
+    assert_eq!(
+        px(&snapped, 16, 4, 8),
+        [255, 0, 0, 255],
+        "edge snapped to 4.0"
+    );
+    assert_eq!(px(&snapped, 16, 3, 8)[3], 0, "nothing left of the edge");
+    let Some(moved) = draw(&mut r, &packet(vec![filled(4.3, RED)]), 16) else {
+        return;
+    };
+    let coverage = px(&moved, 16, 4, 8)[3] as f32 / 255.0;
+    assert!(
+        (coverage - 0.7).abs() <= 0.125 + 0.01,
+        "edge column coverage {coverage} is within 1/8 px of the true 0.7"
+    );
+    assert_eq!(
+        px(&moved, 16, 3, 8)[3],
+        0,
+        "control: still nothing left of it"
+    );
+}
+
+fn faded(opacity: f32, commands: Vec<DrawCommand>) -> DrawCommand {
+    DrawCommand::Faded { opacity, commands }
+}
+
+fn glow(x: f32) -> DrawCommand {
+    DrawCommand::Shadow {
+        commands: vec![filled(x, RED)],
+        color: [1.0, 0.0, 0.0, 1.0],
+        sigma: 1.0,
+    }
+}
+
+#[test]
+fn a_blurred_path_fading_over_five_frames_rasterizes_its_layer_once() {
+    let Some(mut r) = renderer() else { return };
+    let _font = orbital_canvas_paint::vector::FONT_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut centre = Vec::new();
+    for step in 1..=5 {
+        let opacity = step as f32 / 10.0;
+        let Some(rgba) = draw(&mut r, &packet(vec![faded(opacity, vec![glow(4.0)])]), 16) else {
+            return;
+        };
+        centre.push(px(&rgba, 16, 8, 8)[3] as f32 / 255.0);
+        assert_eq!(r.vector_layer_count(), 1, "frame {step} reuses the layer");
+    }
+    for (step, alpha) in centre.iter().enumerate() {
+        let want = (step + 1) as f32 / 10.0;
+        assert!(
+            (alpha - want).abs() < 0.06,
+            "step {step}: {alpha} vs {want}"
+        );
+    }
+}
+
+#[test]
+fn control_an_unanimated_path_and_a_changed_one_keep_their_layers() {
+    let Some(mut r) = renderer() else { return };
+    let _font = orbital_canvas_paint::vector::FONT_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(rgba) = draw(&mut r, &packet(vec![glow(4.0)]), 16) else {
+        return;
+    };
+    assert_eq!(px(&rgba, 16, 8, 8)[3], 255, "an unfaded layer is opaque");
+    let _ = draw(&mut r, &packet(vec![faded(0.5, vec![glow(4.0)])]), 16);
+    assert_eq!(r.vector_layer_count(), 1, "the fade shares the plain layer");
+    let _ = draw(
+        &mut r,
+        &packet(vec![faded(0.5, vec![filled(4.0, BLUE)])]),
+        16,
+    );
+    assert_eq!(
+        r.vector_layer_count(),
+        2,
+        "different content is a new layer"
+    );
+}
+
+#[test]
+fn a_faded_run_keeps_z_order_between_quads() {
+    let Some(mut r) = renderer() else { return };
+    let quad = |color| DrawCommand::Quad {
+        rect: Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 16.0,
+            h: 16.0,
+        },
+        color,
+    };
+    let Some(over) = draw(
+        &mut r,
+        &packet(vec![quad(BLUE), faded(1.0, vec![filled(4.0, RED)])]),
+        16,
+    ) else {
+        return;
+    };
+    assert_eq!(px(&over, 16, 8, 8), [255, 0, 0, 255]);
+    let under = draw(
+        &mut r,
+        &packet(vec![faded(1.0, vec![filled(4.0, RED)]), quad(BLUE)]),
+        16,
+    )
+    .unwrap();
+    assert_eq!(
+        px(&under, 16, 8, 8),
+        [0, 0, 255, 255],
+        "control: quad on top"
+    );
+}
+
+const GLOW_PX: u32 = 32;
+
+fn premultiplied(straight: &[u8]) -> Vec<u8> {
+    straight
+        .chunks_exact(4)
+        .flat_map(|p| {
+            let a = p[3] as f32 / 255.0;
+            [
+                (p[0] as f32 * a).round() as u8,
+                (p[1] as f32 * a).round() as u8,
+                (p[2] as f32 * a).round() as u8,
+                p[3],
+            ]
+        })
+        .collect()
+}
+
+fn cpu_glow(command: &DrawCommand) -> Vec<u8> {
+    premultiplied(
+        &orbital_canvas_paint::vector::rasterize(&[command], GLOW_PX, GLOW_PX, 2.0, 2.0)
+            .expect("cpu layer"),
+    )
+}
+
+fn max_channel_diff(a: &[u8], b: &[u8]) -> u8 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| x.abs_diff(*y))
+        .max()
+        .unwrap_or(0)
+}
+
+fn green_shadow() -> DrawCommand {
+    DrawCommand::Shadow {
+        commands: vec![DrawCommand::Path {
+            segments: rect(5.0, 5.0, 6.0, 6.0),
+            fill: Some(RED),
+            stroke: None,
+        }],
+        color: [0.0, 1.0, 0.0, 1.0],
+        sigma: 1.5,
+    }
+}
+
+fn blurred_square() -> DrawCommand {
+    DrawCommand::Blurred {
+        command: Box::new(filled(5.0, RED)),
+        radius: 1.5,
+    }
+}
+
+fn assert_gpu_glow_matches_cpu(command: DrawCommand) {
+    let Some(mut r) = renderer() else { return };
+    let _font = orbital_canvas_paint::vector::FONT_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(gpu) = draw(&mut r, &packet(vec![command.clone()]), GLOW_PX) else {
+        return;
+    };
+    assert_eq!(r.gpu_blurred_layer_count(), 1, "blurred on the GPU");
+    assert_eq!(r.vector_layer_count(), 1, "cached as one vector layer");
+    let cpu = cpu_glow(&command);
+    for (name, x, y) in [
+        ("centre", 16, 16),
+        ("edge", 10, 16),
+        ("falloff", 7, 16),
+        ("outside", 1, 1),
+    ] {
+        let (g, c) = (px(&gpu, GLOW_PX, x, y), px(&cpu, GLOW_PX, x, y));
+        assert!(
+            max_channel_diff(&g, &c) <= 8,
+            "{name} ({x},{y}): gpu {g:?} vs cpu {c:?}"
+        );
+    }
+    assert!(px(&gpu, GLOW_PX, 16, 16)[3] > 150, "the centre is lit");
+    assert!(
+        px(&gpu, GLOW_PX, 7, 16)[3] > 0,
+        "the blur reaches past the shape"
+    );
+    assert_eq!(px(&gpu, GLOW_PX, 1, 1)[3], 0, "far outside stays clear");
+    assert!(
+        max_channel_diff(&gpu, &cpu) <= 12,
+        "every pixel within tolerance of the CPU result"
+    );
+    let again = draw(&mut r, &packet(vec![command]), GLOW_PX).unwrap();
+    assert_eq!(again, gpu, "the cached layer draws the same pixels");
+    assert_eq!(
+        r.gpu_blurred_layer_count(),
+        1,
+        "the second frame does not blur again"
+    );
+}
+
+#[test]
+fn a_shadow_is_blurred_on_the_gpu_and_matches_the_cpu_result() {
+    assert_gpu_glow_matches_cpu(green_shadow());
+}
+
+#[test]
+fn a_blurred_command_is_blurred_on_the_gpu_and_matches_the_cpu_result() {
+    assert_gpu_glow_matches_cpu(blurred_square());
+}
+
+#[test]
+fn control_a_plain_path_is_not_blurred_and_a_faded_shadow_still_fades() {
+    let Some(mut r) = renderer() else { return };
+    let _font = orbital_canvas_paint::vector::FONT_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(plain) = draw(&mut r, &packet(vec![filled(4.0, RED)]), 16) else {
+        return;
+    };
+    assert_eq!(px(&plain, 16, 8, 8), [255, 0, 0, 255]);
+    assert_eq!(r.gpu_blurred_layer_count(), 0, "a path uses no blur pass");
+    let faded_glow = draw(&mut r, &packet(vec![faded(0.5, vec![green_shadow()])]), 16).unwrap();
+    assert_eq!(r.gpu_blurred_layer_count(), 1);
+    let full = draw(&mut r, &packet(vec![green_shadow()]), 16).unwrap();
+    assert_eq!(
+        r.gpu_blurred_layer_count(),
+        1,
+        "the fade shares the blurred layer"
+    );
+    let (half, whole) = (
+        px(&faded_glow, 16, 8, 8)[3] as f32,
+        px(&full, 16, 8, 8)[3] as f32,
+    );
+    assert!(
+        whole > 100.0 && (half - whole * 0.5).abs() < 8.0,
+        "{half} vs {whole}"
+    );
+}
+
+#[test]
+fn a_shadow_keeps_its_z_order_between_paths_in_one_run() {
+    let Some(mut r) = renderer() else { return };
+    let _font = orbital_canvas_paint::vector::FONT_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let glow = DrawCommand::Shadow {
+        commands: vec![filled(4.0, RED)],
+        color: [0.0, 1.0, 0.0, 1.0],
+        sigma: 0.5,
+    };
+    let Some(over) = draw(&mut r, &packet(vec![glow.clone(), filled(4.0, BLUE)]), 16) else {
+        return;
+    };
+    assert_eq!(
+        px(&over, 16, 8, 8),
+        [0, 0, 255, 255],
+        "the path is over the glow"
+    );
+    let under = draw(&mut r, &packet(vec![filled(4.0, BLUE), glow]), 16).unwrap();
+    assert_eq!(
+        px(&under, 16, 8, 8)[1],
+        255,
+        "control: the glow is over the path"
+    );
 }

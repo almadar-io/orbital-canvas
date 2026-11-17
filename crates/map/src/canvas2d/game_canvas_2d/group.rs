@@ -49,8 +49,6 @@ pub(super) fn paint_group(
         gathered.text_hits.len(),
     );
     let semantic_start = gathered.semantic.len();
-    let folds = folds_children(node);
-    gathered.folding += u32::from(folds);
     for child in items(node) {
         walk(
             child,
@@ -62,14 +60,16 @@ pub(super) fn paint_group(
             out,
         )?;
     }
-    gathered.folding -= u32::from(folds);
     if let Some(spec) = node.get("target").filter(|t| !t.is_null()) {
         gathered.regions.truncate(region_start);
         gathered.text_hits.truncate(hits_start);
-        return crate::layer_props::collect_target(spec, (zero_x, zero_y), out, start);
+        crate::layer_props::collect_target(spec, (zero_x, zero_y), out, start)?;
+        fold_animations(gathered, start, Some((zero_x, zero_y)));
+        return Ok(());
     }
     if let Some(radius) = node.get("smoothUnion").filter(|r| !r.is_null()) {
         blend_group_shapes(radius, projector.tile_width * zoom, out, start)?;
+        fold_animations(gathered, start, None);
     }
     let mut rect_clip = false;
     let clip = match node.get("clip").filter(|clip| !clip.is_null()) {
@@ -84,6 +84,9 @@ pub(super) fn paint_group(
             );
             if parsed.is_none() {
                 out.truncate(start);
+                gathered
+                    .animations
+                    .retain(|a| a.path.first().unwrap_or(&a.first) < &start);
                 gap_once("group-clip-path", "malformed draw-group SVG clip path");
                 return Ok(());
             }
@@ -101,6 +104,7 @@ pub(super) fn paint_group(
             clip: segments,
             commands,
         });
+        fold_animations(gathered, start, None);
     }
     let origin = Vec2 {
         x: zero_x,
@@ -519,10 +523,15 @@ pub(super) fn commands_bounds(commands: &[DrawCommand]) -> Option<Rect> {
     })
 }
 
-/// Whether a `draw-group` folds the commands its children paint into one command: a `clip`, a render `target` or a
-/// `smoothUnion`.
-pub(super) fn folds_children(node: &Value) -> bool {
-    ["clip", "target", "smoothUnion"]
-        .iter()
-        .any(|key| node.get(*key).is_some_and(|v| !v.is_null()))
+/// Re-address the packet animations recorded inside a group that just folded `out[start..]` into one command; a
+/// render target also moves its children by `-zero`, so their transform origins move with them.
+fn fold_animations(gathered: &mut Gathered, start: usize, target_zero: Option<(f32, f32)>) {
+    for animation in &mut gathered.animations {
+        let inside = animation.path.first().unwrap_or(&animation.first) >= &start;
+        animation.folded_under(start);
+        if let (true, Some((zx, zy))) = (inside, target_zero) {
+            animation.origin.x -= zx;
+            animation.origin.y -= zy;
+        }
+    }
 }

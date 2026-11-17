@@ -85,11 +85,10 @@ pub struct Gathered {
     pinned: Vec<(usize, usize)>,
     /// Drawable animations the packet plays per frame: scroll-clocked ones and path morphs.
     animations: Vec<orbital_canvas_base::packet::Animation>,
-    /// Groups being walked that fold their children into one command (a clip, a render target, a smooth union): an
-    /// epoch animation under one stays with the mapper, since its command range does not survive the fold.
-    folding: u32,
     /// `draw-scene3d` drawables without an `id` so far, which name their targets by order.
     scene3d_count: usize,
+    /// The embedded 3D scenes that play by themselves, to re-map alone per frame.
+    pub live_scenes3d: Vec<LiveScene3d>,
 }
 
 fn invalid(field: &str, detail: impl Into<String>) -> CanvasSceneError {
@@ -471,9 +470,7 @@ fn walk(
 ) -> Result<(), CanvasSceneError> {
     let (out_start, region_start) = (out.len(), gathered.regions.len());
     let (hit_start, semantic_start) = (gathered.text_hits.len(), gathered.semantic.len());
-    let epoch = (gathered.folding == 0)
-        .then(|| epoch_animation(node, projector, to_screen))
-        .flatten();
+    let epoch = epoch_animation(node, projector, to_screen);
     let at_rest = epoch.as_ref().map(|_| epoch_rest_node(node));
     walk_paint(
         at_rest.as_ref().unwrap_or(node),
@@ -490,6 +487,7 @@ fn walk(
             .push(orbital_canvas_base::packet::Animation {
                 first: out_start,
                 end: out.len(),
+                path: Vec::new(),
                 ..animation
             });
     }
@@ -514,6 +512,7 @@ fn walk(
             .push(orbital_canvas_base::packet::Animation {
                 first: out_start,
                 end: out.len(),
+                path: Vec::new(),
                 ..animation
             });
     }
@@ -904,6 +903,7 @@ pub use self::animation::*;
 use self::editing::*;
 use self::group::*;
 pub(crate) use self::paragraph::*;
+pub use self::scene3d::LiveScene3d;
 use self::scene3d::*;
 use self::shape::*;
 pub(crate) use self::sprite::*;

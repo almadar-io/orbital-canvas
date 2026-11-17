@@ -89,11 +89,15 @@ pub struct Keyframe {
     pub offset_y: Option<f32>,
 }
 
-/// A CSS keyframe animation over `draw_commands[first..end]`, in the host's clock time.
+/// A CSS keyframe animation over `draw_commands[first..end]`, in the host's clock time. Inside a group that folded
+/// its children (clip, render target, smooth union) `path` names the folded command at each level and the range
+/// indexes its children (an `SdfBlend`'s two shapes are children 0 and 1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Animation {
     pub first: usize,
     pub end: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<usize>,
     pub duration_ms: f32,
     /// Before it elapses the range shows its rest frame (CSS `animation-delay`, no fill).
     #[serde(default)]
@@ -115,6 +119,25 @@ pub struct Animation {
     /// Outlines the range's paths morph through, by keyframe offset; empty draws the rest outline.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub morph: Vec<MorphFrame>,
+}
+
+impl Animation {
+    /// Re-address the range after a group folded `draw_commands[start..]` into the one command at `start`; a range
+    /// below `start` is untouched. Nested folds compose.
+    pub fn folded_under(&mut self, start: usize) {
+        match self.path.first_mut() {
+            Some(top) if *top >= start => {
+                *top -= start;
+                self.path.insert(0, start);
+            }
+            None if self.first >= start => {
+                self.first -= start;
+                self.end -= start;
+                self.path.push(start);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// One outline of a path morph at a keyframe offset: contours resampled to the same point count.
@@ -595,6 +618,11 @@ pub enum DrawCommand {
     },
     /// Composite one shape's vector operations with canvas `lighter` blending.
     AdditiveGroup { commands: Vec<DrawCommand> },
+    /// Vector commands rasterized once and composited at `opacity`: the fade stays outside the cached content.
+    Faded {
+        opacity: f32,
+        commands: Vec<DrawCommand>,
+    },
     /// Scope mixed child commands to an authored SVG path in packet pixels.
     ClipGroup {
         clip: Vec<PathSegment>,

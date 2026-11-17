@@ -1289,3 +1289,47 @@ fn cached_shaping_returns_the_glyphs_fresh_shaping_does() {
         assert_eq!(shaped.clusters.len(), fresh.clusters.len());
     }
 }
+
+#[test]
+fn a_blur_input_is_the_unblurred_premultiplied_coverage_and_a_sigma_in_device_pixels() {
+    let square = DrawCommand::Path {
+        segments: rect(15.0, 15.0, 10.0, 10.0),
+        fill: Some(RED),
+        stroke: None,
+    };
+    let shadow = DrawCommand::Shadow {
+        commands: vec![square.clone()],
+        color: [0.0, 1.0, 0.0, 0.5],
+        sigma: 3.0,
+    };
+    let input = rasterize_blur_input(&shadow, 80, 80, 2.0, 2.0, 0.0, 0.0).unwrap();
+    assert_eq!(input.sigma, 6.0, "sigma scales with the surface");
+    assert_eq!(at(&input.rgba, 80, 40, 40), [0, 128, 0, 128]);
+    assert_eq!(
+        at(&input.rgba, 80, 28, 40)[3],
+        0,
+        "the coverage stops at the shape's edge, unblurred"
+    );
+    assert!(is_blur(&shadow));
+    assert!(
+        rasterize_blur_input(&square, 80, 80, 2.0, 2.0, 0.0, 0.0).is_none(),
+        "control: a path is not a blur"
+    );
+    assert!(!is_blur(&square));
+}
+
+#[test]
+fn control_a_blur_of_no_spread_leaves_the_shape_sharp() {
+    let square = DrawCommand::Path {
+        segments: rect(15.0, 15.0, 10.0, 10.0),
+        fill: Some(RED),
+        stroke: None,
+    };
+    let none = DrawCommand::Blurred {
+        command: Box::new(square.clone()),
+        radius: 0.0,
+    };
+    let sharp = rasterize(&[&none], 40, 40, 1.0, 1.0).unwrap();
+    let plain = rasterize(&[&square], 40, 40, 1.0, 1.0).unwrap();
+    assert_eq!(sharp, plain);
+}

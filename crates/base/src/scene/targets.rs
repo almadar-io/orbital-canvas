@@ -25,6 +25,7 @@ pub fn visit(commands: &[DrawCommand], into_targets: bool, f: &mut dyn FnMut(&Dr
             }
             DrawCommand::Shadow { commands, .. }
             | DrawCommand::AdditiveGroup { commands }
+            | DrawCommand::Faded { commands, .. }
             | DrawCommand::ClipGroup { commands, .. } => visit(commands, into_targets, f),
             DrawCommand::Target { commands, .. } if into_targets => {
                 visit(commands, into_targets, f)
