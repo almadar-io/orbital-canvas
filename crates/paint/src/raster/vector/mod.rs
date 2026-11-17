@@ -285,20 +285,23 @@ fn region_mask(
     Some(mask)
 }
 
-/// Rasterize one authored clip path to an RGBA coverage texture for GPU masking.
+/// Rasterize one authored clip path to an RGBA coverage texture for GPU masking, over the part of packet space whose
+/// top-left corner is (`ox`, `oy`), as [`rasterize_box`] does for a run.
 pub fn rasterize_clip_mask(
     segments: &[PathSegment],
     width: u32,
     height: u32,
     scale_x: f32,
     scale_y: f32,
+    ox: f32,
+    oy: f32,
 ) -> Option<Vec<u8>> {
     let mask = region_mask(
         width,
         height,
         &[segments.to_vec()],
         &[],
-        Transform::from_scale(scale_x, scale_y),
+        Transform::from_scale(scale_x, scale_y).pre_translate(-ox, -oy),
     )?;
     let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
     for alpha in mask.data() {

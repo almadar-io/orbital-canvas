@@ -1,6 +1,6 @@
 //! SVG path data, read as the web's `Path2D` reads it, into packet path segments.
 
-use crate::packet::PathSegment;
+use crate::packet::{PathSegment, Rect};
 use crate::transform::Xf;
 use std::f32::consts::{FRAC_PI_2, TAU};
 
@@ -279,9 +279,153 @@ fn arc_to_cubics(
     out
 }
 
+/// The box that holds every point of a path (curve control points included).
+pub fn path_bounds(segments: &[PathSegment]) -> Option<Rect> {
+    let mut bounds: Option<(f32, f32, f32, f32)> = None;
+    let mut add = |x: f32, y: f32| {
+        bounds = Some(match bounds {
+            None => (x, y, x, y),
+            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+        });
+    };
+    for segment in segments {
+        match *segment {
+            PathSegment::MoveTo { x, y } | PathSegment::LineTo { x, y } => add(x, y),
+            PathSegment::CubicTo {
+                x1,
+                y1,
+                x2,
+                y2,
+                x,
+                y,
+            } => {
+                add(x1, y1);
+                add(x2, y2);
+                add(x, y);
+            }
+            PathSegment::Arc { cx, cy, rx, ry, .. } => {
+                add(cx - rx, cy - ry);
+                add(cx + rx, cy + ry);
+            }
+            PathSegment::Close => {}
+        }
+    }
+    bounds.map(|(x0, y0, x1, y1)| Rect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    })
+}
+
+/// The rectangle a path outlines when it is one closed axis-aligned rectangle with area (four corners joined by
+/// straight horizontal and vertical edges), else `None`.
+pub fn axis_rect(segments: &[PathSegment]) -> Option<Rect> {
+    let mut corners: Vec<(f32, f32)> = Vec::with_capacity(5);
+    for (i, segment) in segments.iter().enumerate() {
+        match *segment {
+            PathSegment::MoveTo { x, y } if i == 0 => corners.push((x, y)),
+            PathSegment::LineTo { x, y } if i > 0 => corners.push((x, y)),
+            PathSegment::Close if i + 1 == segments.len() => {}
+            _ => return None,
+        }
+    }
+    if corners.len() == 5 && corners[4] == corners[0] {
+        corners.pop();
+    }
+    if corners.len() != 4 {
+        return None;
+    }
+    let straight = (0..4).all(|i| {
+        let (a, b) = (corners[i], corners[(i + 1) % 4]);
+        (a.0 == b.0) != (a.1 == b.1)
+    });
+    let bounds = path_bounds(segments)?;
+    (straight && bounds.w > 0.0 && bounds.h > 0.0).then_some(bounds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn square(x: f32, y: f32, w: f32, h: f32) -> Vec<PathSegment> {
+        vec![
+            PathSegment::MoveTo { x, y },
+            PathSegment::LineTo { x: x + w, y },
+            PathSegment::LineTo { x: x + w, y: y + h },
+            PathSegment::LineTo { x, y: y + h },
+            PathSegment::Close,
+        ]
+    }
+
+    #[test]
+    fn path_bounds_hold_every_point_and_control_point() {
+        let mut curve = square(2.0, 3.0, 4.0, 5.0);
+        curve.push(PathSegment::CubicTo {
+            x1: -1.0,
+            y1: 3.0,
+            x2: 6.0,
+            y2: 12.0,
+            x: 2.0,
+            y: 3.0,
+        });
+        let b = path_bounds(&curve).unwrap();
+        assert_eq!((b.x, b.y, b.w, b.h), (-1.0, 3.0, 7.0, 9.0));
+        assert!(
+            path_bounds(&[PathSegment::Close]).is_none(),
+            "control: no point, no box"
+        );
+    }
+
+    #[test]
+    fn an_axis_rect_is_a_closed_four_corner_outline_with_straight_edges() {
+        let r = axis_rect(&square(2.0, 3.0, 4.0, 5.0)).unwrap();
+        assert_eq!((r.x, r.y, r.w, r.h), (2.0, 3.0, 4.0, 5.0));
+        let mut repeated = square(2.0, 3.0, 4.0, 5.0);
+        repeated.insert(4, PathSegment::LineTo { x: 2.0, y: 3.0 });
+        assert!(
+            axis_rect(&repeated).is_some(),
+            "a line back to the start closes it too"
+        );
+        let skew = vec![
+            PathSegment::MoveTo { x: 0.0, y: 0.0 },
+            PathSegment::LineTo { x: 4.0, y: 1.0 },
+            PathSegment::LineTo { x: 4.0, y: 5.0 },
+            PathSegment::LineTo { x: 0.0, y: 4.0 },
+            PathSegment::Close,
+        ];
+        assert!(
+            axis_rect(&skew).is_none(),
+            "control: a rotated quad is no axis rect"
+        );
+        let mut rounded = square(2.0, 3.0, 4.0, 5.0);
+        rounded.insert(
+            2,
+            PathSegment::CubicTo {
+                x1: 6.0,
+                y1: 3.0,
+                x2: 6.0,
+                y2: 3.0,
+                x: 6.0,
+                y: 3.0,
+            },
+        );
+        assert!(
+            axis_rect(&rounded).is_none(),
+            "control: a curve is no axis rect"
+        );
+        let triangle = vec![
+            PathSegment::MoveTo { x: 0.0, y: 0.0 },
+            PathSegment::LineTo { x: 4.0, y: 0.0 },
+            PathSegment::LineTo { x: 4.0, y: 4.0 },
+            PathSegment::Close,
+        ];
+        assert!(axis_rect(&triangle).is_none(), "control: three corners");
+        assert!(
+            axis_rect(&square(2.0, 3.0, 0.0, 5.0)).is_none(),
+            "control: no area"
+        );
+    }
 
     #[test]
     fn path_data_parses_move_line_h_v_z_absolute_and_relative() {

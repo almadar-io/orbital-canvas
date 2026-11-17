@@ -20,6 +20,29 @@ pub(super) fn animated_text(node: &Value, epoch_now_ms: f64) -> Option<Value> {
     Some(animated)
 }
 
+/// A `draw-text`'s `halo { color, width }`: an outline painted under the glyphs (a text's own backing), its alpha
+/// scaled by `opacity` as the text's colour is; none when the text declares none.
+pub(super) fn read_halo(
+    node: &Value,
+    opacity: f32,
+) -> Result<Option<orbital_canvas_base::packet::Halo>, CanvasSceneError> {
+    let Some(spec) = node.get("halo").filter(|h| !h.is_null()) else {
+        return Ok(None);
+    };
+    let mut color = spec
+        .get("color")
+        .and_then(Value::as_str)
+        .and_then(parse_css_color)
+        .ok_or_else(|| invalid("halo", "needs a `color` that is a CSS colour"))?;
+    let width = spec
+        .get("width")
+        .and_then(Value::as_f64)
+        .filter(|w| w.is_finite() && *w > 0.0)
+        .ok_or_else(|| invalid("halo", "needs a `width` above zero"))? as f32;
+    color[3] *= opacity;
+    Ok(Some(orbital_canvas_base::packet::Halo { color, width }))
+}
+
 /// A `draw-text`'s `colorRuns`: character ranges `[from, to)` of `text`, sorted and apart, each with its own colour
 /// (its alpha scaled by `opacity`, as the node's own colour is).
 pub(super) fn read_color_runs(
@@ -162,6 +185,7 @@ pub(super) fn paint_text(
     };
     let bold = weight >= 600;
     let editing = TextEditing::read(node)?;
+    let halo = read_halo(node, get_f32(node, "opacity", 1.0))?;
     let color_runs: Vec<ColorRun> = read_color_runs(node, text, get_f32(node, "opacity", 1.0))?
         .into_iter()
         .map(|run| ColorRun {
@@ -293,7 +317,7 @@ pub(super) fn paint_text(
                     color,
                     align,
                     weight,
-                    halo: None,
+                    halo,
                     family,
                     color_runs: runs_on_line(
                         &color_runs,
@@ -500,7 +524,7 @@ pub(super) fn paint_text(
             color,
             align,
             weight,
-            halo: None,
+            halo,
             family,
             color_runs: color_runs.clone(),
             rotation: 0.0,

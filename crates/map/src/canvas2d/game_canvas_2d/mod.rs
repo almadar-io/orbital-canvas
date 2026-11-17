@@ -23,7 +23,7 @@ use orbital_canvas_base::packet::{
     LineJoin, PathSegment, Rect, SdfKind, SdfMaterial, SdfShadow, SdfStroke, Stroke, TextAlign,
     Vec2,
 };
-use orbital_canvas_base::path_data::parse_path_data;
+use orbital_canvas_base::path_data::{parse_path_data, path_bounds};
 use orbital_canvas_base::projector::{Anchor, Projection, Projector, ScenePos, TILE_WIDTH};
 use orbital_canvas_base::transform::Xf;
 use orbital_canvas_paint::asset;
@@ -85,6 +85,9 @@ pub struct Gathered {
     pinned: Vec<(usize, usize)>,
     /// Drawable animations the packet plays per frame: scroll-clocked ones and path morphs.
     animations: Vec<orbital_canvas_base::packet::Animation>,
+    /// Groups being walked that fold their children into one command (a clip, a render target, a smooth union): an
+    /// epoch animation under one stays with the mapper, since its command range does not survive the fold.
+    folding: u32,
 }
 
 fn invalid(field: &str, detail: impl Into<String>) -> CanvasSceneError {
@@ -129,6 +132,15 @@ pub fn from_props_mapped(
     props: &Value,
     epoch_now_ms: f64,
 ) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
+    from_props_sized(props, None, epoch_now_ms)
+}
+
+/// [`from_props_mapped`] laid out in `viewport` (logical width and height) in place of the props' own size.
+fn from_props_sized(
+    props: &Value,
+    viewport: Option<(f32, f32)>,
+    epoch_now_ms: f64,
+) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
     let mut gathered = Gathered::default();
     // An orbital-painter canvas is sized by its declared world, as the web host sizes it.
     let orbital = props.get("painter").and_then(Value::as_str) == Some("orbital");
@@ -137,8 +149,13 @@ pub fn from_props_mapped(
     } else {
         ("width", "height")
     };
-    let width = get_f32(props, width_key, 800.0);
-    let height = get_f32(props, height_key, 600.0);
+    let (width, height) = match viewport.filter(|_| !orbital) {
+        Some((w, h)) => (w.max(1.0), h.max(1.0)),
+        None => (
+            get_f32(props, width_key, 800.0),
+            get_f32(props, height_key, 600.0),
+        ),
+    };
     let scale = get_f32(props, "scale", 0.4);
     let projection = match props.get("projection").and_then(Value::as_str) {
         Some(s) => Projection::parse(s).unwrap_or_else(|| {
@@ -150,18 +167,18 @@ pub fn from_props_mapped(
         }),
         None => Projection::Isometric,
     };
+    let no_drawables = Vec::new();
     let drawables = props
         .get("drawables")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .unwrap_or(&no_drawables);
 
     // Scene extent from drawn positions → baseOffsetX (Canvas2D gridExtent +
     // baseOffsetX useMemo): (maxY + 1 - 1) * scaledTileWidth / 2 for diamond
     // layouts, 0 for square/free.
     let mut max_x = 0.0f32;
     let mut max_y = 0.0f32;
-    for node in &drawables {
+    for node in drawables {
         collect_positions(node, &mut |p| {
             if p.x > max_x {
                 max_x = p.x;
@@ -234,7 +251,7 @@ pub fn from_props_mapped(
     }
     gathered.pinned.push((0, draw_commands.len()));
 
-    for node in &drawables {
+    for node in drawables {
         walk(
             node,
             &projector,
@@ -347,10 +364,27 @@ pub fn from_canvas_node_in_viewport_mapped(
     height: f32,
     epoch_now_ms: f64,
 ) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
-    let mut props = canvas_node_props(node)?;
-    props.insert("width".into(), Value::from(width.max(1.0)));
-    props.insert("height".into(), Value::from(height.max(1.0)));
-    from_props_mapped(&Value::Object(props), epoch_now_ms)
+    from_props_sized(
+        &prepare_canvas_node(node)?,
+        Some((width, height)),
+        epoch_now_ms,
+    )
+}
+
+/// A canvas node's props as the walk reads them (theme references resolved, children as drawables): prepare once,
+/// then map at many clocks with [`from_prepared_at`].
+pub fn prepare_canvas_node(node: &Value) -> Result<Value, CanvasSceneError> {
+    canvas_node_props(node).map(Value::Object)
+}
+
+/// [`from_canvas_node_in_viewport_at`] (or, with no viewport, [`from_canvas_node_at`]) of a node
+/// [`prepare_canvas_node`] prepared.
+pub fn from_prepared_at(
+    prepared: &Value,
+    viewport: Option<(f32, f32)>,
+    epoch_now_ms: f64,
+) -> Result<GameRenderPacket, CanvasSceneError> {
+    from_props_sized(prepared, viewport, epoch_now_ms).map(|(packet, _)| packet)
 }
 
 fn canvas_node_props(node: &Value) -> Result<serde_json::Map<String, Value>, CanvasSceneError> {
@@ -435,8 +469,12 @@ fn walk(
 ) -> Result<(), CanvasSceneError> {
     let (out_start, region_start) = (out.len(), gathered.regions.len());
     let (hit_start, semantic_start) = (gathered.text_hits.len(), gathered.semantic.len());
+    let epoch = (gathered.folding == 0)
+        .then(|| epoch_animation(node, projector, to_screen))
+        .flatten();
+    let at_rest = epoch.as_ref().map(|_| epoch_rest_node(node));
     walk_paint(
-        node,
+        at_rest.as_ref().unwrap_or(node),
         projector,
         to_screen,
         zoom,
@@ -444,6 +482,15 @@ fn walk(
         gathered,
         out,
     )?;
+    if let Some(animation) = epoch {
+        gathered
+            .animations
+            .push(orbital_canvas_base::packet::Animation {
+                first: out_start,
+                end: out.len(),
+                ..animation
+            });
+    }
     let fixed = node.get("fixed").and_then(Value::as_bool) == Some(true);
     if fixed {
         gathered.regions[region_start..]
@@ -510,6 +557,20 @@ fn walk(
         }
         gathered.valued.push((gathered.semantic.len(), target));
     }
+    let level = match semantic.get("level") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_u64()
+                .filter(|n| (1..=6).contains(n))
+                .map(|n| n as u8)
+                .ok_or_else(|| {
+                    invalid(
+                        "semantic.level",
+                        "a semantic level is an integer from 1 to 6",
+                    )
+                })?,
+        ),
+    };
     gathered.semantic.push(crate::scene::SemanticNode {
         id: id.to_owned(),
         role: text("role")
@@ -523,6 +584,7 @@ fn walk(
         selection_start: index("selectionStart"),
         selection_end: index("selectionEnd"),
         multiline: flag("multiline").unwrap_or(false),
+        level,
         order: semantic
             .get("order")
             .and_then(Value::as_f64)

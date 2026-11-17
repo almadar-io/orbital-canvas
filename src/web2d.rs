@@ -10,6 +10,7 @@ pub struct WebSceneCanvas {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
     renderer: SharedDeviceRenderer,
     host: SceneHost,
     webgpu: bool,
@@ -28,6 +29,7 @@ impl WebSceneCanvas {
             ),
             surface: opened.surface,
             config,
+            queue: opened.queue,
             device: opened.device,
             host,
             webgpu: opened.webgpu,
@@ -142,6 +144,9 @@ impl WebSceneCanvas {
                     o.insert("selectionEnd".into(), c.into());
                 }
                 o.insert("multiline".into(), n.multiline.into());
+                if let Some(l) = n.level {
+                    o.insert("level".into(), l.into());
+                }
                 o.insert("order".into(), serde_json::json!(n.order));
                 o.insert(
                     "rect".into(),
@@ -153,6 +158,21 @@ impl WebSceneCanvas {
             })
             .collect();
         serde_json::Value::Array(nodes).to_string()
+    }
+
+    /// A contrast audit of the drawn frame, taken now and run later: it owns everything it needs, so the canvas keeps
+    /// drawing (and stays borrowable) while the audit awaits its readback. `None` with nothing drawn.
+    pub fn contrast_audit_job(&self, all: bool) -> Option<ContrastJob> {
+        let probe = self.host.contrast_probe()?;
+        let (width, height) = self.host.contrast_readback_size(&probe);
+        Some(ContrastJob {
+            probe,
+            device: self.device.clone(),
+            queue: self.queue.clone(),
+            width,
+            height,
+            all,
+        })
     }
 
     /// Text for the focused text field: committed (`composing` false) or the input method's preedit.
@@ -204,5 +224,34 @@ impl WebSceneCanvas {
                 .map(|emit| serde_json::json!({ "event": emit.event, "payload": emit.delivered() }))
                 .collect(),
         )
+    }
+}
+
+/// A contrast audit taken from a [`WebSceneCanvas`] ([`WebSceneCanvas::contrast_audit_job`]): the frame without its
+/// text, the texts to measure, and the device to draw it on.
+pub struct ContrastJob {
+    probe: crate::ContrastProbe,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    width: u32,
+    height: u32,
+    all: bool,
+}
+
+impl ContrastJob {
+    /// The texts whose contrast against the pixels painted behind them is below WCAG 2.2 AA (or every text, when the
+    /// job was taken with `all`), as a JSON array.
+    pub async fn run(self) -> Result<String, String> {
+        let mut renderer =
+            SharedDeviceRenderer::new(self.device, self.queue, wgpu::TextureFormat::Rgba8Unorm);
+        let rgba = renderer
+            .render_packet_to_rgba_async(self.probe.packet(), self.width, self.height)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut found = self.probe.measure(&rgba, self.width, self.height);
+        if !self.all {
+            found.retain(crate::ContrastFinding::fails);
+        }
+        serde_json::to_string(&found).map_err(|e| e.to_string())
     }
 }

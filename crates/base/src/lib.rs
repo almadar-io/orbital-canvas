@@ -42,8 +42,9 @@ pub mod scene3d;
 pub mod shaders;
 
 // support: shared by every layer above
-#[path = "support/color.rs"]
-pub mod color;
+pub use orbital_core_base::color;
+#[path = "support/contrast.rs"]
+pub mod contrast;
 #[path = "support/diagnostics.rs"]
 pub mod diagnostics;
 #[path = "support/faces.rs"]

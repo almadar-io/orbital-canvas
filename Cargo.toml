@@ -25,6 +25,7 @@ wgpu = "26"
 pollster = "0.4"
 # Every default format but `avif`, which is only the AV1 encoder (rav1e); canvas encodes PNG only.
 image = { version = "0.25", default-features = false, features = ["rayon", "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
 raw-window-handle = "0.6"

@@ -1238,3 +1238,54 @@ fn rotated_text_paints_ink_where_the_turned_glyphs_fall_and_not_where_they_were(
         "turned text leaves the old line blank"
     );
 }
+
+#[test]
+fn shaping_is_kept_by_its_inputs_until_a_font_or_asset_arrives() {
+    let mut cache = shaping::ShapeCache::default();
+    let key =
+        |size: f32, bold: bool| ("cache probe".to_owned(), size.to_bits(), bold, Family::Sans);
+    let shaped = shape_uncached("cache probe", 23.5, false, Family::Sans);
+    assert!(
+        cache.get((1, 1), &key(23.5, false)).is_none(),
+        "never shaped"
+    );
+    cache.put((1, 1), key(23.5, false), &shaped);
+    let kept = cache.get((1, 1), &key(23.5, false)).expect("kept");
+    assert_eq!(kept.width, shaped.width);
+    assert_eq!(kept.glyphs.len(), shaped.glyphs.len());
+    assert!(
+        cache.get((1, 1), &key(23.5, true)).is_none(),
+        "control: bold is its own entry"
+    );
+    assert!(
+        cache.get((1, 1), &key(24.0, false)).is_none(),
+        "control: another size is its own entry"
+    );
+    assert!(
+        cache.get((1, 2), &key(23.5, false)).is_none(),
+        "an arrived asset clears what was shaped before it"
+    );
+    assert_eq!(cache.len(), 0);
+    cache.put((1, 1), key(23.5, false), &shaped);
+    assert_eq!(
+        cache.len(),
+        0,
+        "control: a result shaped under old fonts is not kept"
+    );
+}
+
+#[test]
+fn cached_shaping_returns_the_glyphs_fresh_shaping_does() {
+    let text = "cache probe ٱلسلام 37";
+    let fresh = shape_uncached(text, 23.5, false, Family::Sans);
+    for _ in 0..2 {
+        let shaped = shape_in(text, 23.5, false, Family::Sans);
+        assert_eq!(shaped.width, fresh.width);
+        assert!(shaped
+            .glyphs
+            .iter()
+            .zip(&fresh.glyphs)
+            .all(|(a, b)| a.gid == b.gid && a.x == b.x && a.y == b.y && a.font == b.font));
+        assert_eq!(shaped.clusters.len(), fresh.clusters.len());
+    }
+}

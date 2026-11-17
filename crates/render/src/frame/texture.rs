@@ -49,6 +49,52 @@ pub(crate) fn upload_rgba(
     texture
 }
 
+type MapResult = std::result::Result<(), wgpu::BufferAsyncError>;
+
+/// A buffer mapping's result, awaited: set once by the `map_async` callback.
+#[derive(Clone, Default)]
+struct MapDone(std::sync::Arc<std::sync::Mutex<MapState>>);
+
+#[derive(Default)]
+struct MapState {
+    result: Option<MapResult>,
+    waker: Option<std::task::Waker>,
+}
+
+impl MapDone {
+    fn finish(&self, result: MapResult) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.result = Some(result);
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+impl std::future::Future for MapDone {
+    type Output = MapResult;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<MapResult> {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.result.take() {
+            Some(result) => std::task::Poll::Ready(result),
+            None => {
+                state.waker = Some(cx.waker().clone());
+                std::task::Poll::Pending
+            }
+        }
+    }
+}
+
 fn align_up(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & !(alignment - 1)
 }
@@ -59,6 +105,20 @@ fn align_up(value: usize, alignment: usize) -> usize {
 /// readback path, tests of the shared-device renderer, and the
 /// `dump-canvas-packet` example (fixture → PNG visual proof).
 pub fn copy_texture_to_rgba(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: wgpu::CommandEncoder,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>> {
+    pollster::block_on(copy_texture_to_rgba_async(
+        device, queue, encoder, texture, width, height,
+    ))
+}
+
+/// [`copy_texture_to_rgba`] for a host that cannot block: a browser resolves the buffer mapping from its event loop.
+pub async fn copy_texture_to_rgba_async(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     mut encoder: wgpu::CommandEncoder,
@@ -105,13 +165,12 @@ pub fn copy_texture_to_rgba(
     queue.submit(std::iter::once(encoder.finish()));
 
     let slice = readback_buffer.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
+    let mapped = MapDone::default();
+    let signal = mapped.clone();
+    slice.map_async(wgpu::MapMode::Read, move |result| signal.finish(result));
     device.poll(wgpu::PollType::wait()).ok();
-    rx.recv()
-        .map_err(|_| RendererError::Surface("readback channel closed".into()))?
+    mapped
+        .await
         .map_err(|e| RendererError::Surface(format!("buffer map failed: {e}")))?;
 
     let data = slice.get_mapped_range();

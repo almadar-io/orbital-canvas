@@ -2214,3 +2214,337 @@ fn a_second_finger_with_no_capture_sends_nothing_and_starts_no_tap() {
         "the primary's tap anchor is unchanged"
     );
 }
+
+#[test]
+fn a_finished_timed_scene_is_mapped_once_and_a_live_one_every_frame() {
+    let done = started_host(7000.0, true, false);
+    for _ in 0..3 {
+        assert!((text_alpha(&done) - 0.25).abs() < 1e-3, "the end state");
+    }
+    assert_eq!(
+        done.timed_maps(),
+        0,
+        "a fade the packet plays is never re-mapped"
+    );
+    let mid = started_host(5500.0, true, false);
+    assert!(
+        (text_alpha(&mid) - 0.625).abs() < 1e-3,
+        "the packet plays it at the epoch clock"
+    );
+    let _ = text_alpha(&mid);
+    assert_eq!(mid.timed_maps(), 0, "even while it plays");
+    let mut typing = Canvas::new_headless().unwrap();
+    typing
+        .set_scene(serde_json::json!({
+            "type": "canvas", "mode": "2d", "projection": "free", "scale": 1,
+            "drawables": [{"type": "draw-text", "text": "hello", "color": "#000000",
+                "font": "12px sans-serif", "position": {"x": 5, "y": 5},
+                "reveal": {"startMs": 5000, "perGlyphMs": 100, "durationMs": 100}}]
+        }))
+        .unwrap();
+    typing.set_epoch_clock(5200.0);
+    let _ = typing.frame_packet();
+    let _ = typing.frame_packet();
+    assert_eq!(
+        typing.timed_maps(),
+        2,
+        "control: a live typed reveal maps every frame"
+    );
+    typing.set_epoch_clock(60_000.0);
+    let _ = typing.frame_packet();
+    let _ = typing.frame_packet();
+    assert_eq!(typing.timed_maps(), 3, "and once more when it has settled");
+}
+
+#[test]
+fn a_settled_timed_frame_follows_a_new_scene() {
+    let mut host = started_host(7000.0, true, false);
+    assert!((text_alpha(&host) - 0.25).abs() < 1e-3);
+    host.set_scene(serde_json::json!({
+        "type": "canvas", "mode": "2d", "projection": "free", "scale": 1,
+        "drawables": [{"type": "draw-text", "text": "hi", "color": "#000000",
+            "font": "12px sans-serif", "position": {"x": 5, "y": 5},
+            "animation": {"startMs": 5000, "durationMs": 1000, "loop": false,
+                "keyframes": [{"at": 0, "opacity": 1}, {"at": 1, "opacity": 0.5}]}}]
+    }))
+    .unwrap();
+    assert!(
+        (text_alpha(&host) - 0.5).abs() < 1e-3,
+        "the settled frame of the new scene, not the old one"
+    );
+}
+
+mod contrast_audit {
+    use super::*;
+    use crate::packet::{DrawCommand, Gradient, GradientStop, Halo, PathSegment, Rect, Vec2};
+
+    const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+    const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+    const GREY_999: [f32; 4] = [0.6, 0.6, 0.6, 1.0];
+    const GREY_767676: [f32; 4] = [118.0 / 255.0, 118.0 / 255.0, 118.0 / 255.0, 1.0];
+
+    fn ground(color: [f32; 4]) -> DrawCommand {
+        DrawCommand::Quad {
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 240.0,
+                h: 100.0,
+            },
+            color,
+        }
+    }
+
+    fn text(color: [f32; 4], size: f32, weight: u16, halo: Option<Halo>) -> DrawCommand {
+        DrawCommand::Text {
+            text: "Hello".into(),
+            pos: Vec2 { x: 10.0, y: 50.0 },
+            size,
+            color,
+            align: Default::default(),
+            weight,
+            halo,
+            family: Default::default(),
+            color_runs: Vec::new(),
+            rotation: 0.0,
+        }
+    }
+
+    fn host(commands: Vec<DrawCommand>) -> SceneHost {
+        let mut host = SceneHost::new();
+        host.submit(GameRenderPacket {
+            pattern: "canvas-2d".into(),
+            width: 240.0,
+            height: 100.0,
+            draw_commands: commands,
+            ..Default::default()
+        });
+        host
+    }
+
+    fn all(commands: Vec<DrawCommand>) -> Option<Vec<ContrastFinding>> {
+        match host(commands).contrast_audit_all() {
+            Ok(found) => Some(found),
+            Err(e) => {
+                eprintln!("no GPU adapter on this host: {e}");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn a_text_that_paints_nothing_is_not_audited_and_a_faint_one_is() {
+        let Some(found) = all(vec![
+            ground(WHITE),
+            text([0.0, 0.0, 0.0, 0.0], 16.0, 400, None),
+            text([0.0, 0.0, 0.0, 0.3], 16.0, 400, None),
+        ]) else {
+            return;
+        };
+        assert_eq!(
+            found.len(),
+            1,
+            "only the visible text is a reader's text: {found:?}"
+        );
+        assert!(
+            found[0].ratio.unwrap() < 4.5,
+            "control: a faint text is measured and fails"
+        );
+    }
+
+    #[test]
+    fn dark_text_on_a_light_ground_measures_21_and_passes() {
+        let Some(found) = all(vec![ground(WHITE), text(BLACK, 16.0, 400, None)]) else {
+            return;
+        };
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].text, "Hello");
+        assert!((found[0].ratio.unwrap() - 21.0).abs() < 0.01, "{found:?}");
+        assert_eq!(found[0].required, 4.5);
+        let failing = host(vec![ground(WHITE), text(BLACK, 16.0, 400, None)])
+            .contrast_audit()
+            .unwrap();
+        assert!(failing.is_empty(), "{failing:?}");
+    }
+
+    #[test]
+    fn grey_999_on_white_fails_4_5_with_ratio_2_85() {
+        let Some(found) = all(vec![ground(WHITE), text(GREY_999, 16.0, 400, None)]) else {
+            return;
+        };
+        let ratio = found[0].ratio.unwrap();
+        assert!((ratio - 2.848).abs() < 0.01, "{ratio}");
+        let failing = host(vec![ground(WHITE), text(GREY_999, 16.0, 400, None)])
+            .contrast_audit()
+            .unwrap();
+        assert_eq!(failing.len(), 1);
+        assert_eq!(failing[0].size, 16.0);
+    }
+
+    #[test]
+    fn large_text_needs_3_and_grey_999_still_fails_while_767676_passes() {
+        let Some(found) = all(vec![ground(WHITE), text(GREY_999, 32.0, 400, None)]) else {
+            return;
+        };
+        assert_eq!(found[0].required, 3.0);
+        assert!(found[0].ratio.unwrap() < 3.0);
+        let passing = host(vec![ground(WHITE), text(GREY_767676, 32.0, 400, None)]);
+        let mut passing = passing;
+        assert!(passing.contrast_audit().unwrap().is_empty());
+        let small = host(vec![ground(WHITE), text(GREY_767676, 16.0, 400, None)])
+            .contrast_audit_all()
+            .unwrap();
+        assert_eq!(small[0].required, 4.5, "control: 16px keeps 4.5");
+        assert!(small[0].ratio.unwrap() >= 4.5, "#767676 is 4.54");
+    }
+
+    #[test]
+    fn bold_text_from_18_66px_needs_3_and_regular_weight_keeps_4_5() {
+        let Some(bold) = all(vec![ground(WHITE), text(GREY_999, 19.0, 700, None)]) else {
+            return;
+        };
+        assert_eq!(bold[0].required, 3.0);
+        let regular = all(vec![ground(WHITE), text(GREY_999, 19.0, 400, None)]).unwrap();
+        assert_eq!(regular[0].required, 4.5);
+        let small_bold = all(vec![ground(WHITE), text(GREY_999, 18.0, 700, None)]).unwrap();
+        assert_eq!(small_bold[0].required, 4.5, "18px bold is below 18.66");
+    }
+
+    fn gradient_ground(from: f32, to: f32) -> DrawCommand {
+        let stop = |offset: f32, v: f32| GradientStop {
+            offset,
+            color: [v, v, v, 1.0],
+        };
+        DrawCommand::GradientPath {
+            segments: vec![
+                PathSegment::MoveTo { x: 0.0, y: 0.0 },
+                PathSegment::LineTo { x: 240.0, y: 0.0 },
+                PathSegment::LineTo { x: 240.0, y: 100.0 },
+                PathSegment::LineTo { x: 0.0, y: 100.0 },
+                PathSegment::Close,
+            ],
+            fill: None,
+            stroke: None,
+            fill_gradient: Some(Gradient::Linear {
+                from: Vec2 { x: 0.0, y: 0.0 },
+                to: Vec2 { x: 240.0, y: 0.0 },
+                stops: vec![stop(0.0, from), stop(1.0, to)],
+            }),
+            stroke_gradient: None,
+        }
+    }
+
+    #[test]
+    fn text_over_a_gradient_reports_the_worst_end() {
+        let Some(found) = all(vec![
+            gradient_ground(1.0, 0.0),
+            text(BLACK, 16.0, 400, None),
+        ]) else {
+            return;
+        };
+        let rect = found[0].rect;
+        let right = (rect.x + rect.w) / 240.0;
+        let darkest = 1.0 - right;
+        let expected = crate::contrast::wcag_ratio(BLACK, [darkest, darkest, darkest, 1.0]);
+        let ratio = found[0].ratio.unwrap();
+        assert!(
+            ratio < 21.0 && (ratio - expected).abs() / expected < 0.1,
+            "{ratio} vs {expected}"
+        );
+        let flat = all(vec![ground(WHITE), text(BLACK, 16.0, 400, None)]).unwrap();
+        assert!(
+            ratio < flat[0].ratio.unwrap(),
+            "control: the flat ground is better"
+        );
+    }
+
+    #[test]
+    fn a_halo_is_the_backdrop_of_its_text() {
+        let halo = Halo {
+            color: BLACK,
+            width: 3.0,
+        };
+        let Some(found) = all(vec![ground(WHITE), text(GREY_999, 16.0, 400, Some(halo))]) else {
+            return;
+        };
+        let expected = crate::contrast::wcag_ratio(GREY_999, BLACK);
+        assert!((found[0].ratio.unwrap() - expected).abs() < 0.01);
+        assert!(expected > 4.5);
+        let bare = all(vec![ground(WHITE), text(GREY_999, 16.0, 400, None)]).unwrap();
+        assert!(
+            bare[0].ratio.unwrap() < 4.5,
+            "control: no halo measures the ground"
+        );
+    }
+
+    #[test]
+    fn text_outside_every_fill_measures_against_the_clear_colour() {
+        let clear = [0.2, 0.2, 0.2, 1.0];
+        let side = DrawCommand::Quad {
+            rect: Rect {
+                x: 150.0,
+                y: 0.0,
+                w: 90.0,
+                h: 100.0,
+            },
+            color: WHITE,
+        };
+        let Some(found) = all(vec![
+            DrawCommand::Clear { color: clear },
+            side,
+            text(BLACK, 16.0, 400, None),
+        ]) else {
+            return;
+        };
+        let expected = crate::contrast::wcag_ratio(BLACK, clear);
+        assert!(
+            (found[0].ratio.unwrap() - expected).abs() < 0.02,
+            "{found:?}"
+        );
+        assert!(expected < 4.5);
+    }
+
+    #[test]
+    fn a_text_inside_a_clip_group_is_audited_and_never_painted_into_its_own_backdrop() {
+        let clip = ground_clip();
+        let inside = DrawCommand::ClipGroup {
+            clip,
+            commands: vec![text(BLACK, 16.0, 400, None)],
+        };
+        let Some(found) = all(vec![ground(WHITE), inside]) else {
+            return;
+        };
+        assert_eq!(found.len(), 1);
+        assert!((found[0].ratio.unwrap() - 21.0).abs() < 0.01, "{found:?}");
+    }
+
+    fn ground_clip() -> Vec<PathSegment> {
+        vec![
+            PathSegment::MoveTo { x: 0.0, y: 0.0 },
+            PathSegment::LineTo { x: 240.0, y: 0.0 },
+            PathSegment::LineTo { x: 240.0, y: 100.0 },
+            PathSegment::LineTo { x: 0.0, y: 100.0 },
+            PathSegment::Close,
+        ]
+    }
+
+    #[test]
+    fn a_text_with_nothing_painted_behind_it_has_no_ratio_and_is_not_a_failure() {
+        let mut bare = host(vec![text(BLACK, 16.0, 400, None)]);
+        let Ok(failing) = bare.contrast_audit() else {
+            return;
+        };
+        assert!(failing.is_empty());
+        let found = bare.contrast_audit_all().unwrap();
+        assert_eq!(found[0].ratio, None);
+    }
+
+    #[test]
+    fn a_host_with_no_scene_audits_nothing() {
+        let mut empty = SceneHost::new();
+        let Ok(found) = empty.contrast_audit_all() else {
+            return;
+        };
+        assert!(found.is_empty());
+    }
+}

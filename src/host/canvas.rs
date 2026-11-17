@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::packet::GameRenderPacket;
-use crate::renderer::{copy_texture_to_rgba, DeviceResources, SharedDeviceRenderer};
+use crate::renderer::{DeviceResources, SharedDeviceRenderer};
 use crate::{RendererError, Result};
 
 /// Shared game renderer state.
@@ -221,31 +221,9 @@ impl Canvas {
             .viewport
             .unwrap_or((packet.width.max(1.0) as u32, packet.height.max(1.0) as u32));
 
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("game render target"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
         let shared = self.rgba_shared.get_or_insert_with(|| {
-            SharedDeviceRenderer::new(
-                device.clone(),
-                queue.clone(),
-                wgpu::TextureFormat::Rgba8Unorm,
-            )
+            SharedDeviceRenderer::new(device, queue, wgpu::TextureFormat::Rgba8Unorm)
         });
-        shared.render_packet_to_texture(packet, &texture);
-        let encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("game readback encoder"),
-        });
-        copy_texture_to_rgba(&device, &queue, encoder, &texture, width, height)
+        pollster::block_on(shared.render_packet_to_rgba_async(packet, width, height))
     }
 }

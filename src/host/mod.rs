@@ -22,6 +22,15 @@ pub struct InputEvent {
 pub struct SceneHost {
     /// Last submitted display-list packet.
     pub(crate) packet: Option<GameRenderPacket>,
+    /// A timed scene mapped at the epoch clock once nothing in it plays any more, with the asset generation it was
+    /// mapped under; dropped when a new mapping is installed.
+    pub(crate) settled: std::sync::Mutex<Option<(u64, GameRenderPacket)>>,
+    /// The current scene's props prepared for timed re-maps ([`mappers::game_canvas_2d::prepare_canvas_node`]), made
+    /// on the first one and dropped with the scene.
+    pub(crate) prepared: std::sync::Mutex<Option<serde_json::Value>>,
+    /// Timed mappings made for frames (observability for tests).
+    #[cfg(test)]
+    pub(crate) timed_maps: std::sync::atomic::AtomicUsize,
     /// Pending input events forwarded via the C ABI; drained each render tick.
     pub(crate) input_queue: Vec<InputEvent>,
     /// Surface size in PHYSICAL pixels, set by `resize` / surface init.
@@ -122,6 +131,10 @@ impl SceneHost {
             clock_ms: 0.0,
             clock_epoch: None,
             epoch_clock_ms: 0.0,
+            settled: std::sync::Mutex::new(None),
+            prepared: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            timed_maps: std::sync::atomic::AtomicUsize::new(0),
             motion: true,
             view3d: None,
             view3d_moving: false,
@@ -154,6 +167,12 @@ impl SceneHost {
         }
     }
 
+    /// Timed mappings made for frames so far.
+    #[cfg(test)]
+    pub(crate) fn timed_maps(&self) -> usize {
+        self.timed_maps.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The node the current scene was mapped from.
     pub fn scene(&self) -> Option<&serde_json::Value> {
         self.scene.as_ref()
@@ -172,6 +191,10 @@ impl SceneHost {
     /// Replace the current display-list packet.
     pub fn submit(&mut self, packet: GameRenderPacket) {
         self.scene = None;
+        *self
+            .prepared
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.hits.clear();
         self.drags.clear();
         self.springs.clear();
@@ -202,6 +225,10 @@ impl SceneHost {
         self.asset_generation = generation;
         self.live_material = spring::has_live_material(&node);
         self.scene = Some(node);
+        *self
+            .prepared
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.install(mapped);
         Ok(())
     }
@@ -221,6 +248,10 @@ impl SceneHost {
     }
 
     fn install(&mut self, mapped: mappers::scene::MappedScene) {
+        *self
+            .settled
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let scene = mapped.packet.draw_commands.iter().find_map(|c| match c {
             DrawCommand::Scene3D { scene } => Some(scene.as_ref().clone()),
             _ => None,
@@ -307,12 +338,14 @@ impl SceneHost {
 }
 
 mod access;
+mod audit;
 mod canvas;
 mod events;
 mod frame;
 mod pointer;
 mod scroll;
 pub use self::access::*;
+pub use self::audit::*;
 pub use self::canvas::*;
 pub use self::pointer::*;
 pub(crate) use self::scroll::*;

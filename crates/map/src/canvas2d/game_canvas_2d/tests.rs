@@ -2448,10 +2448,18 @@ fn started_text(animation: Value) -> Value {
     animated_text_props(animation)
 }
 
+/// What a scene draws at epoch `t`: mapped at `t`, with the packet's own motion played there.
+fn drawn_at(props: &Value, t: f64) -> GameRenderPacket {
+    from_props_at(props, t)
+        .unwrap()
+        .resolved_at(0.0, t, true)
+        .into_owned()
+}
+
 #[test]
 fn a_start_ms_text_animation_runs_from_its_start_and_without_it_runs_from_the_scene_clock() {
     let props = started_text(started(json!({"startMs": 5000})));
-    let at = |t: f64| text_alpha_and_x(&from_props_at(&props, t).unwrap());
+    let at = |t: f64| text_alpha_and_x(&drawn_at(&props, t));
     let (a0, x0) = at(4000.0);
     assert_eq!(a0, 1.0, "before the start the first keyframe shows");
     let (a1, x1) = at(5500.0);
@@ -2480,17 +2488,17 @@ fn a_start_ms_text_animation_runs_from_its_start_and_without_it_runs_from_the_sc
 #[test]
 fn a_looping_start_ms_animation_cycles_from_its_start() {
     let props = started_text(started(json!({"startMs": 5000, "loop": true})));
-    let (alpha, _) = text_alpha_and_x(&from_props_at(&props, 6250.0).unwrap());
+    let (alpha, _) = text_alpha_and_x(&drawn_at(&props, 6250.0));
     assert!(
         (alpha - 0.8125).abs() < 1e-3,
         "a quarter into the second cycle: {alpha}"
     );
-    let (before, _) = text_alpha_and_x(&from_props_at(&props, 4500.0).unwrap());
+    let (before, _) = text_alpha_and_x(&drawn_at(&props, 4500.0));
     assert_eq!(before, 1.0);
 }
 
 fn debug_of(props: &Value, t: f64) -> String {
-    format!("{:?}", from_props_at(props, t).unwrap().draw_commands)
+    format!("{:?}", drawn_at(props, t).draw_commands)
 }
 
 #[test]
@@ -2519,7 +2527,7 @@ fn a_start_ms_shape_and_group_animation_start_at_their_instant() {
     );
     let grouped = free_props(json!([{"type": "draw-group", "position": {"x": 0, "y": 0},
         "items": [rect_shape(json!({}))], "animation": started(slide)}]));
-    let quad_x = |t: f64| match from_props_at(&grouped, t).unwrap().draw_commands.as_slice() {
+    let quad_x = |t: f64| match drawn_at(&grouped, t).draw_commands.as_slice() {
         [_, DrawCommand::Quad { rect, .. }] => rect.x,
         other => panic!("one quad: {other:?}"),
     };
@@ -2648,7 +2656,7 @@ fn a_rect_clip_scopes_sdf_shapes_and_text_and_cuts_the_regions() {
         _ => None,
     });
     let sdf = sdf.expect("an SDF shape rides the clip, not refused by the group");
-    let bounds = segments_bounds(clip).expect("clip box");
+    let bounds = path_bounds(clip).expect("clip box");
     assert_eq!(
         (bounds.x, bounds.y),
         (sdf.x, sdf.y),
@@ -3258,5 +3266,189 @@ fn fit_shrink_needs_a_width_and_a_height_and_names_the_prop_otherwise() {
         fit_node(LONG, json!({"height": -1})),
     ] {
         assert!(from_props_mapped(&free_props(json!([node])), 0.0).is_err());
+    }
+}
+
+fn headed_text(sem: Value) -> Value {
+    json!({"type": "draw-text", "id": "title", "hit": true, "text": "Overview", "anchor": "top-left",
+        "position": {"x": 0, "y": 0}, "color": "#111111", "semantic": sem})
+}
+
+#[test]
+fn a_heading_semantic_carries_its_level_and_no_level_is_none() {
+    let (_, gathered) = from_props_mapped(
+        &free_props(json!([headed_text(
+            json!({"role": "heading", "level": 2, "name": "Overview"})
+        )])),
+        0.0,
+    )
+    .unwrap();
+    assert_eq!(gathered.semantic[0].level, Some(2));
+    let (_, plain) = from_props_mapped(
+        &free_props(json!([headed_text(
+            json!({"role": "heading", "name": "Overview"})
+        )])),
+        0.0,
+    )
+    .unwrap();
+    assert_eq!(plain.semantic[0].level, None, "control: no level is None");
+    let (_, null_level) = from_props_mapped(
+        &free_props(json!([headed_text(
+            json!({"role": "text", "level": null, "name": "Overview"})
+        )])),
+        0.0,
+    )
+    .unwrap();
+    assert_eq!(
+        null_level.semantic[0].level, None,
+        "edge: a null level is no level, as plain text sends it"
+    );
+    for edge in [1, 6] {
+        let (_, edge_level) = from_props_mapped(
+            &free_props(json!([headed_text(
+                json!({"role": "heading", "level": edge, "name": "Overview"})
+            )])),
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(edge_level.semantic[0].level, Some(edge as u8));
+    }
+}
+
+#[test]
+fn a_semantic_level_outside_one_to_six_or_not_an_integer_is_refused() {
+    for level in [json!(0), json!(7), json!(-1), json!(2.5), json!("2")] {
+        let refused = from_props_mapped(
+            &free_props(json!([headed_text(
+                json!({"role": "heading", "level": level.clone(), "name": "Overview"})
+            )])),
+            0.0,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&refused, CanvasSceneError::InvalidProp { field, .. } if field == "semantic.level"),
+            "{level}: {refused:?}"
+        );
+    }
+}
+
+#[test]
+fn a_group_semantic_with_a_name_is_a_node() {
+    let (_, gathered) = from_props_mapped(
+        &free_props(json!([headed_text(
+            json!({"role": "group", "name": "Filters"})
+        )])),
+        0.0,
+    )
+    .unwrap();
+    assert_eq!(gathered.semantic[0].role, "group");
+    assert_eq!(gathered.semantic[0].name, "Filters");
+}
+
+#[test]
+fn a_start_ms_fade_and_slide_is_mapped_once_and_played_by_the_packet() {
+    let props = started_text(started(json!({"startMs": 5000})));
+    let packet = from_props_at(&props, 5500.0).unwrap();
+    assert!(
+        matches!(
+            packet.animations.as_slice(),
+            [orbital_canvas_base::packet::Animation {
+                clock: orbital_canvas_base::packet::AnimationClock::Epoch { start_ms },
+                ..
+            }] if *start_ms == 5000.0
+        ),
+        "{:?}",
+        packet.animations
+    );
+    assert_eq!(
+        text_alpha_and_x(&from_props_at(&props, 5500.0).unwrap()),
+        text_alpha_and_x(&from_props_at(&props, 9000.0).unwrap()),
+        "the mapping is the same at every clock: the packet moves it"
+    );
+    assert!(
+        !has_started_animation(&json!({"type": "canvas", "drawables": props["drawables"].clone()})),
+        "nothing left for a re-map"
+    );
+}
+
+#[test]
+fn control_a_start_ms_animation_inside_a_clip_stays_with_the_mapper() {
+    let text = animated_text_props(started(json!({"startMs": 5000})))["drawables"][0].clone();
+    let props = free_props(json!([{"type": "draw-group", "position": {"x": 0, "y": 0},
+        "clip": {"x": 0, "y": 0, "width": 100, "height": 100}, "items": [text]}]));
+    let packet = from_props_at(&props, 5500.0).unwrap();
+    assert!(
+        packet.animations.is_empty(),
+        "a clip folds its children's range"
+    );
+    assert!(has_started_animation(
+        &json!({"type": "canvas", "drawables": props["drawables"].clone()})
+    ));
+}
+
+#[test]
+fn an_untracked_opacity_stays_on_a_text_whose_slide_the_packet_plays() {
+    let props = free_props(
+        json!([{"type": "draw-text", "text": "hi", "color": "#000000",
+        "font": "12px sans-serif", "position": {"x": 5, "y": 5}, "opacity": 0.5,
+        "animation": {"startMs": 5000, "durationMs": 1000, "loop": false,
+            "keyframes": [{"at": 0, "offsetX": 0}, {"at": 1, "offsetX": 20}]}}]),
+    );
+    let (alpha, _) = text_alpha_and_x(&drawn_at(&props, 5500.0));
+    assert!((alpha - 0.5).abs() < 1e-4, "{alpha}");
+}
+
+#[test]
+fn a_heading_text_without_hit_still_reaches_the_semantic_tree_with_its_level() {
+    let props = free_props(json!([{"type": "draw-text", "id": "h", "text": "Title",
+        "color": "#000000", "font": "32px sans-serif", "position": {"x": 5, "y": 5},
+        "semantic": {"role": "heading", "level": 2}}]));
+    let (_, gathered) = from_props_mapped(&props, 0.0).unwrap();
+    let node = gathered
+        .semantic
+        .iter()
+        .find(|n| n.id == "h")
+        .expect("a heading node");
+    assert_eq!((node.role.as_str(), node.level), ("heading", Some(2)));
+    assert!(
+        node.rect.w > 0.0 && node.rect.h > 0.0,
+        "it covers its glyphs"
+    );
+}
+
+fn halo_text(halo: Value) -> Value {
+    free_props(
+        json!([{"type": "draw-text", "text": "hi", "color": "#000000",
+        "font": "16px sans-serif", "position": {"x": 5, "y": 5}, "halo": halo}]),
+    )
+}
+
+fn text_halo(packet: &GameRenderPacket) -> Option<orbital_canvas_base::packet::Halo> {
+    packet.draw_commands.iter().find_map(|c| match c {
+        DrawCommand::Text { halo, .. } => Some(*halo),
+        _ => None,
+    })?
+}
+
+#[test]
+fn a_draw_text_halo_reaches_the_text_command() {
+    let halo = text_halo(&from_props(&halo_text(json!({"color": "#ffffff", "width": 4}))).unwrap())
+        .expect("a halo");
+    assert_eq!(halo.color, [1.0, 1.0, 1.0, 1.0]);
+    assert_eq!(halo.width, 4.0);
+    assert!(
+        text_halo(&from_props(&animated_text_props(json!(null))).unwrap()).is_none(),
+        "control: no halo declared, none drawn"
+    );
+    for bad in [
+        json!({"color": "#fff", "width": 0}),
+        json!({"color": "nope", "width": 3}),
+        json!({"width": 3}),
+    ] {
+        let err = from_props(&halo_text(bad.clone())).unwrap_err();
+        assert!(
+            matches!(&err, CanvasSceneError::InvalidProp { field, .. } if field == "halo"),
+            "{bad}: {err:?}"
+        );
     }
 }

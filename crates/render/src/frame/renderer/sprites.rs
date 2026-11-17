@@ -104,6 +104,7 @@ impl SharedDeviceRenderer {
             GpuSprite {
                 width: sheet.0,
                 height: sheet.1,
+                texture,
                 bind_group,
                 last_used: now,
             },
@@ -151,6 +152,7 @@ impl SharedDeviceRenderer {
         GpuSprite {
             width,
             height,
+            texture,
             bind_group,
             last_used: now,
         }
@@ -178,11 +180,17 @@ impl SharedDeviceRenderer {
                 .min_by_key(|(_, s)| s.last_used)
                 .map(|(k, _)| k.clone());
             match victim {
-                Some(k) => {
-                    self.sprites.remove(&k);
-                }
+                Some(k) => self.drop_sprite(&k),
                 None => return,
             }
+        }
+    }
+
+    /// Forget a cached sprite and destroy its texture (the web backend frees nothing on drop); only a sprite the
+    /// in-progress frame has not drawn, so no queued draw still reads it.
+    pub(super) fn drop_sprite(&mut self, key: &SpriteKey) {
+        if let Some(sprite) = self.sprites.remove(key) {
+            sprite.texture.destroy();
         }
     }
 

@@ -117,6 +117,60 @@ pub fn hash_commands<'a>(
     Ok(())
 }
 
+/// Steps per unit a number is rounded to in [`hash_commands_from`]: finer than any pixel or 8-bit colour step.
+const HASH_STEPS_PER_UNIT: f64 = 4096.0;
+
+/// [`hash_commands`] of the commands as they draw relative to `origin`, every number rounded to
+/// 1/[`HASH_STEPS_PER_UNIT`]: a run moved as a whole, as scrolling and translating motion move it, hashes the same.
+pub fn hash_commands_from<'a>(
+    commands: impl IntoIterator<Item = &'a DrawCommand>,
+    origin: crate::packet::Vec2,
+    state: &mut impl Hasher,
+) -> serde_json::Result<()> {
+    let mut moved: Vec<DrawCommand> = commands.into_iter().cloned().collect();
+    crate::animate::transform_group_commands(
+        &mut moved,
+        crate::packet::Vec2::default(),
+        crate::packet::Vec2 {
+            x: -origin.x,
+            y: -origin.y,
+        },
+        1.0,
+        0.0,
+        1.0,
+    );
+    for command in &moved {
+        hash_rounded(&serde_json::to_value(command)?, state);
+    }
+    Ok(())
+}
+
+fn hash_rounded(value: &serde_json::Value, state: &mut impl Hasher) {
+    use serde_json::Value;
+    match value {
+        Value::Null => 0u8.hash(state),
+        Value::Bool(b) => (1u8, b).hash(state),
+        Value::Number(n) => match n.as_f64() {
+            Some(f) => (2u8, (f * HASH_STEPS_PER_UNIT).round() as i64).hash(state),
+            None => (3u8, n.to_string()).hash(state),
+        },
+        Value::String(s) => (4u8, s).hash(state),
+        Value::Array(items) => {
+            (5u8, items.len()).hash(state);
+            for item in items {
+                hash_rounded(item, state);
+            }
+        }
+        Value::Object(fields) => {
+            (6u8, fields.len()).hash(state);
+            for (key, item) in fields {
+                key.hash(state);
+                hash_rounded(item, state);
+            }
+        }
+    }
+}
+
 /// Commands that read targets, for the tests here and in the crates that paint them.
 #[cfg(any(test, feature = "test-support"))]
 pub mod fixtures {
@@ -202,6 +256,44 @@ mod tests {
         assert_eq!(find_cycle(&chain), None, "control: a chain is no cycle");
         let backwards = [target("b", vec![]), target("a", vec![sprite("target:b")])];
         assert_eq!(find_cycle(&backwards), None, "control: order is no cycle");
+    }
+
+    #[test]
+    fn commands_hashed_from_their_origin_ignore_where_the_run_sits() {
+        use crate::packet::{PathSegment, Vec2};
+        let path = |x: f32, y: f32, red: f32| DrawCommand::Path {
+            segments: vec![
+                PathSegment::MoveTo { x, y },
+                PathSegment::LineTo { x: x + 8.0, y },
+                PathSegment::LineTo {
+                    x: x + 8.0,
+                    y: y + 8.0,
+                },
+                PathSegment::Close,
+            ],
+            fill: Some([red, 0.0, 0.0, 1.0]),
+            stroke: None,
+        };
+        let key = |command: DrawCommand, x: f32, y: f32| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hash_commands_from([&command], Vec2 { x, y }, &mut hasher).expect("serializable");
+            hasher.finish()
+        };
+        assert_eq!(
+            key(path(100.25, 10.3, 1.0), 100.0, 10.0),
+            key(path(763.25, -411.7, 1.0), 763.0, -412.0),
+            "the same run moved by whole units"
+        );
+        assert_ne!(
+            key(path(100.25, 10.3, 1.0), 100.0, 10.0),
+            key(path(100.75, 10.3, 1.0), 100.0, 10.0),
+            "control: another offset inside its box"
+        );
+        assert_ne!(
+            key(path(100.25, 10.3, 1.0), 100.0, 10.0),
+            key(path(100.25, 10.3, 0.5), 100.0, 10.0),
+            "control: another colour"
+        );
     }
 
     #[test]

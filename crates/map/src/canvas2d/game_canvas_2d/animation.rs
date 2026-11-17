@@ -166,12 +166,20 @@ pub(super) fn has_start(animation: &Value) -> bool {
     )
 }
 
+/// The `startMs` animations under `node` the mapper plays at the epoch clock: every one but those the packet plays
+/// ([`epoch_animation`]), which need no re-map.
 pub(super) fn started_animations(node: &Value, f: &mut dyn FnMut(&Value)) {
+    started_animations_in(node, false, f);
+}
+
+fn started_animations_in(node: &Value, folded: bool, f: &mut dyn FnMut(&Value)) {
     if matches!(
         node.get("type").and_then(Value::as_str),
         Some("draw-shape" | "draw-group" | "draw-text")
     ) {
-        if let Some(animation) = node.get("animation").filter(|a| has_start(a)) {
+        if let Some(animation) = node.get("animation").filter(|a| {
+            has_start(a) && (folded || !orbital_canvas_base::animate::plays_on_epoch_packet(a))
+        }) {
             let plays = animation
                 .get("durationMs")
                 .and_then(Value::as_f64)
@@ -185,13 +193,99 @@ pub(super) fn started_animations(node: &Value, f: &mut dyn FnMut(&Value)) {
             }
         }
     }
+    let folded = folded
+        || (node.get("type").and_then(Value::as_str) == Some("draw-group") && folds_children(node));
     for key in ["props", "drawables", "children", "items"] {
         match node.get(key) {
-            Some(Value::Array(items)) => items.iter().for_each(|i| started_animations(i, f)),
-            Some(child @ Value::Object(_)) => started_animations(child, f),
+            Some(Value::Array(items)) => items
+                .iter()
+                .for_each(|i| started_animations_in(i, folded, f)),
+            Some(child @ Value::Object(_)) => started_animations_in(child, folded, f),
             _ => {}
         }
     }
+}
+
+/// A drawable's `startMs` fade-and-slide as a packet animation on the epoch clock
+/// ([`orbital_canvas_base::animate::plays_on_epoch_packet`]): mapped once, played per frame. Offsets are in the units
+/// the drawable reads them in: scene units for a text, tile widths for a shape or group.
+pub(super) fn epoch_animation(
+    node: &Value,
+    projector: &Projector,
+    to_screen: &dyn Fn(f32, f32) -> (f32, f32),
+) -> Option<orbital_canvas_base::packet::Animation> {
+    let kind = node.get("type").and_then(Value::as_str)?;
+    if !matches!(kind, "draw-shape" | "draw-group" | "draw-text") {
+        return None;
+    }
+    let animation = node
+        .get("animation")
+        .filter(|a| orbital_canvas_base::animate::plays_on_epoch_packet(a))?;
+    let start_ms = orbital_canvas_base::animate::start_ms(animation).ok()??;
+    let duration_ms = animation.get("durationMs")?.as_f64()? as f32;
+    let looping = animation.get("loop").and_then(Value::as_bool) != Some(false);
+    let unit = if kind == "draw-text" {
+        1.0
+    } else {
+        projector.tile_width
+    };
+    let (zero_x, zero_y) = to_screen(0.0, 0.0);
+    let number =
+        |frame: &Value, key: &str| frame.get(key).and_then(Value::as_f64).map(|n| n as f32);
+    let keyframes = animation
+        .get("keyframes")?
+        .as_array()?
+        .iter()
+        .map(|frame| {
+            Some(orbital_canvas_base::packet::Keyframe {
+                offset: number(frame, "at")?,
+                opacity: number(frame, "opacity"),
+                offset_x: number(frame, "offsetX").map(|x| to_screen(x * unit, 0.0).0 - zero_x),
+                offset_y: number(frame, "offsetY").map(|y| to_screen(0.0, y * unit).1 - zero_y),
+                ..orbital_canvas_base::packet::Keyframe::default()
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(orbital_canvas_base::packet::Animation {
+        first: 0,
+        end: 0,
+        duration_ms,
+        delay_ms: 0.0,
+        iterations: (!looping).then_some(1),
+        easing: orbital_canvas_base::packet::Easing::Linear,
+        origin: Vec2 {
+            x: zero_x,
+            y: zero_y,
+        },
+        base_rotation: 0.0,
+        keyframes,
+        clock: orbital_canvas_base::packet::AnimationClock::Epoch { start_ms },
+        morph: Vec::new(),
+    })
+}
+
+/// The drawable the packet's epoch animation moves, at rest: without its animation, and for a text or shape (whose
+/// tracks replace the opacity and offsets they name) with each tracked one set to the value the keyframes act on.
+pub(super) fn epoch_rest_node(node: &Value) -> Value {
+    let tracked = |key: &str| {
+        node.get("animation")
+            .and_then(|a| a.get("keyframes"))
+            .and_then(Value::as_array)
+            .is_some_and(|frames| frames.iter().any(|f| f.get(key).is_some()))
+    };
+    let replaces = node.get("type").and_then(Value::as_str) != Some("draw-group");
+    let mut rest = node.clone();
+    if let Some(fields) = rest.as_object_mut() {
+        if replaces {
+            for (key, neutral) in [("opacity", 1.0), ("offsetX", 0.0), ("offsetY", 0.0)] {
+                if tracked(key) {
+                    fields.insert(key.into(), Value::from(neutral));
+                }
+            }
+        }
+        fields.remove("animation");
+    }
+    rest
 }
 
 /// Whether any drawable under `node` declares an animation with a `startMs`.

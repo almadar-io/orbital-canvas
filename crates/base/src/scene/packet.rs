@@ -142,6 +142,11 @@ pub enum AnimationClock {
         from: f32,
         to: f32,
     },
+    /// The page's wall clock (epoch ms) from `start_ms`, as a drawable `startMs` animation plays: the first keyframe
+    /// holds before it starts and the last after it ends, and with no epoch clock or reduced motion it shows the end.
+    Epoch {
+        start_ms: f64,
+    },
 }
 
 /// 2D camera state.

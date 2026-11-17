@@ -5,8 +5,8 @@
 //! (display list); this crate turns it into draw calls.
 
 pub use orbital_canvas_base::{
-    animate, color, diagnostics, fx_projection, morph, packet, path_data, projector, shader_check,
-    shaders, skinning_2d, spring, targets, transform,
+    animate, color, contrast, diagnostics, fx_projection, morph, packet, path_data, projector,
+    shader_check, shaders, skinning_2d, spring, targets, transform,
 };
 #[cfg(feature = "system-fonts")]
 pub use orbital_canvas_paint::system_fonts;
@@ -33,4 +33,6 @@ pub use device::{register_device, shared_device_async};
 pub use gpu::GpuHost;
 pub use renderer::SharedDeviceRenderer;
 
-pub use host::{AccessAction, Canvas, InputEvent, KeyMods, SceneHost, TAP_SLOP};
+pub use host::{
+    AccessAction, Canvas, ContrastFinding, ContrastProbe, InputEvent, KeyMods, SceneHost, TAP_SLOP,
+};

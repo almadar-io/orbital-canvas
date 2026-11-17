@@ -788,3 +788,113 @@ fn a_blend_rides_the_group_transform_with_its_radius_scaled() {
     assert_eq!((a.x, a.w), (1.0, 20.0));
     assert_eq!((b.x, b.w), (41.0, 20.0));
 }
+
+fn entry(start_ms: f64, looping: bool) -> Animation {
+    Animation {
+        first: 0,
+        end: 1,
+        duration_ms: 1000.0,
+        delay_ms: 0.0,
+        iterations: if looping { None } else { Some(1) },
+        easing: Easing::Linear,
+        origin: Vec2 { x: 70.0, y: 70.0 },
+        base_rotation: 0.0,
+        clock: AnimationClock::Epoch { start_ms },
+        morph: Vec::new(),
+        keyframes: vec![
+            Keyframe {
+                offset: 0.0,
+                opacity: Some(0.0),
+                offset_y: Some(14.0),
+                ..Keyframe::default()
+            },
+            Keyframe {
+                offset: 1.0,
+                opacity: Some(1.0),
+                offset_y: Some(0.0),
+                ..Keyframe::default()
+            },
+        ],
+    }
+}
+
+#[test]
+fn an_epoch_animation_holds_its_first_frame_before_it_starts_and_its_last_after() {
+    let p = packet(vec![circle(10.0)], vec![entry(5000.0, false)]);
+    let at = |epoch: f64, motion: bool| p.resolved_at(0.0, epoch, motion).into_owned();
+    assert_eq!(
+        alpha(&at(4000.0, true), 0),
+        0.0,
+        "before it starts: the first keyframe"
+    );
+    assert!((alpha(&at(5500.0, true), 0) - 0.5).abs() < 1e-4, "halfway");
+    assert_eq!(
+        alpha(&at(9000.0, true), 0),
+        1.0,
+        "after it ends: the last keyframe"
+    );
+    assert_eq!(
+        alpha(&at(0.0, true), 0),
+        1.0,
+        "no epoch clock: the end state"
+    );
+    assert_eq!(
+        alpha(&at(4000.0, false), 0),
+        1.0,
+        "reduced motion: the end state, never the rest frame"
+    );
+    let looping = packet(vec![circle(10.0)], vec![entry(5000.0, true)]);
+    assert!(
+        (alpha(&looping.resolved_at(0.0, 6250.0, true), 0) - 0.25).abs() < 1e-4,
+        "a loop wraps"
+    );
+}
+
+#[test]
+fn an_epoch_animation_is_live_until_it_ends() {
+    let once = packet(vec![circle(10.0)], vec![entry(5000.0, false)]);
+    assert!(once.epoch_live(4000.0), "yet to start");
+    assert!(once.epoch_live(5500.0), "playing");
+    assert!(!once.epoch_live(6500.0), "ended");
+    assert!(!once.epoch_live(0.0), "control: no epoch clock");
+    let looping = packet(vec![circle(10.0)], vec![entry(5000.0, true)]);
+    assert!(looping.epoch_live(99_000.0), "a loop never ends");
+    assert!(
+        !packet(vec![circle(10.0)], vec![pulse()]).epoch_live(5500.0),
+        "control: a paint-clock animation is not epoch motion"
+    );
+}
+
+#[test]
+fn a_start_ms_fade_and_slide_plays_on_the_epoch_packet_and_others_stay_with_the_mapper() {
+    let anim = |frames: serde_json::Value| serde_json::json!({"startMs": 5000, "durationMs": 520, "loop": false, "keyframes": frames});
+    assert!(plays_on_epoch_packet(&anim(serde_json::json!([
+        {"at": 0, "opacity": 0, "offsetY": 14},
+        {"at": 0.4, "opacity": 0, "offsetY": 14},
+        {"at": 1, "opacity": 1, "offsetY": 0}
+    ]))));
+    assert!(
+        !plays_on_epoch_packet(&anim(serde_json::json!([
+            {"at": 0, "opacity": 0},
+            {"at": 1, "opacity": 1, "fill": "#fff"}
+        ]))),
+        "control: a colour track stays with the mapper"
+    );
+    assert!(
+        !plays_on_epoch_packet(&anim(serde_json::json!([
+            {"at": 0, "opacity": 0},
+            {"at": 1, "offsetY": 0}
+        ]))),
+        "control: a key missing at one end holds differently, so it stays with the mapper"
+    );
+    assert!(
+        !plays_on_epoch_packet(&serde_json::json!({"durationMs": 520,
+            "keyframes": [{"at": 0, "opacity": 0}, {"at": 1, "opacity": 1}]})),
+        "control: no startMs is the paint clock's"
+    );
+    assert!(
+        !plays_on_epoch_packet(&serde_json::json!({"startMs": 5000, "durationMs": 0,
+            "keyframes": [{"at": 0, "opacity": 0}, {"at": 1, "opacity": 1}]})),
+        "control: no duration"
+    );
+}

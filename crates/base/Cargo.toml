@@ -17,8 +17,6 @@ serde_json = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
 glam = "0.30"
-# Every CSS color a browser paints (named, transparent, hsl, hwb), as the web hosts accept them.
-csscolorparser = { version = "0.7", default-features = false, features = ["named-colors"] }
 
 [dev-dependencies]
 pretty_assertions = "1.4"

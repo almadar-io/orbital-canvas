@@ -136,6 +136,8 @@ pub struct SemanticNode {
     pub selection_start: Option<usize>,
     pub selection_end: Option<usize>,
     pub multiline: bool,
+    /// Heading level 1-6 (`aria-level`).
+    pub level: Option<u8>,
     pub order: f32,
     pub rect: Rect,
     /// The node stays put when the page scrolls.

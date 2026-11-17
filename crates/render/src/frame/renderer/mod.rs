@@ -30,6 +30,7 @@ struct SpriteKey {
 struct GpuSprite {
     width: u32,
     height: u32,
+    texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     /// Value of `SharedDeviceRenderer::use_clock` at the last draw request;
     /// orders eviction (smallest = least recently used).
@@ -116,6 +117,12 @@ pub struct SharedDeviceRenderer {
     blur: Option<crate::backdrop::BlurPass>,
     targets: crate::render_target::TargetStore,
     target_sprite_pipeline: wgpu::RenderPipeline,
+    /// Layers clip groups paint into, kept across frames; one per clip group of a frame.
+    clip_layers: Vec<clip::ClipLayer>,
+    /// Clip masks by shape relative to their box, kept while drawn.
+    clip_masks: std::collections::HashMap<u64, clip::ClipMask>,
+    /// Top-level frames rendered; stamps what a frame used.
+    frame_count: u64,
     /// Buffers made for one frame's draws; destroyed after that frame's submit (wgpu's web backend never frees on drop).
     transient: std::sync::Mutex<Vec<wgpu::Buffer>>,
 }
@@ -188,6 +195,9 @@ impl SharedDeviceRenderer {
             blur: None,
             targets: Default::default(),
             target_sprite_pipeline,
+            clip_layers: Vec::new(),
+            clip_masks: std::collections::HashMap::new(),
+            frame_count: 0,
             transient: Default::default(),
         }
     }
@@ -228,6 +238,45 @@ impl SharedDeviceRenderer {
         &self.queue
     }
 
+    /// Draw `packet` into a new `width` x `height` `Rgba8Unorm` texture and read it back (top row first); the
+    /// renderer must have been made for that format.
+    pub async fn render_packet_to_rgba_async(
+        &mut self,
+        packet: &GameRenderPacket,
+        width: u32,
+        height: u32,
+    ) -> crate::Result<Vec<u8>> {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("game render target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        self.render_packet_to_texture(packet, &texture);
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("game readback encoder"),
+            });
+        crate::texture::copy_texture_to_rgba_async(
+            &self.device,
+            &self.queue,
+            encoder,
+            &texture,
+            width,
+            height,
+        )
+        .await
+    }
+
     /// The error that kept the last packet's 3D scene from drawing, once.
     pub fn take_scene3d_error(&mut self) -> Option<String> {
         self.scene3d_error.take()
@@ -248,6 +297,8 @@ impl SharedDeviceRenderer {
         }
         if self.render_depth == 0 {
             self.frame_epoch = self.use_clock;
+            self.frame_count += 1;
+            self.prune_clip_surfaces();
             if let Some(glyphs) = self.glyphs.as_mut() {
                 glyphs.begin_frame();
             }

@@ -7,7 +7,13 @@ Every open gap this repo owns lives here. This file is the source of truth; the 
 - **Codes:** new gaps use this repo's prefix `G-ORBITAL-GAME-RENDERER-`. Take the "Next code" below, then bump it in the same edit. Codes are never reused or renamed.
 - **Close by deleting.** Remove the entry in the same commit as the fix.
 
-Next code: `G-ORBITAL-GAME-RENDERER-031`
+Next code: `G-ORBITAL-GAME-RENDERER-033`
+
+- **G-ORBITAL-GAME-RENDERER-031** [architectural] — Epoch-clock motion the packet cannot carry still re-maps the whole 2D scene on every frame it plays (`SceneHost::frame_packet`, `src/host/frame.rs`). Since 2026-11-17 a `startMs` fade or slide (opacity and offsets, given at both ends) on a text, shape or group plays on the packet's `Epoch` clock with no re-map. What still re-maps: such an animation inside a group that folds its children (clip, render target, smooth union; see G-ORBITAL-GAME-RENDERER-032), a typed reveal, an emitter, an fx layer, and `startMs` tracks of colour, size or other keys. Prevention: none (cost); the scroll probe measures it.
+  Severity: medium. Root cause: one-off.
+
+- **G-ORBITAL-GAME-RENDERER-032** [mechanical] — A packet animation's command range (`Animation { first, end }`) does not survive an ancestor group that folds its children into one command (`ClipGroup`, `Target`, `SdfBlend` in `map/src/canvas2d/game_canvas_2d/group.rs`): the range then indexes the wrong commands. Epoch animations avoid it by staying with the mapper under a fold (`Gathered::folding`); a scroll-clocked or morph animation under a clip still records a broken range. Fix: re-base ranges inside a fold onto the folded command, or carry them inside it. Prevention: rung 3 (a map test of a scroll animation under a clip).
+  Severity: medium. Root cause: one-off.
 
 - **G-ORBITAL-GAME-RENDERER-028** [mechanical] — A theme font file that is a variable font draws weights below 600 at its 400 instance: `url_font` keys a face by (file, bold) and sets `wght` 700 for bold (real bold since 2026-11-16) and 400 otherwise, because shaping passes only `bold`, not the text's weight. Symptom: a style asking for 200 or 300 display type (minimalist, luxury) draws it at 400. Fix: thread the text command's weight into shaping and key URL faces by weight. Prevention rung: a paint test that a variable face at 300 and 400 rasterises differently. Severity: low. Root cause: one-off.
 

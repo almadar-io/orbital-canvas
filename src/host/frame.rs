@@ -58,6 +58,11 @@ impl SceneHost {
             || self.page_scroll.velocity != 0.0
             || self.scroll_report_pending()
             || self.is_animated()
+            || (self.motion
+                && self
+                    .packet
+                    .as_ref()
+                    .is_some_and(|p| p.epoch_live(self.epoch_clock_ms)))
             || (self.motion && (!self.springs.settled() || self.live_material))
             || (self.motion
                 && self.epoch_clock_ms > 0.0
@@ -98,21 +103,43 @@ impl SceneHost {
                         Some("canvas" | "canvas-2d")
                     )
             }) {
+                let live = mappers::game_canvas_2d::has_active_fx(scene)
+                    || mappers::emitter::any_live(scene, self.epoch_clock_ms)
+                    || mappers::text_reveal::any_live(scene, self.epoch_clock_ms)
+                    || mappers::game_canvas_2d::started_animation_live(scene, self.epoch_clock_ms);
+                let generation = asset::generation();
+                let mut settled = self
+                    .settled
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if live {
+                    *settled = None;
+                } else if let Some((_, packet)) = settled
+                    .as_ref()
+                    .filter(|(mapped_under, _)| *mapped_under == generation)
+                {
+                    return Some(self.present(packet.clone()));
+                }
+                #[cfg(test)]
+                self.timed_maps
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let viewport = self
                     .viewport
                     .map(|(w, h)| (w as f32 / self.density, h as f32 / self.density));
-                let remapped = match viewport {
-                    Some((w, h)) => mappers::game_canvas_2d::from_canvas_node_in_viewport_at(
-                        scene,
-                        w,
-                        h,
-                        self.epoch_clock_ms,
-                    ),
-                    None => {
-                        mappers::game_canvas_2d::from_canvas_node_at(scene, self.epoch_clock_ms)
+                let mut prepared = self
+                    .prepared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if prepared.is_none() {
+                    *prepared = mappers::game_canvas_2d::prepare_canvas_node(scene).ok();
+                }
+                let remapped = prepared.as_ref().map(|props| {
+                    mappers::game_canvas_2d::from_prepared_at(props, viewport, self.epoch_clock_ms)
+                });
+                if let Some(Ok(packet)) = remapped {
+                    if !live {
+                        *settled = Some((generation, packet.clone()));
                     }
-                };
-                if let Ok(packet) = remapped {
                     return Some(self.present(packet));
                 }
             }
@@ -133,7 +160,9 @@ impl SceneHost {
     pub(super) fn present(&self, mut packet: GameRenderPacket) -> GameRenderPacket {
         let offset = self.page_scroll.offset;
         packet.scroll = offset;
-        let mut packet = packet.resolved(self.scene_time(), self.motion).into_owned();
+        let mut packet = packet
+            .resolved_at(self.scene_time(), self.epoch_clock_ms, self.motion)
+            .into_owned();
         packet.time_ms = self.scene_time();
         packet.pointer = self.pointer.map(|(x, y)| packet::Vec2 { x, y });
         packet.scrolled(offset)

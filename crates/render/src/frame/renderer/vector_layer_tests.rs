@@ -1,5 +1,5 @@
 use super::svg_sprite_tests::{draw, px, renderer};
-use super::vector_layers::MAX_VECTOR_LAYERS;
+use super::vector_layers::VECTOR_LAYER_TARGETS;
 use super::*;
 use orbital_canvas_base::packet::{PathSegment, Stroke, TextAlign};
 
@@ -260,7 +260,7 @@ fn an_identical_packet_reuses_the_cached_layer_and_a_changed_one_adds_one() {
     );
     let _ = draw(&mut r, &packet(vec![filled(4.0, RED)]), 16);
     assert_eq!(r.vector_layer_count(), 1);
-    let _ = draw(&mut r, &packet(vec![filled(2.0, RED)]), 16);
+    let _ = draw(&mut r, &packet(vec![filled(4.0, BLUE)]), 16);
     assert_eq!(r.vector_layer_count(), 2);
 }
 
@@ -389,12 +389,21 @@ fn a_cached_layer_is_not_reused_once_the_world_size_changes_under_the_same_targe
 }
 
 #[test]
-fn vector_layers_are_bounded() {
+fn vector_layers_are_bounded_by_bytes_relative_to_the_target() {
     let Some(mut r) = renderer() else { return };
-    for i in 0..(MAX_VECTOR_LAYERS + 4) {
+    for i in 0..12 {
         let _ = draw(&mut r, &packet(vec![filled(i as f32 * 0.25, RED)]), 16);
     }
-    assert!(r.vector_layer_count() <= MAX_VECTOR_LAYERS);
+    let budget = VECTOR_LAYER_TARGETS * 16 * 16 * 4;
+    assert!(
+        r.vector_layer_bytes() <= budget,
+        "{} bytes held, budget {budget}",
+        r.vector_layer_bytes()
+    );
+    assert!(
+        r.vector_layer_count() > 1,
+        "control: the cache holds more than one layer"
+    );
 }
 
 const SIDE: u32 = 128;
@@ -807,4 +816,145 @@ fn stroke_and_text_commands_draw() {
         with_text.chunks_exact(4).any(|p| p[3] > 200 && p[0] > 200),
         "text ink is drawn"
     );
+}
+
+#[test]
+fn a_run_moved_by_whole_pixels_reuses_its_layer() {
+    let Some(mut r) = renderer() else { return };
+    let _font = orbital_canvas_paint::vector::FONT_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _ = draw(&mut r, &packet(vec![filled(4.0, RED)]), 16);
+    let Some(moved) = draw(&mut r, &packet(vec![filled(6.0, RED)]), 16) else {
+        return;
+    };
+    assert_eq!(
+        r.vector_layer_count(),
+        1,
+        "scrolled content is not re-rasterized"
+    );
+    assert_eq!(
+        px(&moved, 16, 13, 8),
+        [255, 0, 0, 255],
+        "drawn at its new place"
+    );
+    assert_eq!(px(&moved, 16, 5, 8)[3], 0, "and not at its old one");
+    let _ = draw(&mut r, &packet(vec![filled(4.5, RED)]), 16);
+    assert_eq!(
+        r.vector_layer_count(),
+        2,
+        "control: a sub-pixel move rasterizes anew"
+    );
+}
+
+fn clip_group(clip: Vec<PathSegment>) -> DrawCommand {
+    DrawCommand::ClipGroup {
+        clip,
+        commands: vec![DrawCommand::Quad {
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 16.0,
+                h: 16.0,
+            },
+            color: RED,
+        }],
+    }
+}
+
+fn diamond(cx: f32) -> Vec<PathSegment> {
+    vec![
+        PathSegment::MoveTo { x: cx, y: 2.0 },
+        PathSegment::LineTo {
+            x: cx + 6.0,
+            y: 8.0,
+        },
+        PathSegment::LineTo { x: cx, y: 14.0 },
+        PathSegment::LineTo {
+            x: cx - 6.0,
+            y: 8.0,
+        },
+        PathSegment::Close,
+    ]
+}
+
+#[test]
+fn a_rect_clip_on_whole_pixels_draws_its_box_without_a_mask() {
+    let Some(mut r) = renderer() else { return };
+    let Some(rgba) = draw(
+        &mut r,
+        &packet(vec![clip_group(rect(4.0, 2.0, 6.0, 10.0))]),
+        16,
+    ) else {
+        return;
+    };
+    assert_eq!(px(&rgba, 16, 5, 3), [255, 0, 0, 255], "inside the clip");
+    assert_eq!(px(&rgba, 16, 3, 3)[3], 0, "left of it");
+    assert_eq!(px(&rgba, 16, 10, 3)[3], 0, "right of it");
+    assert_eq!(px(&rgba, 16, 5, 12)[3], 0, "below it");
+    assert_eq!(r.clip_mask_count(), 0, "a rect needs no mask");
+    let _ = draw(
+        &mut r,
+        &packet(vec![clip_group(rect(4.5, 2.0, 6.0, 10.0))]),
+        16,
+    );
+    assert_eq!(
+        r.clip_mask_count(),
+        1,
+        "control: a rect edge inside a pixel is masked"
+    );
+}
+
+#[test]
+fn a_path_clip_mask_is_reused_when_the_clip_moves_by_whole_pixels() {
+    let Some(mut r) = renderer() else { return };
+    let Some(first) = draw(&mut r, &packet(vec![clip_group(diamond(7.0))]), 16) else {
+        return;
+    };
+    assert_eq!(px(&first, 16, 7, 8), [255, 0, 0, 255], "inside the diamond");
+    assert_eq!(px(&first, 16, 2, 3)[3], 0, "outside its corner");
+    let Some(moved) = draw(&mut r, &packet(vec![clip_group(diamond(9.0))]), 16) else {
+        return;
+    };
+    assert_eq!(
+        r.clip_mask_count(),
+        1,
+        "the mask is cached by shape, not place"
+    );
+    assert_eq!(
+        px(&moved, 16, 9, 8),
+        [255, 0, 0, 255],
+        "inside the moved diamond"
+    );
+    assert_eq!(px(&moved, 16, 2, 8)[3], 0, "outside the moved diamond");
+    let _ = draw(&mut r, &packet(vec![clip_group(diamond(9.5))]), 16);
+    assert_eq!(
+        r.clip_mask_count(),
+        2,
+        "control: a sub-pixel move masks anew"
+    );
+}
+
+#[test]
+fn clip_layers_are_kept_across_frames_one_per_group_in_a_frame() {
+    let Some(mut r) = renderer() else { return };
+    for _ in 0..3 {
+        let _ = draw(
+            &mut r,
+            &packet(vec![clip_group(rect(4.0, 2.0, 6.0, 10.0))]),
+            16,
+        );
+    }
+    assert_eq!(r.clip_layer_count(), 1, "one layer serves every frame");
+    let two = packet(vec![
+        clip_group(rect(0.0, 0.0, 4.0, 4.0)),
+        clip_group(rect(8.0, 8.0, 4.0, 4.0)),
+    ]);
+    let Some(rgba) = draw(&mut r, &two, 16) else {
+        return;
+    };
+    assert_eq!(r.clip_layer_count(), 2, "two groups in one frame need two");
+    assert_eq!(px(&rgba, 16, 1, 1), [255, 0, 0, 255]);
+    assert_eq!(px(&rgba, 16, 9, 9), [255, 0, 0, 255]);
+    assert_eq!(px(&rgba, 16, 6, 6)[3], 0);
 }

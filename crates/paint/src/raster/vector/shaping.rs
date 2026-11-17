@@ -12,7 +12,7 @@ pub struct PlacedGlyph {
     pub y: f32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Shaped {
     pub glyphs: Vec<PlacedGlyph>,
     pub width: f32,
@@ -119,8 +119,69 @@ pub fn shape(text: &str, size: f32, bold: bool, family: Family) -> Shaped {
     shape_in(text, size, bold, family)
 }
 
-/// [`shape`] in a generic family.
+/// The most shaped texts the cache holds before it starts over.
+const SHAPE_CACHE_ENTRIES: usize = 16_384;
+
+pub(crate) type ShapeKey = (String, u32, bool, Family);
+
+/// Shaped texts by their inputs, valid for one (font generation, asset generation): a face that loads, or a theme
+/// face's file that arrives, can change how the same text shapes.
+#[derive(Default)]
+pub(crate) struct ShapeCache {
+    generations: (u64, u64),
+    entries: std::collections::HashMap<ShapeKey, Shaped>,
+}
+
+impl ShapeCache {
+    pub(crate) fn get(&mut self, generations: (u64, u64), key: &ShapeKey) -> Option<Shaped> {
+        if self.generations != generations {
+            self.entries.clear();
+            self.generations = generations;
+        }
+        self.entries.get(key).cloned()
+    }
+
+    pub(crate) fn put(&mut self, generations: (u64, u64), key: ShapeKey, shaped: &Shaped) {
+        if self.generations != generations {
+            return;
+        }
+        if self.entries.len() >= SHAPE_CACHE_ENTRIES {
+            self.entries.clear();
+        }
+        self.entries.insert(key, shaped.clone());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+fn shape_cache() -> &'static Mutex<ShapeCache> {
+    static CACHE: OnceLock<Mutex<ShapeCache>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// [`shape`] in a generic family, kept by its inputs until a font or an asset (a theme face's file) arrives.
 pub fn shape_in(text: &str, size: f32, bold: bool, family: Family) -> Shaped {
+    let generations = (font_generation(), crate::asset::generation());
+    let key = (text.to_owned(), size.to_bits(), bold, family);
+    let cached = shape_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(generations, &key);
+    if let Some(shaped) = cached {
+        return shaped;
+    }
+    let shaped = shape_uncached(text, size, bold, family);
+    shape_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .put(generations, key, &shaped);
+    shaped
+}
+
+pub(crate) fn shape_uncached(text: &str, size: f32, bold: bool, family: Family) -> Shaped {
     let mut out = Shaped::default();
     if text.is_empty() {
         return out;

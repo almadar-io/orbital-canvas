@@ -41,6 +41,50 @@ pub fn plays_on_packet(animation: &Value) -> bool {
             .is_some_and(|frames| frames.iter().any(|f| f.get("d").is_some()))
 }
 
+/// The keys an epoch-clock packet animation carries: what a packet [`crate::packet::Keyframe`] moves the same way a
+/// drawable track does.
+const EPOCH_PACKET_KEYS: [&str; 3] = ["opacity", "offsetX", "offsetY"];
+
+/// Whether a drawable `startMs` animation can play on the packet's epoch clock instead of the mapper's: a duration,
+/// keyframes naming only opacity and offsets, and every key it names given at both `at: 0` and `at: 1`, so the
+/// packet's interpolation and holds match the drawable track's exactly.
+pub fn plays_on_epoch_packet(animation: &Value) -> bool {
+    if !matches!(start_ms(animation), Ok(Some(_))) || plays_on_packet(animation) {
+        return false;
+    }
+    let Some(frames) = animation
+        .get("keyframes")
+        .and_then(Value::as_array)
+        .filter(|f| !f.is_empty())
+    else {
+        return false;
+    };
+    if !animation
+        .get("durationMs")
+        .and_then(Value::as_f64)
+        .is_some_and(|d| d.is_finite() && d > 0.0)
+    {
+        return false;
+    }
+    let at = |frame: &Value| frame.get("at").and_then(Value::as_f64);
+    let only_known_keys = frames.iter().all(|frame| {
+        frame.as_object().is_some_and(|fields| {
+            fields
+                .keys()
+                .all(|k| k == "at" || EPOCH_PACKET_KEYS.contains(&k.as_str()))
+        }) && at(frame).is_some_and(|a| (0.0..=1.0).contains(&a))
+    });
+    let end = |value: f64| frames.iter().find(|f| at(f) == Some(value));
+    let (Some(first), Some(last)) = (end(0.0), end(1.0)) else {
+        return false;
+    };
+    only_known_keys
+        && EPOCH_PACKET_KEYS.iter().all(|key| {
+            let named = frames.iter().any(|f| f.get(*key).is_some());
+            !named || (first.get(*key).is_some() && last.get(*key).is_some())
+        })
+}
+
 /// Whether the animation plays at the paint clock: any running clock, or a `startMs` animation at no clock, which
 /// shows its end state. One the packet plays never does.
 pub fn plays_at(animation: &Value, epoch_now_ms: f64) -> bool {
@@ -191,6 +235,31 @@ impl Animation {
         self.time_progress(t_ms).map(|p| self.sample_progress(p))
     }
 
+    /// Where an epoch animation is at `epoch_ms`: 0 before it starts, its last frame once its iterations end, and its
+    /// end with no epoch clock.
+    fn epoch_progress(&self, start_ms: f64, epoch_ms: f64) -> f32 {
+        if epoch_ms <= 0.0 || self.duration_ms <= 0.0 {
+            return 1.0;
+        }
+        let cycle = ((epoch_ms - start_ms).max(0.0) / self.duration_ms as f64) as f32;
+        match self.iterations {
+            Some(n) if cycle >= n as f32 => 1.0,
+            _ => cycle - cycle.floor(),
+        }
+    }
+
+    /// Whether an epoch animation still moves at `epoch_ms`: not yet started, playing, or looping.
+    fn epoch_moving(&self, epoch_ms: f64) -> bool {
+        let AnimationClock::Epoch { start_ms } = self.clock else {
+            return false;
+        };
+        epoch_ms > 0.0
+            && match self.iterations {
+                None => true,
+                Some(n) => epoch_ms < start_ms + (self.duration_ms * n as f32) as f64,
+            }
+    }
+
     fn time_progress(&self, t_ms: f64) -> Option<f32> {
         if self.duration_ms <= 0.0 {
             return None;
@@ -207,9 +276,10 @@ impl Animation {
     }
 
     /// Where the animation is on its own clock, 0 to 1; `None` while it shows the rest frame.
-    pub(crate) fn progress_at(&self, t_ms: f64, scroll: f32) -> Option<f32> {
+    pub(crate) fn progress_at(&self, t_ms: f64, epoch_ms: f64, scroll: f32) -> Option<f32> {
         match self.clock {
             AnimationClock::Time => self.time_progress(t_ms),
+            AnimationClock::Epoch { start_ms } => Some(self.epoch_progress(start_ms, epoch_ms)),
             AnimationClock::Scroll { from, to } => Some(if to > from {
                 ((scroll - from) / (to - from)).clamp(0.0, 1.0)
             } else if scroll < from {
@@ -257,7 +327,7 @@ impl Animation {
     /// The animation on its own clock: the host time `t_ms`, or the page `scroll` offset.
     #[cfg(test)]
     pub(crate) fn sample_at(&self, t_ms: f64, scroll: f32) -> Option<Sample> {
-        self.progress_at(t_ms, scroll)
+        self.progress_at(t_ms, 0.0, scroll)
             .map(|p| self.sample_progress(p))
     }
 }
@@ -820,15 +890,32 @@ impl GameRenderPacket {
         self
     }
 
+    /// Whether an epoch-clock animation still moves at `epoch_ms` (the page's wall clock): it needs frames until then.
+    pub fn epoch_live(&self, epoch_ms: f64) -> bool {
+        self.animations.iter().any(|a| a.epoch_moving(epoch_ms))
+    }
+
     /// The packet as it draws at `t_ms` on the host clock. With `motion` off, or nothing animated,
     /// that is the rest frame: the packet itself.
     pub fn resolved(&self, t_ms: f64, motion: bool) -> Cow<'_, GameRenderPacket> {
-        if !motion || self.animations.is_empty() {
+        self.resolved_at(t_ms, 0.0, motion)
+    }
+
+    /// [`Self::resolved`] with the page's wall clock `epoch_ms` for epoch-clock animations; with `motion` off those
+    /// show their end, as a drawable `startMs` animation does under reduced motion.
+    pub fn resolved_at(&self, t_ms: f64, epoch_ms: f64, motion: bool) -> Cow<'_, GameRenderPacket> {
+        let epoch = |a: &Animation| matches!(a.clock, AnimationClock::Epoch { .. });
+        if self.animations.is_empty() || (!motion && !self.animations.iter().any(epoch)) {
             return Cow::Borrowed(self);
         }
         let mut out = self.clone();
         for a in &self.animations {
-            let Some(progress) = a.progress_at(t_ms, self.scroll) else {
+            let progress = if motion {
+                a.progress_at(t_ms, epoch_ms, self.scroll)
+            } else {
+                epoch(a).then_some(1.0)
+            };
+            let Some(progress) = progress else {
                 continue;
             };
             let x = Xform::new(a, a.sample_progress(progress));

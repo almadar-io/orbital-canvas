@@ -49,6 +49,8 @@ pub(super) fn paint_group(
         gathered.text_hits.len(),
     );
     let semantic_start = gathered.semantic.len();
+    let folds = folds_children(node);
+    gathered.folding += u32::from(folds);
     for child in items(node) {
         walk(
             child,
@@ -60,6 +62,7 @@ pub(super) fn paint_group(
             out,
         )?;
     }
+    gathered.folding -= u32::from(folds);
     if let Some(spec) = node.get("target").filter(|t| !t.is_null()) {
         gathered.regions.truncate(region_start);
         gathered.text_hits.truncate(hits_start);
@@ -223,7 +226,7 @@ pub(super) fn paint_group(
     }
     if rect_clip {
         if let Some(DrawCommand::ClipGroup { clip, .. }) = out.get(start) {
-            if let Some(bounds) = segments_bounds(clip) {
+            if let Some(bounds) = path_bounds(clip) {
                 cut_regions_to(&mut gathered.regions, region_start, bounds);
             }
         }
@@ -403,45 +406,6 @@ pub(super) fn rect_clip_segments(
     Ok(path)
 }
 
-/// The box that holds every point of a path (curve control points included).
-pub(super) fn segments_bounds(segments: &[PathSegment]) -> Option<Rect> {
-    let mut bounds: Option<(f32, f32, f32, f32)> = None;
-    let mut add = |x: f32, y: f32| {
-        bounds = Some(match bounds {
-            None => (x, y, x, y),
-            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
-        });
-    };
-    for segment in segments {
-        match *segment {
-            PathSegment::MoveTo { x, y } | PathSegment::LineTo { x, y } => add(x, y),
-            PathSegment::CubicTo {
-                x1,
-                y1,
-                x2,
-                y2,
-                x,
-                y,
-            } => {
-                add(x1, y1);
-                add(x2, y2);
-                add(x, y);
-            }
-            PathSegment::Arc { cx, cy, rx, ry, .. } => {
-                add(cx - rx, cy - ry);
-                add(cx + rx, cy + ry);
-            }
-            PathSegment::Close => {}
-        }
-    }
-    bounds.map(|(x0, y0, x1, y1)| Rect {
-        x: x0,
-        y: y0,
-        w: x1 - x0,
-        h: y1 - y0,
-    })
-}
-
 /// Cut the regions a clipped group gathered to the clip's bounds: one wholly outside is dropped, a straddling
 /// one is intersected, a rotated one stays whole.
 pub(super) fn cut_regions_to(regions: &mut Vec<Region>, from: usize, bounds: Rect) {
@@ -528,6 +492,13 @@ pub(super) fn commands_bounds(commands: &[DrawCommand]) -> Option<Rect> {
                     walk_commands(std::slice::from_ref(command.as_ref()), add)
                 }
                 DrawCommand::AdditiveGroup { commands } => walk_commands(commands, add),
+                DrawCommand::Text { .. } => {
+                    if let orbital_canvas_paint::vector::RunBounds::Box { x0, y0, x1, y1 } =
+                        orbital_canvas_paint::vector::command_bounds(command)
+                    {
+                        add(x0, y0, x1, y1)
+                    }
+                }
                 _ => {}
             }
         }
@@ -539,4 +510,12 @@ pub(super) fn commands_bounds(commands: &[DrawCommand]) -> Option<Rect> {
         w: x1 - x0,
         h: y1 - y0,
     })
+}
+
+/// Whether a `draw-group` folds the commands its children paint into one command: a `clip`, a render `target` or a
+/// `smoothUnion`.
+pub(super) fn folds_children(node: &Value) -> bool {
+    ["clip", "target", "smoothUnion"]
+        .iter()
+        .any(|key| node.get(*key).is_some_and(|v| !v.is_null()))
 }

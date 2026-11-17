@@ -208,12 +208,14 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    @location(1) mask_uv: vec2<f32>,
 };
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
     out.uv = in.uv;
+    out.mask_uv = in.color.xy;
     return out;
 }
 @group(0) @binding(0) var t_content: texture_2d<f32>;
@@ -222,7 +224,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let content = textureSample(t_content, s_surface, in.uv);
-    let coverage = textureSample(t_mask, s_surface, in.uv).a;
+    let coverage = textureSample(t_mask, s_surface, in.mask_uv).a;
     let rgb = select(vec3<f32>(0.0), content.rgb / max(content.a, 0.000001), content.a > 0.0);
     return vec4<f32>(rgb, content.a * coverage);
 }
