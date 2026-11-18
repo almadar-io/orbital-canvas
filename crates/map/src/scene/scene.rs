@@ -138,6 +138,12 @@ pub struct SemanticNode {
     pub multiline: bool,
     /// Heading level 1-6 (`aria-level`).
     pub level: Option<u8>,
+    /// Where a link leads; a host that mirrors the tree renders the node as an anchor with this address.
+    pub href: Option<String>,
+    /// Whether a control that opens a list (a combobox) has it open (`aria-expanded`).
+    pub expanded: Option<bool>,
+    /// The id of the node this one belongs to: an option names its combobox, so a host can group a list under it.
+    pub owner: Option<String>,
     pub order: f32,
     pub rect: Rect,
     /// The node stays put when the page scrolls.

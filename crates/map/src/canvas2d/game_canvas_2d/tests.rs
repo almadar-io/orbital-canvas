@@ -3333,6 +3333,111 @@ fn a_semantic_level_outside_one_to_six_or_not_an_integer_is_refused() {
 }
 
 #[test]
+fn a_link_semantic_carries_its_href_and_no_href_is_none() {
+    let (_, gathered) = from_props_mapped(
+        &free_props(json!([headed_text(
+            json!({"role": "link", "name": "About", "href": "/about"})
+        )])),
+        0.0,
+    )
+    .unwrap();
+    assert_eq!(gathered.semantic[0].href.as_deref(), Some("/about"));
+    let (_, plain) = from_props_mapped(
+        &free_props(json!([headed_text(
+            json!({"role": "link", "name": "About"})
+        )])),
+        0.0,
+    )
+    .unwrap();
+    assert_eq!(plain.semantic[0].href, None, "control: no href is None");
+    for absent in [json!(null), json!("")] {
+        let (_, none) = from_props_mapped(
+            &free_props(json!([headed_text(
+                json!({"role": "link", "name": "About", "href": absent})
+            )])),
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(none.semantic[0].href, None, "edge: null and empty are no href");
+    }
+}
+
+#[test]
+fn a_semantic_href_that_is_not_a_string_is_refused() {
+    for href in [json!(7), json!(true), json!(["/about"])] {
+        let refused = from_props_mapped(
+            &free_props(json!([headed_text(
+                json!({"role": "link", "name": "About", "href": href.clone()})
+            )])),
+            0.0,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&refused, CanvasSceneError::InvalidProp { field, .. } if field == "semantic.href"),
+            "{href}: {refused:?}"
+        );
+    }
+}
+
+#[test]
+fn a_combobox_semantic_carries_whether_it_is_expanded_and_none_when_unsaid() {
+    for open in [true, false] {
+        let (_, gathered) = from_props_mapped(
+            &free_props(json!([headed_text(
+                json!({"role": "combobox", "name": "Language", "expanded": open})
+            )])),
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(gathered.semantic[0].expanded, Some(open));
+    }
+    for absent in [json!({"role": "combobox", "name": "Language"}), json!({"role": "combobox", "name": "Language", "expanded": null})] {
+        let (_, plain) =
+            from_props_mapped(&free_props(json!([headed_text(absent)])), 0.0).unwrap();
+        assert_eq!(plain.semantic[0].expanded, None, "control: unsaid is None");
+    }
+    let refused = from_props_mapped(
+        &free_props(json!([headed_text(
+            json!({"role": "combobox", "name": "Language", "expanded": "yes"})
+        )])),
+        0.0,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&refused, CanvasSceneError::InvalidProp { field, .. } if field == "semantic.expanded"),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn an_option_semantic_names_the_node_that_owns_it() {
+    let (_, gathered) = from_props_mapped(
+        &free_props(json!([headed_text(
+            json!({"role": "option", "name": "English", "owner": "langPick"})
+        )])),
+        0.0,
+    )
+    .unwrap();
+    assert_eq!(gathered.semantic[0].owner.as_deref(), Some("langPick"));
+    for absent in [json!({"role": "option", "name": "English"}), json!({"role": "option", "name": "English", "owner": ""}), json!({"role": "option", "name": "English", "owner": null})] {
+        let (_, plain) =
+            from_props_mapped(&free_props(json!([headed_text(absent)])), 0.0).unwrap();
+        assert_eq!(plain.semantic[0].owner, None, "control: no owner is None");
+    }
+    let refused = from_props_mapped(
+        &free_props(json!([headed_text(
+            json!({"role": "option", "name": "English", "owner": 3})
+        )])),
+        0.0,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&refused, CanvasSceneError::InvalidProp { field, .. } if field == "semantic.owner"),
+        "{refused:?}"
+    );
+}
+
+#[test]
 fn a_group_semantic_with_a_name_is_a_node() {
     let (_, gathered) = from_props_mapped(
         &free_props(json!([headed_text(

@@ -572,6 +572,28 @@ fn walk(
                 })?,
         ),
     };
+    let href = match semantic.get("href") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s.is_empty() => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err(invalid("semantic.href", "a semantic href is a string")),
+    };
+    let expanded = match semantic.get("expanded") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => {
+            return Err(invalid(
+                "semantic.expanded",
+                "a semantic expanded is true or false",
+            ))
+        }
+    };
+    let owner = match semantic.get("owner") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s.is_empty() => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err(invalid("semantic.owner", "a semantic owner is a node id")),
+    };
     gathered.semantic.push(crate::scene::SemanticNode {
         id: id.to_owned(),
         role: text("role")
@@ -586,6 +608,9 @@ fn walk(
         selection_end: index("selectionEnd"),
         multiline: flag("multiline").unwrap_or(false),
         level,
+        href,
+        expanded,
+        owner,
         order: semantic
             .get("order")
             .and_then(Value::as_f64)

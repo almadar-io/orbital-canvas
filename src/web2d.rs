@@ -147,6 +147,15 @@ impl WebSceneCanvas {
                 if let Some(l) = n.level {
                     o.insert("level".into(), l.into());
                 }
+                if let Some(h) = &n.href {
+                    o.insert("href".into(), h.clone().into());
+                }
+                if let Some(e) = n.expanded {
+                    o.insert("expanded".into(), e.into());
+                }
+                if let Some(w) = &n.owner {
+                    o.insert("owner".into(), w.clone().into());
+                }
                 o.insert("order".into(), serde_json::json!(n.order));
                 o.insert(
                     "rect".into(),
