@@ -7,7 +7,9 @@ Every open gap this repo owns lives here. This file is the source of truth; the 
 - **Codes:** new gaps use this repo's prefix `G-ORBITAL-GAME-RENDERER-`. Take the "Next code" below, then bump it in the same edit. Codes are never reused or renamed.
 - **Close by deleting.** Remove the entry in the same commit as the fix.
 
-Next code: `G-ORBITAL-GAME-RENDERER-033`
+Next code: `G-ORBITAL-GAME-RENDERER-034`
+
+- **G-ORBITAL-GAME-RENDERER-033** [mechanical] — Raster sprites are uploaded with a single mip level (`upload_rgba` in `frame/texture.rs`, `sprites.rs`), so a photograph drawn much smaller than its source (a 2400 px museum scan in a 360 px card) is minified by one bilinear tap and shimmers or aliases on fine linework. Found 2026-11-17 while moving the Rasm marketing landings to high-resolution sources; the workaround is data-side (request each image at about twice its largest display width). Fix: build a mip chain on upload for sprites larger than their first draw, and sample with a mipmap filter. Prevention rung: (3) the verifiers (a render test drawing a fine checkerboard at 1/4 scale and asserting no moire band). Severity: low. Root cause: one-off.
 
 - **G-ORBITAL-GAME-RENDERER-031** [architectural] — Epoch-clock motion the packet cannot carry still re-maps the whole 2D scene on every frame it plays (`SceneHost::frame_packet`, `src/host/frame.rs`). Since 2026-11-17 a `startMs` fade or slide (opacity and offsets, given at both ends) on a text, shape or group plays on the packet's `Epoch` clock with no re-map. What still re-maps: a typed reveal, an emitter, an fx layer, and `startMs` tracks of colour, size or other keys. Prevention: none (cost); the scroll probe measures it.
   Severity: medium. Root cause: one-off.
