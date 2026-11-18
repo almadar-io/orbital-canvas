@@ -35,6 +35,38 @@ pub fn visit(commands: &[DrawCommand], into_targets: bool, f: &mut dyn FnMut(&Dr
     }
 }
 
+/// Set every anchored material's `since` to the seconds from its anchor to `epoch_ms`, everywhere in `commands`.
+pub fn stamp_since(commands: &mut [DrawCommand], epoch_ms: f64) {
+    for command in commands {
+        match command {
+            DrawCommand::Sdf {
+                material: Some(material),
+                ..
+            } => {
+                if let Some(anchor) = material.anchor_ms {
+                    material.since = ((epoch_ms - anchor) / 1000.0) as f32;
+                }
+            }
+            DrawCommand::SdfBackdrop { shape, .. } => {
+                stamp_since(std::slice::from_mut(shape), epoch_ms)
+            }
+            DrawCommand::SdfBlend { first, second, .. } => {
+                stamp_since(std::slice::from_mut(first), epoch_ms);
+                stamp_since(std::slice::from_mut(second), epoch_ms);
+            }
+            DrawCommand::Blurred { command, .. } => {
+                stamp_since(std::slice::from_mut(command), epoch_ms)
+            }
+            DrawCommand::Shadow { commands, .. }
+            | DrawCommand::AdditiveGroup { commands }
+            | DrawCommand::Faded { commands, .. }
+            | DrawCommand::ClipGroup { commands, .. }
+            | DrawCommand::Target { commands, .. } => stamp_since(commands, epoch_ms),
+            _ => {}
+        }
+    }
+}
+
 /// The target ids `commands` read (sprites and materials), not looking inside nested targets.
 pub fn reads(commands: &[DrawCommand]) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
@@ -218,6 +250,7 @@ pub mod fixtures {
                 params: Vec::new(),
                 live,
                 since: 0.0,
+                anchor_ms: None,
                 targets: targets.iter().map(|t| (*t).to_owned()).collect(),
             }),
         }
@@ -228,6 +261,53 @@ pub mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
+
+    fn since_of(command: &DrawCommand) -> f32 {
+        match command {
+            DrawCommand::Sdf {
+                material: Some(material),
+                ..
+            } => material.since,
+            _ => panic!("not a material shape"),
+        }
+    }
+
+    fn anchored_at(anchor_ms: Option<f64>) -> DrawCommand {
+        let mut command = material_shape(&[], false);
+        if let DrawCommand::Sdf {
+            material: Some(material),
+            ..
+        } = &mut command
+        {
+            material.anchor_ms = anchor_ms;
+            material.since = 9.0;
+        }
+        command
+    }
+
+    #[test]
+    fn stamp_since_sets_the_seconds_from_each_anchor_and_leaves_unanchored_materials() {
+        let mut commands = vec![
+            anchored_at(Some(1000.0)),
+            anchored_at(None),
+            DrawCommand::AdditiveGroup {
+                commands: vec![anchored_at(Some(4000.0))],
+            },
+        ];
+        stamp_since(&mut commands, 5500.0);
+        assert_eq!(since_of(&commands[0]), 4.5);
+        assert_eq!(since_of(&commands[1]), 9.0, "control: no anchor, untouched");
+        let DrawCommand::AdditiveGroup { commands: nested } = &commands[2] else {
+            panic!("a group");
+        };
+        assert_eq!(since_of(&nested[0]), 1.5, "nested commands are reached");
+        stamp_since(&mut commands, 500.0);
+        assert_eq!(
+            since_of(&commands[0]),
+            -0.5,
+            "edge: before its anchor the time is negative"
+        );
+    }
 
     #[test]
     fn reads_find_sprites_and_materials_and_skip_plain_textures() {

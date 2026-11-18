@@ -4172,6 +4172,28 @@ fn only_a_scene3d_that_moves_wants_frames() {
 }
 
 #[test]
+fn an_anchored_material_is_no_mapper_effect_the_host_reads_its_time_at_each_frame() {
+    let plate = |material: Value| {
+        json!({"type": "canvas", "drawables": [{"type": "draw-shape", "shape": "rect", "position": {"x": 0, "y": 0},
+            "width": 10, "height": 10, "fill": "#000000", "material": material}]})
+    };
+    let shade = "fn shade(px: Pixel) -> vec4<f32> { return px.color; }";
+    let anchored = plate(json!({"wgsl": shade, "anchor": 1000.0}));
+    assert!(
+        !has_active_fx(&anchored),
+        "an anchor alone asks for no new mapping"
+    );
+    assert!(!active_fx_live(&anchored, 2000.0));
+    let frames = json!([{"at": 0, "opacity": 1}, {"at": 1, "opacity": 1}]);
+    let looping = json!({"type": "canvas", "drawables": [{"type": "draw-text", "text": "07", "color": "#000000",
+        "font": "16px sans-serif", "position": {"x": 5, "y": 5}, "animation": {"durationMs": 2000, "keyframes": frames}}]});
+    assert!(
+        active_fx_live(&looping, 2000.0),
+        "control: a looping animation is still mapped at the clock"
+    );
+}
+
+#[test]
 fn a_finished_paint_clock_animation_is_not_live_and_a_looping_one_is() {
     let text = |animation: Value| {
         json!({"type": "canvas", "drawables": [{"type": "draw-text", "text": "07", "color": "#000000",
@@ -4215,6 +4237,78 @@ fn broken_words_box(width: f32, wrap: bool, truncate: bool) -> ParagraphBox {
 
 fn sans_at(text: &str, size: f32) -> f32 {
     orbital_canvas_paint::vector::shape(text, size, false, TextFamily::Sans).width
+}
+
+#[test]
+fn a_paragraph_laid_out_again_comes_from_the_cache_unchanged() {
+    let text = "cache round trip alpha beta gamma delta epsilon";
+    let frame = broken_words_box(sans_at("cache round trip alpha", 12.0), true, false);
+    let first = layout_paragraph(text, 12.0, false, TextFamily::Sans, frame);
+    let again = layout_paragraph(text, 12.0, false, TextFamily::Sans, frame);
+    assert!(first.lines.len() >= 2, "{:?}", first.lines);
+    assert_eq!(first, again);
+    let fresh =
+        paragraph::layout_paragraph_uncached(text, 12.0, false, TextFamily::Sans, frame);
+    assert_eq!(first, fresh);
+    assert!(paragraph::paragraph_cache_len() >= 1);
+}
+
+#[test]
+fn control_a_different_width_wrap_or_line_cap_is_its_own_layout() {
+    let text = "keyed control one two three four five\nsix seven eight nine ten";
+    let wide_width = sans_at(text, 12.0) * 2.0;
+    let wide = layout_paragraph(
+        text,
+        12.0,
+        false,
+        TextFamily::Sans,
+        broken_words_box(wide_width, true, false),
+    );
+    let narrow = layout_paragraph(
+        text,
+        12.0,
+        false,
+        TextFamily::Sans,
+        broken_words_box(sans_at("keyed control one", 12.0), true, false),
+    );
+    assert!(narrow.lines.len() > wide.lines.len(), "{:?}", narrow.lines);
+    let flat = layout_paragraph(
+        text,
+        12.0,
+        false,
+        TextFamily::Sans,
+        broken_words_box(sans_at("keyed control one", 12.0), false, false),
+    );
+    assert_eq!(flat.lines.len(), 2);
+    assert_ne!(flat, narrow);
+    let capped = layout_paragraph(
+        text,
+        12.0,
+        false,
+        TextFamily::Sans,
+        ParagraphBox {
+            max_lines: Some(1),
+            ..broken_words_box(sans_at("keyed control one", 12.0), true, false)
+        },
+    );
+    assert!(capped.lines.len() <= 1, "{:?}", capped.lines);
+    assert_ne!(capped, narrow);
+    let wide_again = layout_paragraph(
+        text,
+        12.0,
+        false,
+        TextFamily::Sans,
+        broken_words_box(wide_width, true, false),
+    );
+    assert_eq!(wide, wide_again);
+}
+
+#[test]
+fn edge_an_empty_paragraph_is_cached_like_any_other() {
+    let frame = broken_words_box(100.0, true, false);
+    let first = layout_paragraph("", 12.0, false, TextFamily::Sans, frame);
+    let again = layout_paragraph("", 12.0, false, TextFamily::Sans, frame);
+    assert_eq!(first, again);
 }
 
 #[test]

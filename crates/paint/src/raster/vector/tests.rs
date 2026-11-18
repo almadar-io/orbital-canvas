@@ -191,6 +191,74 @@ fn a_shadow_paints_the_coverage_in_its_color_blurred_past_the_edge() {
     );
 }
 
+fn bounds_text(s: &str, x: f32, size: f32) -> DrawCommand {
+    DrawCommand::Text {
+        color_runs: Vec::new(),
+        rotation: 0.0,
+        text: s.into(),
+        pos: Vec2 { x, y: 30.0 },
+        size,
+        color: RED,
+        align: TextAlign::Left,
+        weight: 400,
+        halo: None,
+        family: orbital_canvas_base::packet::TextFamily::Sans,
+    }
+}
+
+#[test]
+fn text_bounds_are_the_same_from_the_cache_as_outlined_afresh() {
+    let word = "cachedbounds-same-as-fresh";
+    let cmd = bounds_text(word, 12.0, 18.0);
+    let first = command_bounds(&cmd);
+    let second = command_bounds(&cmd);
+    assert_eq!(first, second);
+    let pos = Vec2 { x: 12.0, y: 30.0 };
+    let direct = text_path(word, pos, 18.0, TextAlign::Left, false, Family::Sans).map(|p| {
+        let b = p.all.bounds();
+        [b.left(), b.top(), b.right(), b.bottom()]
+    });
+    assert!(direct.is_some());
+    assert_eq!(
+        text_ink_bounds(word, pos, 18.0, TextAlign::Left, false, Family::Sans),
+        direct
+    );
+    assert!(text_bounds_cache_len() > 0);
+}
+
+#[test]
+fn control_text_at_another_position_or_size_has_its_own_bounds() {
+    let word = "cachedbounds-position-and-size";
+    let base = command_bounds(&bounds_text(word, 12.0, 18.0));
+    let moved = command_bounds(&bounds_text(word, 112.0, 18.0));
+    let larger = command_bounds(&bounds_text(word, 12.0, 36.0));
+    let RunBounds::Box { x0: bx, x1: bw, .. } = base else {
+        panic!("text has a box");
+    };
+    let RunBounds::Box { x0: mx, x1: mw, .. } = moved else {
+        panic!("moved text has a box");
+    };
+    let RunBounds::Box { x1: lw, .. } = larger else {
+        panic!("larger text has a box");
+    };
+    assert_ne!(base, moved);
+    assert_ne!(base, larger);
+    assert!((mx - bx - 100.0).abs() < 0.01 && (mw - bw - 100.0).abs() < 0.01);
+    assert!(lw > bw);
+}
+
+#[test]
+fn edge_text_with_no_outline_has_no_bounds_and_that_is_cached_too() {
+    let empty = bounds_text("", 12.0, 18.0);
+    assert_eq!(command_bounds(&empty), RunBounds::Empty);
+    assert_eq!(command_bounds(&empty), RunBounds::Empty);
+    let pos = Vec2 { x: 12.0, y: 30.0 };
+    assert_eq!(
+        text_ink_bounds("", pos, 18.0, TextAlign::Left, false, Family::Sans),
+        None
+    );
+}
+
 fn ink_top(text: &str, weight: u16) -> Option<u32> {
     let cmd = DrawCommand::Text {
         color_runs: Vec::new(),

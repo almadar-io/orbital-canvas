@@ -5,7 +5,6 @@
 use orbital_canvas_base::packet::{DrawCommand, SdfKind, SdfMaterial, Vec2};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use wgpu::util::DeviceExt;
 
 use orbital_canvas_base::shaders::{check_material, material_source, plain_material_source};
 
@@ -197,6 +196,8 @@ pub(crate) struct SdfPass {
     backdrop: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
     sampler: wgpu::Sampler,
     empty: wgpu::TextureView,
+    pool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    used: usize,
 }
 
 /// A backdrop's two pipelines: the first clears the frame where the shape covers, the second adds the blurred frame.
@@ -306,6 +307,8 @@ impl SdfPass {
             backdrop: None,
             sampler,
             empty,
+            pool: Vec::new(),
+            used: 0,
         }
     }
 
@@ -397,17 +400,34 @@ impl SdfPass {
         self.pipelines.get(&key)
     }
 
-    /// A uniform buffer holding the frame (packet size, clock, pointer) and up to [`MAX_INSTANCES`] shapes.
+    /// Start a frame: drop the pooled buffers the last frame did not use and hand every kept one out again.
+    pub(crate) fn begin_frame(&mut self) {
+        let used = self.used.min(self.pool.len());
+        for (buffer, _) in self.pool.drain(used..) {
+            buffer.destroy();
+        }
+        self.used = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pool_len(&self) -> usize {
+        self.pool.len()
+    }
+
+    /// A pooled uniform buffer's bind group holding the frame (packet size, clock, pointer) and up to [`MAX_INSTANCES`]
+    /// shapes; only the shapes held are written, the draw reads no further.
     pub(crate) fn bind_group(
-        &self,
+        &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         instances: &[SdfInstance],
         packet_size: (f32, f32),
         time_ms: f64,
         pointer: Option<Vec2>,
         scroll: f32,
-    ) -> (wgpu::BindGroup, wgpu::Buffer) {
-        let mut floats = vec![0.0f32; HEADER_FLOATS + MAX_INSTANCES * FIELDS * 4];
+    ) -> wgpu::BindGroup {
+        let held = instances.len().min(MAX_INSTANCES);
+        let mut floats = vec![0.0f32; HEADER_FLOATS + held * FIELDS * 4];
         floats[0] = packet_size.0.max(1.0);
         floats[1] = packet_size.1.max(1.0);
         floats[2] = (time_ms / 1000.0) as f32;
@@ -423,20 +443,28 @@ impl SdfPass {
                 floats[at..at + 4].copy_from_slice(slot);
             }
         }
-        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("sdf instances"),
-            contents: bytemuck::cast_slice(&floats),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sdf bind group"),
-            layout: &self.layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffer.as_entire_binding(),
-            }],
-        });
-        (group, buffer)
+        if self.used == self.pool.len() {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sdf instances"),
+                size: ((HEADER_FLOATS + MAX_INSTANCES * FIELDS * 4) * std::mem::size_of::<f32>())
+                    as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("sdf bind group"),
+                layout: &self.layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+            });
+            self.pool.push((buffer, group));
+        }
+        queue.write_buffer(&self.pool[self.used].0, 0, bytemuck::cast_slice(&floats));
+        let group = self.pool[self.used].1.clone();
+        self.used += 1;
+        group
     }
 }
 

@@ -321,6 +321,9 @@ impl SharedDeviceRenderer {
                 glyphs.begin_frame();
             }
             self.targets.begin_frame();
+            if let Some(sdf) = self.sdf.as_mut() {
+                sdf.begin_frame();
+            }
         }
         self.render_depth += 1;
         let transient_mark = self.transient_len();

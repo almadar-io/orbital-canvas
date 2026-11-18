@@ -367,12 +367,6 @@ fn fx(node: &Value, clock: Option<f64>) -> bool {
     }) {
         return true;
     }
-    if node
-        .pointer("/material/anchor")
-        .is_some_and(|anchor| anchor.as_f64().is_some())
-    {
-        return true;
-    }
     if node.get("type").and_then(Value::as_str) == Some("draw-text")
         && node
             .get("caret")

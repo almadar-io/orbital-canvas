@@ -25,7 +25,99 @@ pub(crate) struct ParagraphBox {
     pub truncate: bool,
 }
 
+type ParagraphKey = (
+    String,
+    u32,
+    bool,
+    orbital_canvas_base::packet::TextFamily,
+    u32,
+    bool,
+    Option<usize>,
+    bool,
+);
+
+const PARAGRAPH_CACHE_ENTRIES: usize = 16_384;
+
+/// Laid-out paragraphs by their inputs, valid for one (font generation, asset generation).
+#[derive(Default)]
+struct ParagraphCache {
+    generations: (u64, u64),
+    entries: std::collections::HashMap<ParagraphKey, Paragraph>,
+}
+
+impl ParagraphCache {
+    fn get(&mut self, generations: (u64, u64), key: &ParagraphKey) -> Option<Paragraph> {
+        if self.generations != generations {
+            self.entries.clear();
+            self.generations = generations;
+        }
+        self.entries.get(key).cloned()
+    }
+
+    fn put(&mut self, generations: (u64, u64), key: ParagraphKey, paragraph: &Paragraph) {
+        if self.generations != generations {
+            return;
+        }
+        if self.entries.len() >= PARAGRAPH_CACHE_ENTRIES {
+            self.entries.clear();
+        }
+        self.entries.insert(key, paragraph.clone());
+    }
+}
+
+fn paragraph_cache() -> &'static std::sync::Mutex<ParagraphCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ParagraphCache>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// How many paragraphs the cache holds.
+#[cfg(test)]
+pub(crate) fn paragraph_cache_len() -> usize {
+    paragraph_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entries
+        .len()
+}
+
 pub(crate) fn layout_paragraph(
+    text: &str,
+    size: f32,
+    bold: bool,
+    family: orbital_canvas_base::packet::TextFamily,
+    frame: ParagraphBox,
+) -> Paragraph {
+    let generations = (
+        orbital_canvas_paint::vector::font_generation(),
+        orbital_canvas_paint::asset::generation(),
+    );
+    let key = (
+        text.to_owned(),
+        size.to_bits(),
+        bold,
+        family,
+        frame.width.to_bits(),
+        frame.wrap,
+        frame.max_lines,
+        frame.truncate,
+    );
+    let cached = paragraph_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(generations, &key);
+    if let Some(paragraph) = cached {
+        return paragraph;
+    }
+    let paragraph = layout_paragraph_uncached(text, size, bold, family, frame);
+    paragraph_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .put(generations, key, &paragraph);
+    paragraph
+}
+
+pub(super) fn layout_paragraph_uncached(
     text: &str,
     size: f32,
     bold: bool,

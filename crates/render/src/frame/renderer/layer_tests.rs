@@ -109,6 +109,7 @@ fn material(wgsl: &str, targets: &[&str]) -> SdfMaterial {
         params: vec![],
         live: false,
         since: 0.0,
+            anchor_ms: None,
         targets: targets.iter().map(|t| (*t).to_owned()).collect(),
     }
 }

@@ -68,7 +68,7 @@ impl SharedDeviceRenderer {
         packet: &GameRenderPacket,
         out: &mut Vec<Draw>,
     ) {
-        let (device, format) = (self.device.clone(), self.format);
+        let (device, queue, format) = (self.device.clone(), self.queue.clone(), self.format);
         let pass = self
             .sdf
             .get_or_insert_with(|| crate::sdf::SdfPass::new(&device, format));
@@ -77,26 +77,22 @@ impl SharedDeviceRenderer {
             return;
         }
         let aux = pass.aux_group(&device, None, run.target.as_ref().map(|t| &t.view));
-        let mut kept = Vec::new();
         for chunk in crate::sdf::batches(&run.instances) {
-            let (bind_group, buffer) = pass.bind_group(
+            let bind_group = pass.bind_group(
                 &device,
+                &queue,
                 chunk,
                 (packet.width, packet.height),
                 packet.time_ms,
                 packet.pointer,
                 packet.scroll,
             );
-            kept.push(buffer);
             out.push(Draw::Sdf {
                 key: run.key,
                 bind_group,
                 aux: aux.clone(),
                 count: chunk.len() as u32,
             });
-        }
-        for buffer in &kept {
-            self.keep(buffer);
         }
     }
 

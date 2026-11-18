@@ -63,6 +63,94 @@ pub(super) fn path_bounds(segments: &[PathSegment], stroke: Option<&Stroke>) -> 
     .grow(reach)
 }
 
+/// The most text ink bounds the cache holds before it starts over.
+const TEXT_BOUNDS_CACHE_ENTRIES: usize = 16_384;
+
+type TextBoundsKey = (String, u32, u32, u32, u8, bool, Family);
+
+/// Ink bounds of placed texts by their inputs, valid for one (font generation, asset generation).
+#[derive(Default)]
+struct TextBoundsCache {
+    generations: (u64, u64),
+    entries: std::collections::HashMap<TextBoundsKey, Option<[f32; 4]>>,
+}
+
+impl TextBoundsCache {
+    fn get(&mut self, generations: (u64, u64), key: &TextBoundsKey) -> Option<Option<[f32; 4]>> {
+        if self.generations != generations {
+            self.entries.clear();
+            self.generations = generations;
+        }
+        self.entries.get(key).copied()
+    }
+
+    fn put(&mut self, generations: (u64, u64), key: TextBoundsKey, bounds: Option<[f32; 4]>) {
+        if self.generations != generations {
+            return;
+        }
+        if self.entries.len() >= TEXT_BOUNDS_CACHE_ENTRIES {
+            self.entries.clear();
+        }
+        self.entries.insert(key, bounds);
+    }
+}
+
+fn text_bounds_cache() -> &'static Mutex<TextBoundsCache> {
+    static CACHE: OnceLock<Mutex<TextBoundsCache>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn text_bounds_cache_len() -> usize {
+    text_bounds_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entries
+        .len()
+}
+
+/// `[left, top, right, bottom]` of the outline [`text_path`] places, kept by its inputs until a font or an asset arrives.
+pub(super) fn text_ink_bounds(
+    text: &str,
+    pos: Vec2,
+    size: f32,
+    align: TextAlign,
+    bold: bool,
+    family: Family,
+) -> Option<[f32; 4]> {
+    let generations = (font_generation(), crate::asset::generation());
+    let align_code = match align {
+        TextAlign::Left => 0,
+        TextAlign::Center => 1,
+        TextAlign::Right => 2,
+    };
+    let key = (
+        text.to_owned(),
+        pos.x.to_bits(),
+        pos.y.to_bits(),
+        size.to_bits(),
+        align_code,
+        bold,
+        family,
+    );
+    let cached = text_bounds_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(generations, &key);
+    if let Some(bounds) = cached {
+        return bounds;
+    }
+    let bounds = text_path(text, pos, size, align, bold, family).map(|paths| {
+        let b = paths.all.bounds();
+        [b.left(), b.top(), b.right(), b.bottom()]
+    });
+    text_bounds_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .put(generations, key, bounds);
+    bounds
+}
+
 /// The box a vector command paints into, from the same path and text outlines [`draw_command`] fills: a stroke
 /// reaches twice its width past the outline (a mitre), a blur and a shadow three times their spread.
 pub fn command_bounds(command: &DrawCommand) -> RunBounds {
@@ -96,21 +184,15 @@ pub fn command_bounds(command: &DrawCommand) -> RunBounds {
             family,
             rotation,
             ..
-        } => match text_path(text, *pos, *size, *align, *weight >= 600, *family) {
-            Some(paths) => {
-                let b = paths.all.bounds();
+        } => match text_ink_bounds(text, *pos, *size, *align, *weight >= 600, *family) {
+            Some([left, top, right, bottom]) => {
                 let reach = halo.as_ref().map(|h| h.width).unwrap_or(0.0) + size * 0.05 + 1.0;
                 let (sin, cos) = rotation.sin_cos();
-                let corners = [
-                    (b.left(), b.top()),
-                    (b.right(), b.top()),
-                    (b.right(), b.bottom()),
-                    (b.left(), b.bottom()),
-                ]
-                .map(|(x, y)| {
-                    let (dx, dy) = (x - pos.x, y - pos.y);
-                    (pos.x + dx * cos - dy * sin, pos.y + dx * sin + dy * cos)
-                });
+                let corners =
+                    [(left, top), (right, top), (right, bottom), (left, bottom)].map(|(x, y)| {
+                        let (dx, dy) = (x - pos.x, y - pos.y);
+                        (pos.x + dx * cos - dy * sin, pos.y + dx * sin + dy * cos)
+                    });
                 let xs = corners.map(|c| c.0);
                 let ys = corners.map(|c| c.1);
                 RunBounds::Box {

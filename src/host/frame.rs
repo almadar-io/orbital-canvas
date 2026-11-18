@@ -63,7 +63,8 @@ impl SceneHost {
                     .packet
                     .as_ref()
                     .is_some_and(|p| p.epoch_live(self.epoch_clock_ms)))
-            || (self.motion && (!self.springs.settled() || self.live_material))
+            || (self.motion && !self.springs.settled())
+            || self.clocked_material_wants_frames()
             || (self.motion && self.epoch_clock_ms > 0.0 && !self.live_scenes3d.is_empty())
             || (self.motion
                 && self.epoch_clock_ms > 0.0
@@ -88,6 +89,38 @@ impl SceneHost {
                 }))
             || asset::pending() > 0
             || asset::generation() != self.asset_generation
+    }
+
+    /// Whether a material that reads the clock (`live`, a live target, or an `anchor`) is drawn where it shows. On a
+    /// canvas that scrolls as a page, a top-level rect is judged by its place against the view; anything the host
+    /// cannot place that way (nested, another anchor, animated) counts wherever it is, as on a canvas with no scroll.
+    fn clocked_material_wants_frames(&self) -> bool {
+        if !self.motion {
+            return false;
+        }
+        let Some(scene) = self.scene.as_ref() else {
+            return self.live_material;
+        };
+        let root = scene.get("props").unwrap_or(scene);
+        let view = self
+            .scroll_declared()
+            .map(|_| self.packet.as_ref().map_or(0.0, |p| p.height));
+        ["drawables", "children"]
+            .into_iter()
+            .filter_map(|key| root.get(key).and_then(serde_json::Value::as_array))
+            .flatten()
+            .any(|drawable| {
+                let (live, anchored) = clocked(drawable);
+                let counts = live || (anchored && self.epoch_clock_ms > 0.0);
+                counts
+                    && match (view, placed_rows(drawable)) {
+                        (Some(height), Some((top, bottom, fixed))) => {
+                            let offset = if fixed { 0.0 } else { self.page_scroll.offset };
+                            bottom - offset > 0.0 && top - offset < height
+                        }
+                        _ => true,
+                    }
+            })
     }
 
     /// The current packet as it draws at the clock's scene time.
@@ -181,6 +214,9 @@ impl SceneHost {
             .resolved_at(self.scene_time(), self.epoch_clock_ms, self.motion)
             .into_owned();
         packet.time_ms = self.scene_time();
+        if self.epoch_clock_ms > 0.0 {
+            crate::targets::stamp_since(&mut packet.draw_commands, self.epoch_clock_ms);
+        }
         packet.pointer = self.pointer.map(|(x, y)| packet::Vec2 { x, y });
         packet.scrolled(offset)
     }
@@ -240,4 +276,65 @@ fn replace_in(
         }
     }
     false
+}
+
+/// Whether `drawable` or anything under it paints a live material or live target, and whether one carries an anchor.
+fn clocked(drawable: &serde_json::Value) -> (bool, bool) {
+    let flag = |pointer: &str| {
+        drawable
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    let mut live = flag("/material/live") || flag("/target/live");
+    let mut anchored = drawable
+        .pointer("/material/anchor")
+        .is_some_and(|anchor| anchor.as_f64().is_some());
+    for key in ["props", "drawables", "children", "items"] {
+        match drawable.get(key) {
+            Some(serde_json::Value::Array(items)) => {
+                for item in items {
+                    let (l, a) = clocked(item);
+                    live |= l;
+                    anchored |= a;
+                }
+            }
+            Some(child @ serde_json::Value::Object(_)) => {
+                let (l, a) = clocked(child);
+                live |= l;
+                anchored |= a;
+            }
+            _ => {}
+        }
+    }
+    (live, anchored)
+}
+
+/// The rows a top-level drawable covers and whether it is fixed, when that is plain to read: a `draw-shape` anchored
+/// top-left with a numeric place and height, no animation and nothing nested.
+fn placed_rows(drawable: &serde_json::Value) -> Option<(f32, f32, bool)> {
+    let text = |key: &str| drawable.get(key).and_then(serde_json::Value::as_str);
+    if text("type") != Some("draw-shape") || text("anchor") != Some("top-left") {
+        return None;
+    }
+    if [
+        "animation",
+        "rotate",
+        "props",
+        "drawables",
+        "children",
+        "items",
+    ]
+    .into_iter()
+    .any(|key| drawable.get(key).is_some())
+    {
+        return None;
+    }
+    let top = drawable.pointer("/position/y")?.as_f64()? as f32;
+    let height = drawable.get("height")?.as_f64()? as f32;
+    let fixed = drawable
+        .get("fixed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Some((top, top + height, fixed))
 }

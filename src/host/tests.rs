@@ -1822,6 +1822,160 @@ fn scroll_scene(declared: bool) -> serde_json::Value {
     scene
 }
 
+fn clocked_page(
+    material: serde_json::Value,
+    y: f64,
+    extra: serde_json::Value,
+    scroll: bool,
+) -> SceneHost {
+    let mut plate = serde_json::json!({"type": "draw-shape", "id": "art", "shape": "rect", "anchor": "top-left",
+        "position": {"x": 0, "y": y}, "width": 200, "height": 40, "fill": "#000000", "material": material});
+    for (key, value) in extra.as_object().cloned().unwrap_or_default() {
+        plate[key] = value;
+    }
+    let mut scene = serde_json::json!({
+        "type": "canvas", "mode": "2d", "projection": "free", "camera": {"zoom": 1}, "width": 200, "height": 100,
+        "drawables": [plate]
+    });
+    if scroll {
+        scene["scroll"] = serde_json::json!({"height": 600});
+    }
+    let mut host = SceneHost::new();
+    host.set_epoch_clock(5000.0);
+    host.set_scene(scene).unwrap();
+    host
+}
+
+const SHADE: &str = "fn shade(px: Pixel) -> vec4<f32> { return px.color; }";
+
+#[test]
+fn a_live_material_scrolled_out_of_view_asks_for_no_frames_and_asks_again_in_view() {
+    let live = serde_json::json!({"wgsl": SHADE, "live": true});
+    let mut below = clocked_page(live.clone(), 300.0, serde_json::json!({}), true);
+    assert!(!below.wants_frames(), "the art is below the 100-high view");
+    assert!(below.wheel(10.0, 50.0, 0.0, 220.0));
+    assert!(
+        below.wants_frames(),
+        "scrolled to 220 the art at 300 to 340 is in view"
+    );
+    assert!(below.wheel(10.0, 50.0, 0.0, 200.0));
+    assert!(
+        !below.wants_frames(),
+        "scrolled to 420 it has left through the top"
+    );
+    assert!(
+        clocked_page(live, 20.0, serde_json::json!({}), true).wants_frames(),
+        "control: in view at rest it keeps its frames"
+    );
+}
+
+#[test]
+fn edge_a_live_material_touching_the_view_edge_by_any_amount_is_in_view() {
+    let live = serde_json::json!({"wgsl": SHADE, "live": true});
+    let mut host = clocked_page(live, 300.0, serde_json::json!({}), true);
+    assert!(host.wheel(10.0, 50.0, 0.0, 201.0));
+    assert!(
+        host.wants_frames(),
+        "one unit of it shows at the bottom edge"
+    );
+    assert!(host.wheel(10.0, 50.0, 0.0, 139.0));
+    assert!(
+        !host.wants_frames(),
+        "at 340 its bottom edge sits on the view top: nothing shows"
+    );
+}
+
+#[test]
+fn an_anchored_material_out_of_view_asks_for_no_frames() {
+    let anchored = serde_json::json!({"wgsl": SHADE, "live": false, "anchor": 1000.0});
+    assert!(!clocked_page(anchored.clone(), 300.0, serde_json::json!({}), true).wants_frames());
+    assert!(
+        clocked_page(anchored, 20.0, serde_json::json!({}), true).wants_frames(),
+        "control: in view its clock runs"
+    );
+}
+
+fn first_since(packet: &GameRenderPacket) -> f32 {
+    packet
+        .draw_commands
+        .iter()
+        .find_map(|command| match command {
+            DrawCommand::Sdf {
+                material: Some(material),
+                ..
+            } => Some(material.since),
+            _ => None,
+        })
+        .expect("a material shape")
+}
+
+#[test]
+fn an_anchored_material_reads_its_elapsed_time_at_every_frame() {
+    let anchored = serde_json::json!({"wgsl": SHADE, "live": false, "anchor": 1000.0});
+    let mut host = clocked_page(anchored, 20.0, serde_json::json!({}), true);
+    assert_eq!(first_since(&host.frame_packet().unwrap()), 4.0);
+    host.set_epoch_clock(6500.0);
+    assert_eq!(
+        first_since(&host.frame_packet().unwrap()),
+        5.5,
+        "the clock moved and the scene was not set again"
+    );
+    let plain = serde_json::json!({"wgsl": SHADE, "live": true});
+    let mut still = clocked_page(plain, 20.0, serde_json::json!({}), true);
+    still.set_epoch_clock(6500.0);
+    assert_eq!(
+        first_since(&still.frame_packet().unwrap()),
+        0.0,
+        "control: no anchor, no elapsed time"
+    );
+}
+
+#[test]
+fn a_fixed_live_material_keeps_its_frames_however_far_the_page_scrolls() {
+    let live = serde_json::json!({"wgsl": SHADE, "live": true});
+    let mut host = clocked_page(live, 20.0, serde_json::json!({"fixed": true}), true);
+    assert!(host.wheel(10.0, 50.0, 0.0, 400.0));
+    assert!(host.wants_frames());
+}
+
+#[test]
+fn control_without_page_scroll_a_live_material_keeps_its_frames_wherever_it_is() {
+    let live = serde_json::json!({"wgsl": SHADE, "live": true});
+    assert!(clocked_page(live, 300.0, serde_json::json!({}), false).wants_frames());
+}
+
+#[test]
+fn control_a_live_material_the_host_cannot_place_keeps_its_frames() {
+    let live = serde_json::json!({"wgsl": SHADE, "live": true});
+    let frames = serde_json::json!([{"at": 0, "offsetY": -400}, {"at": 1, "offsetY": 0}]);
+    assert!(
+        clocked_page(
+            live.clone(),
+            300.0,
+            serde_json::json!({"anchor": "center"}),
+            true
+        )
+        .wants_frames(),
+        "another anchor"
+    );
+    assert!(
+        clocked_page(live.clone(), 300.0, serde_json::json!({"animation": {"clock": "scroll", "from": 0, "to": 100, "keyframes": frames}}), true).wants_frames(),
+        "an animation may move it"
+    );
+    let mut nested = SceneHost::new();
+    nested.set_epoch_clock(5000.0);
+    nested
+        .set_scene(serde_json::json!({
+            "type": "canvas", "mode": "2d", "projection": "free", "camera": {"zoom": 1}, "width": 200, "height": 100,
+            "scroll": {"height": 600},
+            "drawables": [{"type": "draw-group", "id": "g", "position": {"x": 0, "y": 300}, "children": [
+                {"type": "draw-shape", "id": "art", "shape": "rect", "anchor": "top-left", "position": {"x": 0, "y": 0},
+                 "width": 200, "height": 40, "fill": "#000000", "material": live}]}]
+        }))
+        .unwrap();
+    assert!(nested.wants_frames(), "inside a group");
+}
+
 fn command_text(p: &GameRenderPacket, i: usize) -> String {
     format!("{:?}", p.draw_commands[i])
 }

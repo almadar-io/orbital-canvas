@@ -37,7 +37,7 @@ impl SharedDeviceRenderer {
         let wgsl = material.map(|m| m.wgsl.clone());
         let key = crate::sdf::pipeline_key(wgsl.as_deref());
         let target = self.material_target(material);
-        let (device, format) = (self.device.clone(), self.format);
+        let (device, queue, format) = (self.device.clone(), self.queue.clone(), self.format);
         self.blur
             .get_or_insert_with(|| crate::backdrop::BlurPass::new(&device, format));
         let pass = self
@@ -48,8 +48,9 @@ impl SharedDeviceRenderer {
             return None;
         }
         pass.ensure_backdrop(&device);
-        let (bind_group, buffer) = pass.bind_group(
+        let bind_group = pass.bind_group(
             &device,
+            &queue,
             &[instance],
             (packet.width, packet.height),
             packet.time_ms,
@@ -58,7 +59,6 @@ impl SharedDeviceRenderer {
         );
         let behind = set.b.create_view(&wgpu::TextureViewDescriptor::default());
         let aux = pass.aux_group(&device, Some(&behind), target.as_ref().map(|t| &t.view));
-        self.keep(&buffer);
         Some(Draw::Backdrop(Box::new(BackdropDraw {
             job: crate::backdrop::BackdropJob {
                 frame: set.frame.clone(),

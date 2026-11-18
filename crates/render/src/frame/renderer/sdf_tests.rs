@@ -92,6 +92,7 @@ fn with_material(wgsl: &str) -> DrawCommand {
             params: vec![],
             live: true,
             since: 0.0,
+            anchor_ms: None,
             targets: Vec::new(),
         });
     }
@@ -421,4 +422,77 @@ fn releasing_from_a_mark_keeps_the_buffers_an_outer_frame_still_needs() {
     );
     r.release_transient(0);
     assert_eq!(r.transient_len(), 0);
+}
+
+fn coloured(fill: [f32; 4]) -> DrawCommand {
+    let mut command = shape(SdfKind::Rect, full());
+    if let DrawCommand::Sdf { fill: f, .. } = &mut command {
+        *f = fill;
+    }
+    command
+}
+
+fn pool_len(r: &SharedDeviceRenderer) -> usize {
+    r.sdf.as_ref().map_or(0, |pass| pass.pool_len())
+}
+
+#[test]
+fn a_second_frame_reuses_the_pooled_buffers_and_draws_its_own_data() {
+    let Some(mut r) = renderer() else { return };
+    let blue = [0.0, 0.0, 1.0, 1.0];
+    let Some(first) = draw(&mut r, &packet(vec![coloured(RED)], 0.0, None), 64) else {
+        return;
+    };
+    let after_first = pool_len(&r);
+    let Some(second) = draw(&mut r, &packet(vec![coloured(blue)], 0.0, None), 64) else {
+        return;
+    };
+    assert!(px(&first, 64, 32, 32)[0] > 200 && px(&first, 64, 32, 32)[2] < 50);
+    assert!(
+        px(&second, 64, 32, 32)[2] > 200 && px(&second, 64, 32, 32)[0] < 50,
+        "the second frame paints its own colour, not the stale one"
+    );
+    assert_eq!(after_first, 1);
+    assert_eq!(pool_len(&r), after_first, "no growth between frames");
+}
+
+#[test]
+fn control_a_frame_with_fewer_shapes_shrinks_the_pool_on_the_next_frame() {
+    let Some(mut r) = renderer() else { return };
+    let many = vec![coloured(RED); crate::sdf::MAX_INSTANCES + 1];
+    if draw(&mut r, &packet(many, 0.0, None), 64).is_none() {
+        return;
+    }
+    assert_eq!(pool_len(&r), 2, "more than one batch needs two buffers");
+    let one = packet(vec![coloured(RED)], 0.0, None);
+    if draw(&mut r, &one, 64).is_none() || draw(&mut r, &one, 64).is_none() {
+        return;
+    }
+    assert_eq!(pool_len(&r), 1);
+}
+
+#[test]
+fn edge_two_runs_in_one_frame_get_two_pooled_buffers() {
+    let Some(mut r) = renderer() else { return };
+    let left = "fn shade(px: Pixel) -> vec4<f32> { return vec4<f32>(1.0, 0.0, 0.0, 1.0); }";
+    let right = "fn shade(px: Pixel) -> vec4<f32> { return vec4<f32>(0.0, 0.0, 1.0, 1.0); }";
+    let half = |wgsl: &str, x: f32| {
+        let mut command = with_material(wgsl);
+        if let DrawCommand::Sdf { rect, .. } = &mut command {
+            *rect = Rect {
+                x,
+                y: 0.0,
+                w: 32.0,
+                h: 64.0,
+            };
+        }
+        command
+    };
+    let frame = packet(vec![half(left, 0.0), half(right, 32.0)], 0.0, None);
+    let Some(out) = draw(&mut r, &frame, 64) else {
+        return;
+    };
+    assert!(px(&out, 64, 16, 32)[0] > 200 && px(&out, 64, 16, 32)[2] < 50);
+    assert!(px(&out, 64, 48, 32)[2] > 200 && px(&out, 64, 48, 32)[0] < 50);
+    assert!(pool_len(&r) >= 2);
 }

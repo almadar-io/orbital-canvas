@@ -384,6 +384,10 @@ pub struct SdfMaterial {
     /// Seconds from `material.anchor` to this frame's epoch, read as `Pixel.since`; 0 without an anchor or an epoch.
     #[serde(default)]
     pub since: f32,
+    /// The epoch instant (ms) `since` counts from, when the material declares an `anchor`: the host reads
+    /// `since` from it again at every frame, so an anchored material needs no new mapping to move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_ms: Option<f64>,
     /// Ids of render targets (`DrawCommand::Target`) the material samples; the first is `target_a` at `@group(1)`.
     #[serde(default)]
     pub targets: Vec<String>,

@@ -589,27 +589,27 @@ pub(super) fn paint_sdf_shape(
             }
             orbital_canvas_base::shaders::check_material(wgsl)
                 .map_err(|detail| invalid("material.wgsl", detail))?;
-            let since = match spec.get("anchor").filter(|a| !a.is_null()) {
-                None => 0.0,
+            let anchor_ms = match spec.get("anchor").filter(|a| !a.is_null()) {
+                None => None,
                 Some(anchor) => {
-                    let anchor = anchor.as_f64().filter(|a| a.is_finite()).ok_or_else(|| {
+                    Some(anchor.as_f64().filter(|a| a.is_finite()).ok_or_else(|| {
                         invalid(
                             "material.anchor",
                             "must be a finite number of epoch milliseconds",
                         )
-                    })?;
-                    if epoch_now_ms > 0.0 {
-                        ((epoch_now_ms - anchor) / 1000.0) as f32
-                    } else {
-                        0.0
-                    }
+                    })?)
                 }
+            };
+            let since = match anchor_ms {
+                Some(anchor) if epoch_now_ms > 0.0 => ((epoch_now_ms - anchor) / 1000.0) as f32,
+                _ => 0.0,
             };
             Some(SdfMaterial {
                 wgsl: wgsl.to_owned(),
                 params,
                 live: spec.get("live").and_then(Value::as_bool).unwrap_or(false),
                 since,
+                anchor_ms,
                 targets: crate::layer_props::material_targets(spec)?,
             })
         }
