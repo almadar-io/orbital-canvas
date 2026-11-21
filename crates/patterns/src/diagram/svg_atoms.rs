@@ -906,14 +906,16 @@ mod tests {
         map("svg-pulse", &props, None).unwrap()
     }
 
-    fn ring_radius(cmds: &[DrawCommand], i: usize) -> f32 {
-        match &cmds[i] {
-            DrawCommand::Path { segments, .. } => match segments[0] {
-                orbital_canvas_base::packet::PathSegment::Arc { rx, .. } => rx,
-                _ => panic!("arc"),
-            },
-            _ => panic!("path"),
-        }
+    fn ring_radii(cmds: &[DrawCommand]) -> Vec<f32> {
+        cmds.iter()
+            .filter_map(|c| match c {
+                DrawCommand::Path { segments, .. } => segments.iter().find_map(|s| match s {
+                    orbital_canvas_base::packet::PathSegment::Arc { rx, .. } => Some(*rx),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -933,20 +935,15 @@ mod tests {
         let s = pulse_scene(json!({"rings": 3}));
         let at0 = s.packet.resolved(0.0, true).into_owned();
         let half = s.packet.resolved(1000.0, true).into_owned();
-        let first = s
-            .packet
-            .draw_commands
-            .iter()
-            .position(|c| matches!(c, DrawCommand::Path { .. }))
-            .unwrap();
         assert_ne!(
             serde_json::to_string(&at0.draw_commands).unwrap(),
             serde_json::to_string(&half.draw_commands).unwrap()
         );
-        assert!(ring_radius(&at0.draw_commands, first) < ring_radius(&half.draw_commands, first));
+        let (r0, rh) = (ring_radii(&at0.draw_commands), ring_radii(&half.draw_commands));
+        assert!(r0[0] < rh[0], "the first ring grows: {r0:?} -> {rh:?}\n{}", serde_json::to_string(&at0.draw_commands).unwrap());
         assert_eq!(
-            ring_radius(&at0.draw_commands, first + 1),
-            ring_radius(&s.packet.draw_commands, first + 1),
+            ring_radii(&at0.draw_commands)[1],
+            ring_radii(&s.packet.draw_commands)[1],
             "control: the second ring is still inside its delay at t=0"
         );
     }

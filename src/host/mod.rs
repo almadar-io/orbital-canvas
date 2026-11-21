@@ -88,6 +88,8 @@ pub struct SceneHost {
     pub(crate) resize_reported: Option<(f32, f32)>,
     /// The reading direction last sent as `directionEvent`.
     pub(crate) direction_reported: Option<String>,
+    /// The reduced-motion preference last sent as `motionEvent`.
+    pub(crate) motion_reported: Option<bool>,
     /// The region under the pointer, the region holding a press, and the last pointer position.
     pub(crate) hovered: Option<String>,
     pub(crate) captured: Option<String>,
@@ -148,6 +150,7 @@ impl SceneHost {
             semantic: Vec::new(),
             resize_reported: None,
             direction_reported: None,
+            motion_reported: None,
             hovered: None,
             captured: None,
             pointer: None,
@@ -315,6 +318,7 @@ impl SceneHost {
         self.report_measured();
         self.report_resize();
         self.report_direction();
+        self.report_motion();
     }
 
     /// Set the device pixel ratio (physical pixels per logical point) and re-lay-out the

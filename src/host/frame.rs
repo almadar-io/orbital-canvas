@@ -31,6 +31,7 @@ impl SceneHost {
     /// Whether the host allows motion. Off, every animated scene draws its rest frame.
     pub fn set_motion(&mut self, enabled: bool) {
         self.motion = enabled;
+        self.report_motion();
         let was_settled = self.springs.settled();
         self.springs.set_motion(enabled);
         if !was_settled && self.springs.settled() {

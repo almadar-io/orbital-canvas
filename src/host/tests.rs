@@ -681,6 +681,31 @@ fn control_a_direction_without_a_direction_event_or_unset_sends_nothing() {
 }
 
 #[test]
+fn the_motion_preference_is_reported_once_and_on_change() {
+    let mut r = host_with(serde_json::json!({"motionEvent": "MOT"}));
+    let sent = r.take_scene_events();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].event, "MOT");
+    assert_eq!(sent[0].payload, serde_json::json!({"reduced": false}));
+    let node = r.scene.clone().unwrap();
+    r.set_scene(node).unwrap();
+    assert!(r.take_scene_events().is_empty(), "same preference: nothing");
+    r.set_motion(false);
+    let sent = r.take_scene_events();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].payload, serde_json::json!({"reduced": true}));
+    r.set_motion(false);
+    assert!(r.take_scene_events().is_empty(), "edge: unchanged preference");
+}
+
+#[test]
+fn control_without_a_motion_event_a_preference_change_sends_nothing() {
+    let mut r = host_with(serde_json::json!({}));
+    r.set_motion(false);
+    assert!(r.take_scene_events().is_empty());
+}
+
+#[test]
 fn resize_without_a_resize_event_sends_nothing() {
     let mut r = host_with(serde_json::json!({}));
     r.set_viewport(800, 600);

@@ -43,6 +43,19 @@ impl SceneHost {
         self.direction_reported = Some(direction);
     }
 
+    /// Queue one `motionEvent` with the host's reduced-motion preference when it differs from the one last sent.
+    pub(super) fn report_motion(&mut self) {
+        if self.canvas_event("motionEvent").is_none() {
+            return;
+        }
+        let reduced = !self.motion;
+        if self.motion_reported == Some(reduced) {
+            return;
+        }
+        self.queue_canvas_event("motionEvent", serde_json::json!({ "reduced": reduced }));
+        self.motion_reported = Some(reduced);
+    }
+
     /// Queue one `resizeEvent` (CSS pixels) when the size differs from the one last sent.
     pub(super) fn report_resize(&mut self) {
         let Some((w, h)) = self.viewport else { return };
