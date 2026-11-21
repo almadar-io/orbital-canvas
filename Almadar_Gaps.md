@@ -7,7 +7,9 @@ Every open gap this repo owns lives here. This file is the source of truth; the 
 - **Codes:** new gaps use this repo's prefix `G-ORBITAL-GAME-RENDERER-`. Take the "Next code" below, then bump it in the same edit. Codes are never reused or renamed.
 - **Close by deleting.** Remove the entry in the same commit as the fix.
 
-Next code: `G-ORBITAL-GAME-RENDERER-036`
+Next code: `G-ORBITAL-GAME-RENDERER-037`
+
+- **G-ORBITAL-GAME-RENDERER-036** [mechanical] — On the WebGL2 path (no WebGPU), every 2D canvas colour is gamma-encoded a second time: a ground `#0D0E12` paints as about `#43454C`, `#06140A` as about `#274F38`, ink `#1E2A3A` as `#607183`, which is sRGB encoding applied to values already in sRGB. Plain fills and shader materials alike. The WebGPU path paints the authored colours. Found 2026-11-21 night (P-046) in headless Chrome with SwiftShader against the same frame drawn with Metal; dark Rasm design systems read washed out and text drops below WCAG AA there. Repro: open std-finance-landing on :4790 in Chrome with `--use-angle=swiftshader` and with `--use-angle=metal`, compare the ground. Fix: find the conversion in the WebGL2 presentation (an sRGB view or blit of a Unorm target) and present the target as written. Prevention rung: (3) the verifiers (a paired-capture pixel check of one known colour on both backends). Severity: high. Root cause: one-off.
 
 - **G-ORBITAL-GAME-RENDERER-033** [mechanical] — Raster sprites are uploaded with a single mip level (`upload_rgba` in `frame/texture.rs`, `sprites.rs`), so a photograph drawn much smaller than its source (a 2400 px museum scan in a 360 px card) is minified by one bilinear tap and shimmers or aliases on fine linework. Found 2026-11-17 while moving the Rasm marketing landings to high-resolution sources; the workaround is data-side (request each image at about twice its largest display width). Fix: build a mip chain on upload for sprites larger than their first draw, and sample with a mipmap filter. Prevention rung: (3) the verifiers (a render test drawing a fine checkerboard at 1/4 scale and asserting no moire band). Severity: low. Root cause: one-off.
 
