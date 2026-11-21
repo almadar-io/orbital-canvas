@@ -4483,3 +4483,51 @@ fn a_broken_word_paints_and_measures_two_lines() {
     assert_eq!(gathered.measured[0].lines as usize, texts);
     assert!(gathered.measured[0].width <= width + 1e-3);
 }
+
+fn dashed_route(scale: f64) -> GameRenderPacket {
+    packet_for(json!({
+        "projection": "free", "scale": 1.0,
+        "drawables": [{"type": "draw-shape", "id": "route", "shape": "path", "d": "M0 0 H100",
+            "position": {"x": 0, "y": 0}, "scale": scale, "stroke": "#000000", "strokeWidth": 2,
+            "strokeDash": [100, 100],
+            "animation": {"clock": "scroll", "from": 0, "to": 100,
+                "keyframes": [{"at": 0, "dashOffset": 100}, {"at": 1, "dashOffset": 0}]}}]
+    }))
+}
+
+fn route_stroke(packet: &GameRenderPacket) -> orbital_canvas_base::packet::Stroke {
+    packet
+        .draw_commands
+        .iter()
+        .find_map(|c| match c {
+            DrawCommand::Path { stroke: Some(s), .. } => Some(s.clone()),
+            _ => None,
+        })
+        .expect("the route paints a stroked path")
+}
+
+#[test]
+fn a_scroll_keyframe_dash_offset_moves_a_dashed_path_in_its_own_units() {
+    let packet = dashed_route(2.0);
+    let rest = route_stroke(&packet);
+    let unit = route_stroke(&dashed_route(1.0)).dash[0] / 100.0;
+    assert!(unit > 0.0);
+    assert_eq!(rest.dash, vec![200.0 * unit, 200.0 * unit], "a path's dash follows its scale, like its outline");
+    let offsets: Vec<_> = packet.animations[0].keyframes.iter().map(|k| k.dash_offset).collect();
+    assert_eq!(offsets, vec![Some(200.0 * unit), Some(0.0)], "the keyframe offset is in the same units as the dash");
+    let mut scrolled = packet.clone();
+    scrolled.scroll = 50.0;
+    let half = scrolled.resolved_at(0.0, 0.0, true).into_owned();
+    assert!((route_stroke(&half).dash_offset - 100.0 * unit).abs() < 1e-3, "half the scroll draws half the route in");
+}
+
+#[test]
+fn control_an_unscaled_path_keeps_its_authored_dash() {
+    let packet = packet_for(json!({
+        "projection": "free", "scale": 1.0,
+        "drawables": [{"type": "draw-shape", "id": "box", "shape": "path", "d": "M0 0 H100",
+            "position": {"x": 0, "y": 0}, "stroke": "#000000", "strokeDash": [4, 2]}]
+    }));
+    let unit = route_stroke(&dashed_route(1.0)).dash[0] / 100.0;
+    assert_eq!(route_stroke(&packet).dash, vec![4.0 * unit, 2.0 * unit], "an unscaled path is unchanged");
+}

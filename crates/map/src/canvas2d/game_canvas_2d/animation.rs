@@ -5,7 +5,8 @@ use super::*;
 /// A drawable `animation` the packet plays per frame (see [`orbital_canvas_base::animate::plays_on_packet`]) as a packet
 /// animation over the drawable's commands. Progress follows the page scroll between `from` and `to` with
 /// `clock: "scroll"`, else the paint clock over `durationMs` (looping unless `loop: false`). Keyframes carry `at`,
-/// `opacity`, `scale`, `rotate`, `offsetX` and `offsetY` (scene units, as in a paint-clock drawable animation) and,
+/// `opacity`, `scale`, `rotate`, `offsetX` and `offsetY` (scene units, as in a paint-clock drawable animation), `dashOffset`
+/// (in the stroke dash's own units, see [`dash_unit`]) and,
 /// on a `path` shape, `d`: the outline at that offset, every `d` with the same number of subpaths.
 pub(super) fn packet_animation(
     node: &Value,
@@ -92,6 +93,7 @@ pub(super) fn packet_animation(
                 opacity: get("opacity"),
                 offset_x: get("offsetX").map(|x| to_screen(x * tw, 0.0).0 - zero_x),
                 offset_y: get("offsetY").map(|y| to_screen(0.0, y * tw).1 - zero_y),
+                dash_offset: get("dashOffset").map(|d| d * dash_unit(node, zoom)),
                 ..orbital_canvas_base::packet::Keyframe::default()
             })
         })

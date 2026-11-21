@@ -632,7 +632,14 @@ impl SharedDeviceRenderer {
                             h: read.height as f32,
                         };
                         let from = if src.w > 0.0 && src.h > 0.0 {
-                            *src
+                            let sx = read.width as f32 / read.points.0.max(1) as f32;
+                            let sy = read.height as f32 / read.points.1.max(1) as f32;
+                            Rect {
+                                x: src.x * sx,
+                                y: src.y * sy,
+                                w: src.w * sx,
+                                h: src.h * sy,
+                            }
                         } else {
                             whole
                         };

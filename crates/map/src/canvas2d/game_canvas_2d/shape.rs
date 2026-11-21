@@ -29,6 +29,16 @@ pub(super) fn path_xf(
     }
 }
 
+/// Screen px per authored dash unit: the zoom, and on a `path` shape also its `scale`, so a dash sized to an outline
+/// stays on that outline at every size.
+pub(super) fn dash_unit(node: &Value, zoom: f32) -> f32 {
+    if node.get("shape").and_then(Value::as_str) == Some("path") {
+        zoom * get_f32(node, "scale", 1.0)
+    } else {
+        zoom
+    }
+}
+
 pub(super) fn animated_shape(node: &Value, epoch_now_ms: f64) -> Option<Value> {
     let animation = node.get("animation")?;
     if !orbital_canvas_base::animate::plays_at(animation, epoch_now_ms) {
@@ -825,11 +835,11 @@ pub(super) fn paint_vector_shape(
                     .map(|dash| {
                         dash.iter()
                             .filter_map(Value::as_f64)
-                            .map(|length| length as f32 * zoom)
+                            .map(|length| length as f32 * dash_unit(node, zoom))
                             .collect()
                     })
                     .unwrap_or_default(),
-                dash_offset: get_f32(node, "strokeDashOffset", 0.0) * zoom,
+                dash_offset: get_f32(node, "strokeDashOffset", 0.0) * dash_unit(node, zoom),
                 cap: LineCap::Butt,
                 join: LineJoin::Miter,
             }

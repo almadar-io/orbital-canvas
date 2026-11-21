@@ -42,6 +42,8 @@ pub(crate) struct TargetTexture {
     pub(crate) serial: u64,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    /// The size the target was declared at, in points; `width`/`height` are its device pixels.
+    pub(crate) points: (u32, u32),
 }
 
 struct Entry {
@@ -121,6 +123,7 @@ impl TargetStore {
         format: wgpu::TextureFormat,
         id: &str,
         size: (u32, u32),
+        points: (u32, u32),
     ) -> TargetTexture {
         let entry = self.entries.entry(id.to_owned()).or_insert(Entry {
             slots: [None, None],
@@ -162,10 +165,12 @@ impl TargetStore {
                 serial: self.serial,
                 width: size.0,
                 height: size.1,
+                points,
             });
         } else if let Some(t) = entry.slots[slot].as_mut() {
             self.serial += 1;
             t.serial = self.serial;
+            t.points = points;
         }
         entry.slots[slot].clone().expect("slot just filled")
     }
