@@ -17,6 +17,30 @@ pub fn apply(props: &mut Map<String, Value>, theme: &Value) {
     walk_object(props, theme, &families);
 }
 
+/// The host's `canvasTheme` with the program's `themeLayer` laid over it: each `palette` colour and `fonts` role
+/// the layer names replaces the host's, and everything else the host gives stays.
+pub fn layered(host: Option<Value>, layer: Option<Value>) -> Option<Value> {
+    let Some(layer) = layer else { return host };
+    let mut theme = host.unwrap_or_else(|| Value::Object(Map::new()));
+    let Value::Object(out) = &mut theme else {
+        return Some(theme);
+    };
+    for table in ["palette", "fonts"] {
+        let Some(Value::Object(from)) = layer.get(table) else {
+            continue;
+        };
+        let into = out
+            .entry(table)
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Value::Object(into) = into {
+            for (k, v) in from {
+                into.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    Some(theme)
+}
+
 /// The CSS family each keyword draws in, registering the theme's font files.
 fn register_families(theme: &Value) -> Vec<(&'static str, String)> {
     FAMILY_KEYWORDS
@@ -137,6 +161,37 @@ mod tests {
             "only colour slots resolve"
         );
         assert_eq!(props["drawables"][2]["fill"], "red");
+    }
+
+    #[test]
+    fn a_program_theme_layer_lays_its_palette_and_fonts_over_the_host_theme_key_by_key() {
+        let layer = json!({
+            "palette": { "card": "#101820", "primary": "#FF5A1F" },
+            "fonts": { "body": { "family": "Theme Layer Test Body", "file": "https://fonts.test/layer-body.ttf", "generic": "serif" } }
+        });
+        let merged = layered(Some(theme()), Some(layer)).expect("a theme");
+        let mut props = json!({ "drawables": [
+            { "type": "draw-shape", "fill": "card", "stroke": "background" },
+            { "type": "draw-shape", "fill": "primary", "stroke": "ink" },
+            { "type": "draw-text", "font": "400 16px body" },
+            { "type": "draw-text", "font": "700 48px display" }
+        ]});
+        apply(props.as_object_mut().unwrap(), &merged);
+        assert_eq!(props["drawables"][0]["fill"], "#101820", "the layer's colour wins over the host palette");
+        assert_eq!(props["drawables"][0]["stroke"], "rgb(247, 243, 232)", "a host colour the layer leaves stays");
+        assert_eq!(props["drawables"][1]["fill"], "#FF5A1F", "the layer's palette wins over a host tone");
+        assert_eq!(props["drawables"][1]["stroke"], "rgb(26, 22, 48)");
+        assert_eq!(props["drawables"][2]["font"], "400 16px \"Theme Layer Test Body\"");
+        assert_eq!(props["drawables"][3]["font"], "700 48px \"Theme Refs Test Display\"", "a host role the layer leaves stays");
+    }
+
+    #[test]
+    fn a_theme_layer_alone_themes_the_scene_and_no_layer_keeps_the_host_theme() {
+        let layer = json!({ "palette": { "background": "#000000" } });
+        let alone = layered(None, Some(layer)).expect("the layer");
+        assert_eq!(theme_color(&alone, "background").as_deref(), Some("#000000"));
+        assert_eq!(layered(Some(theme()), None), Some(theme()));
+        assert_eq!(layered(None, None), None);
     }
 
     #[test]

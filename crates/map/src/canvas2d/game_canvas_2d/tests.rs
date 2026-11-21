@@ -4531,3 +4531,21 @@ fn control_an_unscaled_path_keeps_its_authored_dash() {
     let unit = route_stroke(&dashed_route(1.0)).dash[0] / 100.0;
     assert_eq!(route_stroke(&packet).dash, vec![4.0 * unit, 2.0 * unit], "an unscaled path is unchanged");
 }
+
+#[test]
+fn a_canvas_nodes_theme_layer_is_laid_over_its_host_theme_before_references_resolve() {
+    let node = |layer: bool| {
+        let mut n = json!({ "type": "canvas", "mode": "2d",
+            "canvasTheme": { "palette": { "card": "#ffffff", "background": "#eeeeee" } },
+            "drawables": [{ "type": "draw-shape", "fill": "card", "stroke": "background" }] });
+        if layer {
+            n["themeLayer"] = json!({ "palette": { "card": "#123456" } });
+        }
+        prepare_canvas_node(&n).expect("props")
+    };
+    let laid = node(true);
+    assert_eq!(laid["drawables"][0]["fill"], "#123456");
+    assert_eq!(laid["drawables"][0]["stroke"], "#eeeeee");
+    assert!(laid.get("themeLayer").is_none(), "the layer is consumed, not drawn");
+    assert_eq!(node(false)["drawables"][0]["fill"], "#ffffff");
+}

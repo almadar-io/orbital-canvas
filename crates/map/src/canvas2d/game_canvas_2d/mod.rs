@@ -401,7 +401,9 @@ fn canvas_node_props(node: &Value) -> Result<serde_json::Map<String, Value>, Can
     }
     let mut props = fields.clone();
     props.remove("type");
-    if let Some(theme) = props.remove("canvasTheme") {
+    let host = props.remove("canvasTheme");
+    let layer = props.remove("themeLayer");
+    if let Some(theme) = crate::theme_refs::layered(host, layer) {
         crate::theme_refs::apply(&mut props, &theme);
     }
     if !props.contains_key("drawables") {
