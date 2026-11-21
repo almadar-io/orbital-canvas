@@ -13,6 +13,8 @@ pub(crate) struct PageScroll {
     pub(crate) touch: Option<ScrollTouch>,
     pub(crate) reported: Option<f32>,
     pub(crate) reported_at: Option<f64>,
+    /// The `scroll.to` request number last applied, so each request moves the page once.
+    pub(crate) applied_to: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +59,32 @@ impl SceneHost {
             .and_then(serde_json::Value::as_f64)
             .unwrap_or(0.0);
         Some((height, event, report_ms))
+    }
+
+    /// The canvas's `scroll.to` request: the offset to move to and the number that names this request.
+    pub(super) fn scroll_to_declared(&self) -> Option<(f32, f64)> {
+        let node = self.scene.as_ref()?;
+        let to = node.get("props").unwrap_or(node).get("scroll")?.get("to")?;
+        let y = to.get("y")?.as_f64().filter(|y| y.is_finite())? as f32;
+        let n = to.get("n")?.as_f64().filter(|n| n.is_finite())?;
+        Some((y, n))
+    }
+
+    /// Move the page to a new `scroll.to` request (clamped to the content), once per request number.
+    pub(super) fn apply_scroll_to(&mut self) {
+        let (Some((y, n)), Some(max)) = (self.scroll_to_declared(), self.scroll_max()) else {
+            return;
+        };
+        if self.page_scroll.applied_to == Some(n) {
+            return;
+        }
+        self.page_scroll.applied_to = Some(n);
+        self.page_scroll.velocity = 0.0;
+        self.page_scroll.offset = y.clamp(0.0, max);
+        if let Some((px, py)) = self.pointer {
+            self.hover_to(px, py);
+        }
+        self.report_scroll(true);
     }
 
     pub(super) fn scroll_max(&self) -> Option<f32> {

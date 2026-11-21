@@ -315,6 +315,7 @@ impl SceneHost {
             }
             None => self.page_scroll = PageScroll::default(),
         }
+        self.apply_scroll_to();
         self.report_measured();
         self.report_resize();
         self.report_direction();

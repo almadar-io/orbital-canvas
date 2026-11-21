@@ -3149,3 +3149,38 @@ mod sprung_text {
         assert_eq!(lines(&h), before);
     }
 }
+
+fn scroll_to_page(to: Option<serde_json::Value>) -> serde_json::Value {
+    let mut scene = serde_json::json!({
+        "type": "canvas", "mode": "2d", "projection": "free", "camera": {"zoom": 1}, "width": 200, "height": 100,
+        "drawables": [{"type": "draw-shape", "id": "art", "shape": "rect", "anchor": "top-left",
+            "position": {"x": 0, "y": 0}, "width": 200, "height": 40, "fill": "#000000"}],
+        "scroll": {"height": 600, "event": "SCROLLED"}
+    });
+    if let Some(to) = to {
+        scene["scroll"]["to"] = to;
+    }
+    scene
+}
+
+#[test]
+fn a_scroll_to_request_moves_the_page_once_per_request_number() {
+    let mut host = SceneHost::new();
+    host.set_scene(scroll_to_page(Some(serde_json::json!({"y": 200, "n": 1})))).unwrap();
+    assert_eq!(host.page_scroll(), 200.0, "the request moves the page");
+    host.scroll_by(50.0);
+    host.set_scene(scroll_to_page(Some(serde_json::json!({"y": 200, "n": 1})))).unwrap();
+    assert_eq!(host.page_scroll(), 250.0, "the same request number is not applied twice");
+    host.set_scene(scroll_to_page(Some(serde_json::json!({"y": 9999, "n": 2})))).unwrap();
+    assert_eq!(host.page_scroll(), 500.0, "a new request is clamped to the content");
+}
+
+#[test]
+fn control_without_a_scroll_to_request_the_page_stays_where_the_reader_left_it() {
+    let mut host = SceneHost::new();
+    host.set_scene(scroll_to_page(None)).unwrap();
+    assert_eq!(host.page_scroll(), 0.0);
+    host.scroll_by(120.0);
+    host.set_scene(scroll_to_page(None)).unwrap();
+    assert_eq!(host.page_scroll(), 120.0);
+}

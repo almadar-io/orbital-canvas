@@ -94,7 +94,6 @@ pub(super) fn packet_animation(
                 offset_x: get("offsetX").map(|x| to_screen(x * tw, 0.0).0 - zero_x),
                 offset_y: get("offsetY").map(|y| to_screen(0.0, y * tw).1 - zero_y),
                 dash_offset: get("dashOffset").map(|d| d * dash_unit(node, zoom)),
-                ..orbital_canvas_base::packet::Keyframe::default()
             })
         })
         .collect::<Result<Vec<_>, CanvasSceneError>>()?;
