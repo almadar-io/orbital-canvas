@@ -96,6 +96,11 @@ pub struct SceneHost {
     pub(crate) pointer: Option<(f32, f32)>,
     /// Whether a drawable paints a material that reads the clock.
     pub(crate) live_material: bool,
+    /// When what keeps the current scene moving ends, read once when the scene is set.
+    pub(crate) liveness: frame::Liveness,
+    /// Scenes read for [`frame::Liveness`] (observability for tests).
+    #[cfg(test)]
+    pub(crate) liveness_reads: std::sync::atomic::AtomicUsize,
     /// The embedded 3D scenes of the current packet that play by themselves.
     pub(crate) live_scenes3d: Vec<mappers::game_canvas_2d::LiveScene3d>,
     /// The pointers held down (ascending id), the one whose press began the gesture, and the `touches` payload
@@ -155,6 +160,9 @@ impl SceneHost {
             captured: None,
             pointer: None,
             live_material: false,
+            liveness: frame::Liveness::default(),
+            #[cfg(test)]
+            liveness_reads: std::sync::atomic::AtomicUsize::new(0),
             live_scenes3d: Vec::new(),
             touches: Vec::new(),
             primary_pointer: None,
@@ -171,6 +179,13 @@ impl SceneHost {
             self.asset_generation = generation;
             self.relayout();
         }
+    }
+
+    /// Scenes read for what keeps them moving so far.
+    #[cfg(test)]
+    pub(crate) fn liveness_reads(&self) -> usize {
+        self.liveness_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Timed mappings made for frames so far.
@@ -207,6 +222,7 @@ impl SceneHost {
         self.pointer_regions.clear();
         self.measured.clear();
         self.live_material = false;
+        self.liveness = frame::Liveness::default();
         self.live_scenes3d.clear();
         self.packet = Some(packet);
     }
@@ -231,6 +247,10 @@ impl SceneHost {
         };
         self.asset_generation = generation;
         self.live_material = spring::has_live_material(&node);
+        self.liveness = frame::Liveness::read(&node);
+        #[cfg(test)]
+        self.liveness_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.scene = Some(node);
         *self
             .prepared

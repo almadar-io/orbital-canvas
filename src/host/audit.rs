@@ -218,7 +218,7 @@ fn worst_ratio(t: &TextProbe, rgba: &[u8], width: u32, height: u32, scale: f32) 
 impl SceneHost {
     /// The frame as currently drawn, split into its texts and a text-free packet; `None` without a scene.
     pub fn contrast_probe(&self) -> Option<ContrastProbe> {
-        let mut packet = self.frame_packet()?;
+        let mut packet = self.whole_frame_packet()?;
         let mut texts = Vec::new();
         packet.draw_commands = bare(&packet.draw_commands, &mut texts, true);
         Some(ContrastProbe { packet, texts })

@@ -988,14 +988,26 @@ impl GameRenderPacket {
     /// [`Self::resolved`] with the page's wall clock `epoch_ms` for epoch-clock animations; with `motion` off those
     /// show their end, as a drawable `startMs` animation does under reduced motion.
     pub fn resolved_at(&self, t_ms: f64, epoch_ms: f64, motion: bool) -> Cow<'_, GameRenderPacket> {
+        self.resolved_at_scroll(t_ms, epoch_ms, motion, self.scroll)
+    }
+
+    /// [`Self::resolved_at`] with scroll-clocked animations played at the page scroll `scroll` instead of the packet's own.
+    pub fn resolved_at_scroll(
+        &self,
+        t_ms: f64,
+        epoch_ms: f64,
+        motion: bool,
+        scroll: f32,
+    ) -> Cow<'_, GameRenderPacket> {
         let epoch = |a: &Animation| matches!(a.clock, AnimationClock::Epoch { .. });
         if self.animations.is_empty() || (!motion && !self.animations.iter().any(epoch)) {
             return Cow::Borrowed(self);
         }
         let mut out = self.clone();
+        out.scroll = scroll;
         for a in &self.animations {
             let progress = if motion {
-                a.progress_at(t_ms, epoch_ms, self.scroll)
+                a.progress_at(t_ms, epoch_ms, scroll)
             } else {
                 epoch(a).then_some(1.0)
             };

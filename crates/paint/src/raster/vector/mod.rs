@@ -13,7 +13,7 @@
 
 use orbital_canvas_base::packet::{
     ColorRun, DrawCommand, FillPattern, Gradient, GradientStop, LineCap, LineJoin, PathSegment,
-    Stroke, TextAlign, Vec2,
+    Rect, Stroke, TextAlign, Vec2,
 };
 use rustybuzz::{Direction, UnicodeBuffer};
 use std::ops::Range;

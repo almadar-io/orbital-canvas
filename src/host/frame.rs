@@ -69,25 +69,7 @@ impl SceneHost {
             || (self.motion && self.epoch_clock_ms > 0.0 && !self.live_scenes3d.is_empty())
             || (self.motion
                 && self.epoch_clock_ms > 0.0
-                && self.scene.as_ref().is_some_and(|scene| {
-                    mappers::game_canvas_2d::active_fx_live(scene, self.epoch_clock_ms)
-                }))
-            || (self.motion
-                && self.epoch_clock_ms > 0.0
-                && self
-                    .scene
-                    .as_ref()
-                    .is_some_and(|scene| mappers::emitter::any_live(scene, self.epoch_clock_ms)))
-            || (self.motion
-                && self.epoch_clock_ms > 0.0
-                && self.scene.as_ref().is_some_and(|scene| {
-                    mappers::text_reveal::any_live(scene, self.epoch_clock_ms)
-                }))
-            || (self.motion
-                && self.epoch_clock_ms > 0.0
-                && self.scene.as_ref().is_some_and(|scene| {
-                    mappers::game_canvas_2d::started_animation_live(scene, self.epoch_clock_ms)
-                }))
+                && self.liveness.live_at(self.epoch_clock_ms))
             || asset::pending() > 0
             || asset::generation() != self.asset_generation
     }
@@ -99,22 +81,19 @@ impl SceneHost {
         if !self.motion {
             return false;
         }
-        let Some(scene) = self.scene.as_ref() else {
+        if self.scene.is_none() {
             return self.live_material;
-        };
-        let root = scene.get("props").unwrap_or(scene);
+        }
         let view = self
             .scroll_declared()
             .map(|_| self.packet.as_ref().map_or(0.0, |p| p.height));
-        ["drawables", "children"]
-            .into_iter()
-            .filter_map(|key| root.get(key).and_then(serde_json::Value::as_array))
-            .flatten()
-            .any(|drawable| {
-                let (live, anchored) = clocked(drawable);
+        self.liveness
+            .materials
+            .iter()
+            .any(|&(live, anchored, rows)| {
                 let counts = live || (anchored && self.epoch_clock_ms > 0.0);
                 counts
-                    && match (view, placed_rows(drawable)) {
+                    && match (view, rows) {
                         (Some(height), Some((top, bottom, fixed))) => {
                             let offset = if fixed { 0.0 } else { self.page_scroll.offset };
                             bottom - offset > 0.0 && top - offset < height
@@ -126,7 +105,16 @@ impl SceneHost {
 
     /// The current packet as it draws at the clock's scene time.
     pub fn frame_packet(&self) -> Option<GameRenderPacket> {
-        let mut packet = self.mapped_frame_packet()?;
+        self.frame_packet_at(false)
+    }
+
+    /// [`Self::frame_packet`] with every command of the page, the ones scrolled far from the view too (the audits read it).
+    pub(crate) fn whole_frame_packet(&self) -> Option<GameRenderPacket> {
+        self.frame_packet_at(true)
+    }
+
+    fn frame_packet_at(&self, whole: bool) -> Option<GameRenderPacket> {
+        let mut packet = self.mapped_frame_packet(whole)?;
         if self.motion && self.epoch_clock_ms > 0.0 {
             for live in &self.live_scenes3d {
                 let Ok(scene) = live.scene_at(self.epoch_clock_ms) else {
@@ -138,22 +126,16 @@ impl SceneHost {
         Some(packet)
     }
 
-    fn mapped_frame_packet(&self) -> Option<GameRenderPacket> {
+    fn mapped_frame_packet(&self, whole: bool) -> Option<GameRenderPacket> {
         if self.motion && self.epoch_clock_ms > 0.0 {
             if let Some(scene) = self.scene.as_ref().filter(|scene| {
-                (mappers::game_canvas_2d::has_active_fx(scene)
-                    || mappers::emitter::has_emitter(scene)
-                    || mappers::text_reveal::has_reveal(scene)
-                    || mappers::game_canvas_2d::has_started_animation(scene))
+                self.liveness.timed
                     && matches!(
                         scene.get("type").and_then(serde_json::Value::as_str),
                         Some("canvas" | "canvas-2d")
                     )
             }) {
-                let live = mappers::game_canvas_2d::active_fx_live(scene, self.epoch_clock_ms)
-                    || mappers::emitter::any_live(scene, self.epoch_clock_ms)
-                    || mappers::text_reveal::any_live(scene, self.epoch_clock_ms)
-                    || mappers::game_canvas_2d::started_animation_live(scene, self.epoch_clock_ms);
+                let live = self.liveness.live_at(self.epoch_clock_ms);
                 let generation = asset::generation();
                 let mut settled = self
                     .settled
@@ -165,7 +147,7 @@ impl SceneHost {
                     .as_ref()
                     .filter(|(mapped_under, _)| *mapped_under == generation)
                 {
-                    return Some(self.present(packet.clone()));
+                    return Some(self.present(packet, whole));
                 }
                 #[cfg(test)]
                 self.timed_maps
@@ -191,11 +173,11 @@ impl SceneHost {
                     if !live {
                         *settled = Some((generation, packet.clone()));
                     }
-                    return Some(self.present(packet));
+                    return Some(self.present(&packet, whole));
                 }
             }
         }
-        let mut packet = self.present(self.packet.clone()?);
+        let mut packet = self.present(self.packet.as_ref()?, whole);
         if let Some(camera) = self.view3d.as_ref().and_then(scene3d::Scene3DView::camera) {
             for command in &mut packet.draw_commands {
                 if let DrawCommand::Scene3D { scene } = command {
@@ -207,13 +189,19 @@ impl SceneHost {
     }
 
     /// A mapped packet as this frame draws it: its animations played at the scene time and the page scroll, the
-    /// clock and pointer for materials, and every unpinned command moved up by the scroll.
-    pub(super) fn present(&self, mut packet: GameRenderPacket) -> GameRenderPacket {
+    /// clock and pointer for materials, and every unpinned command moved up by the scroll. On a canvas that scrolls as
+    /// a page, unless `whole`, only the pinned commands and the ones within a view above or below the view are kept.
+    pub(super) fn present(&self, packet: &GameRenderPacket, whole: bool) -> GameRenderPacket {
         let offset = self.page_scroll.offset;
+        let resolved =
+            packet.resolved_at_scroll(self.scene_time(), self.epoch_clock_ms, self.motion, offset);
+        let mut packet = if whole || self.scroll_declared().is_none() {
+            resolved.into_owned()
+        } else {
+            let view = resolved.height;
+            near_the_view(resolved, offset - view, offset + 2.0 * view)
+        };
         packet.scroll = offset;
-        let mut packet = packet
-            .resolved_at(self.scene_time(), self.epoch_clock_ms, self.motion)
-            .into_owned();
         packet.time_ms = self.scene_time();
         if self.epoch_clock_ms > 0.0 {
             crate::targets::stamp_since(&mut packet.draw_commands, self.epoch_clock_ms);
@@ -231,6 +219,133 @@ impl SceneHost {
         }
         self.asset_generation = asset::generation();
         self.relayout();
+    }
+}
+
+/// The packet with only its pinned commands and those that may paint between `top` and `bottom` (unscrolled
+/// coordinates); its pinned and animated ranges follow the commands kept.
+fn near_the_view(
+    packet: std::borrow::Cow<'_, GameRenderPacket>,
+    top: f32,
+    bottom: f32,
+) -> GameRenderPacket {
+    let pinned = |i: usize| {
+        packet
+            .pinned
+            .iter()
+            .any(|&(first, end)| i >= first && i < end)
+    };
+    let keep: Vec<bool> = packet
+        .draw_commands
+        .iter()
+        .enumerate()
+        .map(|(i, command)| {
+            pinned(i)
+                || match crate::vector::command_bounds(command) {
+                    crate::vector::RunBounds::Empty => false,
+                    crate::vector::RunBounds::Anywhere => true,
+                    crate::vector::RunBounds::Box { y0, y1, .. } => y1 >= top && y0 <= bottom,
+                }
+        })
+        .collect();
+    let kept_before = |end: usize| keep[..end.min(keep.len())].iter().filter(|k| **k).count();
+    let ranges: Vec<(usize, usize)> = packet
+        .pinned
+        .iter()
+        .map(|&(first, end)| (kept_before(first), kept_before(end)))
+        .collect();
+    let mut out = match packet {
+        std::borrow::Cow::Owned(mut owned) => {
+            let commands = std::mem::take(&mut owned.draw_commands);
+            owned.draw_commands = commands
+                .into_iter()
+                .zip(&keep)
+                .filter_map(|(command, k)| k.then_some(command))
+                .collect();
+            owned
+        }
+        std::borrow::Cow::Borrowed(shared) => GameRenderPacket {
+            pattern: shared.pattern.clone(),
+            width: shared.width,
+            height: shared.height,
+            background_image: shared.background_image.clone(),
+            asset_base_url: shared.asset_base_url.clone(),
+            camera: shared.camera,
+            draw_commands: shared
+                .draw_commands
+                .iter()
+                .zip(&keep)
+                .filter(|(_, k)| **k)
+                .map(|(command, _)| command.clone())
+                .collect(),
+            tick_event: shared.tick_event.clone(),
+            draw_event: shared.draw_event.clone(),
+            fps: shared.fps,
+            animations: shared.animations.clone(),
+            time_ms: shared.time_ms,
+            pointer: shared.pointer,
+            scroll: shared.scroll,
+            pinned: Vec::new(),
+        },
+    };
+    out.pinned = ranges;
+    for animation in &mut out.animations {
+        animation.first = kept_before(animation.first);
+        animation.end = kept_before(animation.end);
+    }
+    out
+}
+
+/// A top-level drawable with a clocked material: live, anchored, and the rows it covers (top, bottom, fixed) when plain to read.
+pub(crate) type ClockedMaterial = (bool, bool, Option<(f32, f32, bool)>);
+
+/// What keeps a scene moving, read once when it is set: the epoch instant its fx, emitters, text reveals and
+/// `startMs` animations have all ended by (infinite while one runs on), whether it has any of them, and each top-level
+/// drawable that paints a clocked material.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Liveness {
+    until: Option<f64>,
+    /// The scene has fx, emitters, reveals or `startMs` animations: frames map it again at the epoch clock.
+    pub(crate) timed: bool,
+    /// Per top-level drawable with a clocked material: live, anchored, and the rows it covers when plain to read.
+    pub(crate) materials: Vec<ClockedMaterial>,
+}
+
+impl Liveness {
+    pub(crate) fn read(scene: &serde_json::Value) -> Self {
+        let until = [
+            mappers::game_canvas_2d::active_fx_until(scene),
+            mappers::emitter::live_until(scene),
+            mappers::text_reveal::live_until(scene),
+            mappers::game_canvas_2d::started_animation_until(scene),
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(f64::max);
+        let timed = mappers::game_canvas_2d::has_active_fx(scene)
+            || mappers::emitter::has_emitter(scene)
+            || mappers::text_reveal::has_reveal(scene)
+            || mappers::game_canvas_2d::has_started_animation(scene);
+        let root = scene.get("props").unwrap_or(scene);
+        let materials = ["drawables", "children"]
+            .into_iter()
+            .filter_map(|key| root.get(key).and_then(serde_json::Value::as_array))
+            .flatten()
+            .filter_map(|drawable| {
+                let (live, anchored) = clocked(drawable);
+                (live || anchored).then(|| (live, anchored, placed_rows(drawable)))
+            })
+            .collect();
+        Self {
+            until,
+            timed,
+            materials,
+        }
+    }
+
+    /// Whether a fx, emitter, reveal or `startMs` animation still runs at `epoch_ms`.
+    pub(crate) fn live_at(&self, epoch_ms: f64) -> bool {
+        self.until.is_some_and(|until| epoch_ms < until)
     }
 }
 

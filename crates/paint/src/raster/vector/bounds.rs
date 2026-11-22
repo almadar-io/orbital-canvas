@@ -212,8 +212,84 @@ pub fn command_bounds(command: &DrawCommand) -> RunBounds {
             .iter()
             .fold(RunBounds::Empty, |acc, c| acc.union(command_bounds(c)))
             .grow(sigma * 3.0),
-        _ => RunBounds::Anywhere,
+        DrawCommand::Quad { rect, .. } => rect_bounds(rect, 0.0),
+        DrawCommand::Sprite { dst, rotation, .. } => rect_bounds(dst, *rotation),
+        DrawCommand::Poly { points, .. } => points_bounds(points),
+        DrawCommand::TexturedTriangle { points, .. } => points_bounds(points),
+        DrawCommand::Sdf {
+            rect,
+            rotation,
+            stroke,
+            shadow,
+            ..
+        } => {
+            let body = rect_bounds(rect, *rotation).grow(stroke.as_ref().map_or(0.0, |s| s.width));
+            match shadow {
+                Some(s) => body.union(
+                    rect_bounds(
+                        &Rect {
+                            x: rect.x + s.offset.x,
+                            y: rect.y + s.offset.y,
+                            ..*rect
+                        },
+                        *rotation,
+                    )
+                    .grow(s.sigma * 3.0),
+                ),
+                None => body,
+            }
+        }
+        DrawCommand::SdfBlend {
+            first,
+            second,
+            radius,
+        } => command_bounds(first)
+            .union(command_bounds(second))
+            .grow(*radius),
+        DrawCommand::SdfBackdrop { shape, .. } => command_bounds(shape),
+        DrawCommand::AdditiveGroup { commands } | DrawCommand::Faded { commands, .. } => commands
+            .iter()
+            .fold(RunBounds::Empty, |acc, c| acc.union(command_bounds(c))),
+        DrawCommand::ClipGroup { clip, .. } => path_bounds(clip, None),
+        DrawCommand::Clear { .. }
+        | DrawCommand::Particles { .. }
+        | DrawCommand::Scene3D { .. }
+        | DrawCommand::Target { .. }
+        | DrawCommand::TileGrid { .. }
+        | DrawCommand::Scissor { .. }
+        | DrawCommand::ResetScissor => RunBounds::Anywhere,
     }
+}
+
+/// A rect's box; turned about its centre, the circle through its corners holds it at any angle.
+fn rect_bounds(rect: &Rect, rotation: f32) -> RunBounds {
+    if rotation == 0.0 {
+        return RunBounds::Box {
+            x0: rect.x.min(rect.x + rect.w),
+            y0: rect.y.min(rect.y + rect.h),
+            x1: rect.x.max(rect.x + rect.w),
+            y1: rect.y.max(rect.y + rect.h),
+        };
+    }
+    let (cx, cy) = (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
+    let r = rect.w.hypot(rect.h) / 2.0;
+    RunBounds::Box {
+        x0: cx - r,
+        y0: cy - r,
+        x1: cx + r,
+        y1: cy + r,
+    }
+}
+
+fn points_bounds(points: &[Vec2]) -> RunBounds {
+    points.iter().fold(RunBounds::Empty, |acc, p| {
+        acc.union(RunBounds::Box {
+            x0: p.x,
+            y0: p.y,
+            x1: p.x,
+            y1: p.y,
+        })
+    })
 }
 
 /// The union of [`command_bounds`] over a run.

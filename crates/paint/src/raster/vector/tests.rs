@@ -131,7 +131,84 @@ fn text_is_bounded_by_its_glyph_outlines_and_a_command_of_unknown_reach_spans_an
         },
         color: RED,
     };
-    assert_eq!(run_bounds(&[&word, &quad]), RunBounds::Anywhere);
+    assert_eq!(
+        command_bounds(&quad),
+        RunBounds::Box {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 1.0,
+            y1: 1.0
+        }
+    );
+    let clear = DrawCommand::Clear { color: RED };
+    assert_eq!(run_bounds(&[&word, &clear]), RunBounds::Anywhere);
+}
+
+#[test]
+fn every_painting_command_has_a_box_and_only_state_and_whole_surface_ones_span_anywhere() {
+    let rect = orbital_canvas_base::packet::Rect {
+        x: 10.0,
+        y: 20.0,
+        w: 30.0,
+        h: 40.0,
+    };
+    let sprite = DrawCommand::Sprite {
+        texture: "t".into(),
+        src: rect,
+        dst: rect,
+        rotation: 0.0,
+        opacity: 1.0,
+        flip_x: false,
+        flip_y: false,
+        tint: None,
+    };
+    assert_eq!(
+        command_bounds(&sprite),
+        RunBounds::Box {
+            x0: 10.0,
+            y0: 20.0,
+            x1: 40.0,
+            y1: 60.0
+        }
+    );
+    let turned = DrawCommand::Sprite {
+        texture: "t".into(),
+        src: rect,
+        dst: rect,
+        rotation: 0.7,
+        opacity: 1.0,
+        flip_x: false,
+        flip_y: false,
+        tint: None,
+    };
+    let RunBounds::Box { x0, y0, x1, y1 } = command_bounds(&turned) else {
+        panic!("a turned sprite has a box");
+    };
+    assert!(
+        x0 <= 10.0 && y0 <= 20.0 && x1 >= 40.0 && y1 >= 60.0,
+        "the turned box holds the rect: {x0},{y0} {x1},{y1}"
+    );
+    let faded = DrawCommand::Faded {
+        opacity: 0.5,
+        commands: vec![sprite.clone()],
+    };
+    assert_eq!(command_bounds(&faded), command_bounds(&sprite));
+    assert_eq!(
+        command_bounds(&DrawCommand::Faded {
+            opacity: 0.5,
+            commands: Vec::new()
+        }),
+        RunBounds::Empty
+    );
+    assert_eq!(
+        command_bounds(&DrawCommand::Scissor { rect }),
+        RunBounds::Anywhere,
+        "a scissor changes state for what follows: never dropped"
+    );
+    assert_eq!(
+        command_bounds(&DrawCommand::ResetScissor),
+        RunBounds::Anywhere
+    );
 }
 
 #[test]

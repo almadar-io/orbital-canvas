@@ -89,17 +89,25 @@ pub fn has_reveal(node: &Value) -> bool {
 /// Whether any revealing text under `node` still has a glyph to show or finish at the clock. A text has at most as
 /// many glyphs as characters, so the end it reads is never early.
 pub fn any_live(node: &Value, epoch_now_ms: f64) -> bool {
-    let mut live = false;
+    live_until(node).is_some_and(|until| epoch_now_ms < until)
+}
+
+/// The epoch instant every revealing text under `node` has shown its last glyph by; `None` without one that has text.
+pub fn live_until(node: &Value) -> Option<f64> {
+    let mut until: Option<f64> = None;
     reveals(node, &mut |t| {
         if let Ok(Some(reveal)) = parse(t) {
             let chars = t
                 .get("text")
                 .and_then(Value::as_str)
                 .map_or(0, |s| s.chars().count());
-            live |= chars > 0 && epoch_now_ms < reveal.end_ms(chars);
+            if chars > 0 {
+                let end = reveal.end_ms(chars);
+                until = Some(until.map_or(end, |u| u.max(end)));
+            }
         }
     });
-    live
+    until
 }
 
 /// One line to paint: its text, the left edge it starts at and the vertical middle of its em box.

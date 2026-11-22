@@ -17,21 +17,25 @@ pub(crate) struct PageScroll {
     pub(crate) applied_to: Option<f64>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct ScrollTouch {
     pub(crate) start_y: f32,
     pub(crate) last_y: f32,
-    pub(crate) last_ms: f64,
+    /// Where the finger was (ms, y) over the last [`FLING_WINDOW_MS`]: the fling takes its speed from them.
+    pub(crate) samples: Vec<(f64, f32)>,
     pub(crate) engaged: bool,
     /// The press began on a region declaring `wheel: true` or `drag: true`, which keeps its gestures.
     pub(crate) owned: bool,
 }
 
-/// How fast a released page scroll slows (per second, exponential) and the speed below which it rests (packet units
-/// per second).
-pub(super) const SCROLL_FRICTION: f32 = 4.0;
+/// How fast a released page scroll slows (per second, exponential): a phone page keeps 0.998 of its speed per ms,
+/// and the speed below which it rests (packet units per second).
+pub(super) const SCROLL_FRICTION: f32 = 2.002;
 
 pub(super) const SCROLL_REST: f32 = 20.0;
+
+/// A lifted finger flings at its average speed over this many ms before it lifted; still for longer, it does not fling.
+pub(super) const FLING_WINDOW_MS: f64 = 100.0;
 
 impl SceneHost {
     /// A point's height in the scene's own coordinates: a fixed drawable is where it is drawn, the rest sit the page
@@ -116,8 +120,8 @@ impl SceneHost {
 
     /// Carry a released touch's velocity on, decaying to rest, and report the offset when it rests.
     pub(super) fn advance_scroll(&mut self, dt: f32) {
-        let gliding =
-            self.page_scroll.velocity != 0.0 && !self.page_scroll.touch.is_some_and(|t| t.engaged);
+        let gliding = self.page_scroll.velocity != 0.0
+            && !self.page_scroll.touch.as_ref().is_some_and(|t| t.engaged);
         if gliding {
             let max = self.scroll_max().unwrap_or(0.0);
             let v = self.page_scroll.velocity;
@@ -187,21 +191,23 @@ impl SceneHost {
                 self.page_scroll.touch = Some(ScrollTouch {
                     start_y: y,
                     last_y: y,
-                    last_ms: self.clock_ms,
+                    samples: vec![(self.clock_ms, y)],
                     engaged: false,
                     owned,
                 });
                 false
             }
             "touch-move" => {
-                let Some(mut touch) = self.page_scroll.touch else {
+                let Some(mut touch) = self.page_scroll.touch.take() else {
                     return false;
                 };
                 if touch.owned || self.active_drag.is_some() || self.pannable {
+                    self.page_scroll.touch = Some(touch);
                     return false;
                 }
                 if !touch.engaged {
                     if (y - touch.start_y).abs() <= TAP_SLOP {
+                        self.page_scroll.touch = Some(touch);
                         return false;
                     }
                     touch.engaged = true;
@@ -212,21 +218,22 @@ impl SceneHost {
                     }
                 }
                 let delta = touch.last_y - y;
-                let dt = ((self.clock_ms - touch.last_ms) / 1000.0) as f32;
-                if dt > 0.0 {
-                    self.page_scroll.velocity = if self.motion { delta / dt } else { 0.0 };
-                }
+                let now = self.clock_ms;
+                touch.samples.retain(|&(ms, _)| now - ms <= FLING_WINDOW_MS);
+                touch.samples.push((now, y));
                 touch.last_y = y;
-                touch.last_ms = self.clock_ms;
                 self.page_scroll.touch = Some(touch);
                 self.scroll_by(delta);
                 true
             }
             "touch-up" | "touch-cancel" => {
-                let engaged = self.page_scroll.touch.take().is_some_and(|t| t.engaged);
-                if !engaged {
-                    self.page_scroll.velocity = 0.0;
-                } else {
+                let touch = self.page_scroll.touch.take();
+                let engaged = touch.as_ref().is_some_and(|t| t.engaged);
+                self.page_scroll.velocity = match touch {
+                    Some(t) if engaged && self.motion => fling_speed(&t.samples, self.clock_ms),
+                    _ => 0.0,
+                };
+                if engaged {
                     self.pointer = Some((x, y));
                     if self.page_scroll.velocity == 0.0 {
                         self.report_scroll(true);
@@ -263,4 +270,20 @@ impl SceneHost {
         let (_, delta) = self.to_packet_units(0.0, dy);
         self.scroll_by(delta)
     }
+}
+
+/// The finger's average speed (packet units per second, positive down the page) over the samples within
+/// [`FLING_WINDOW_MS`] of `now`; 0 when fewer than two are that recent.
+fn fling_speed(samples: &[(f64, f32)], now: f64) -> f32 {
+    let mut recent = samples.iter().filter(|(ms, _)| now - ms <= FLING_WINDOW_MS);
+    let (Some(&(first_ms, first_y)), Some(&(last_ms, last_y))) =
+        (recent.next(), recent.next_back())
+    else {
+        return 0.0;
+    };
+    let dt = ((last_ms - first_ms) / 1000.0) as f32;
+    if dt <= 0.0 {
+        return 0.0;
+    }
+    (first_y - last_y) / dt
 }

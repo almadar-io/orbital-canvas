@@ -695,7 +695,10 @@ fn the_motion_preference_is_reported_once_and_on_change() {
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].payload, serde_json::json!({"reduced": true}));
     r.set_motion(false);
-    assert!(r.take_scene_events().is_empty(), "edge: unchanged preference");
+    assert!(
+        r.take_scene_events().is_empty(),
+        "edge: unchanged preference"
+    );
 }
 
 #[test]
@@ -1648,6 +1651,37 @@ fn a_start_ms_animation_wants_frames_until_it_ends_and_reduced_motion_shows_its_
 }
 
 #[test]
+fn a_scene_is_read_for_what_keeps_it_moving_once_when_set_not_at_every_frame() {
+    let mut renderer = started_host(4000.0, true, false);
+    let reads = renderer.liveness_reads();
+    for (at, moving) in [
+        (4000.0, true),
+        (5500.0, true),
+        (5999.0, true),
+        (6000.0, false),
+        (9000.0, false),
+    ] {
+        renderer.set_epoch_clock(at);
+        assert_eq!(renderer.wants_frames(), moving, "at {at}");
+        renderer.frame_packet().unwrap();
+    }
+    assert_eq!(
+        renderer.liveness_reads(),
+        reads,
+        "no frame walks the scene again"
+    );
+    renderer
+        .set_scene(serde_json::json!({"type": "canvas", "mode": "2d", "projection": "free", "scale": 1, "drawables": []}))
+        .unwrap();
+    assert_eq!(
+        renderer.liveness_reads(),
+        reads + 1,
+        "control: a new scene is read once"
+    );
+    assert!(!renderer.wants_frames());
+}
+
+#[test]
 fn world_fx_remaps_at_the_epoch_clock_without_changing_kernel_ttl() {
     let mut renderer = Canvas::new_headless().unwrap();
     renderer
@@ -2056,6 +2090,196 @@ fn the_page_scroll_holds_inside_its_content() {
     assert_eq!(r.page_scroll(), 200.0, "300 tall in a 100 tall canvas");
     r.wheel(10.0, 50.0, 0.0, -9000.0);
     assert_eq!(r.page_scroll(), 0.0);
+}
+
+fn host_of(scene: serde_json::Value) -> SceneHost {
+    let mut r = SceneHost::new();
+    r.set_scene(scene).unwrap();
+    r
+}
+
+fn rows_scene(rows: usize, scroll: bool) -> serde_json::Value {
+    let mut drawables = vec![
+        serde_json::json!({"type": "draw-shape", "id": "bar", "shape": "rect", "anchor": "top-left",
+        "position": {"x": 0, "y": 0}, "width": 200, "height": 10, "fill": "#000000", "fixed": true}),
+    ];
+    for i in 0..rows {
+        drawables.push(serde_json::json!({"type": "draw-shape", "id": format!("row{i}"), "shape": "rect",
+            "anchor": "top-left", "position": {"x": 0, "y": i * 100}, "width": 200, "height": 40, "fill": "#ff0000"}));
+    }
+    let mut scene = serde_json::json!({
+        "type": "canvas", "mode": "2d", "projection": "free", "camera": {"zoom": 1}, "width": 200, "height": 100,
+        "drawables": drawables
+    });
+    if scroll {
+        scene["scroll"] = serde_json::json!({"height": rows * 100});
+    }
+    scene
+}
+
+#[test]
+fn a_long_page_scrolled_far_draws_only_what_is_near_the_view() {
+    let mut r = SceneHost::new();
+    r.set_scene(rows_scene(100, true)).unwrap();
+    let all = host_of(rows_scene(100, false))
+        .frame_packet()
+        .unwrap()
+        .draw_commands
+        .len();
+    r.wheel(10.0, 50.0, 0.0, 5000.0);
+    let drawn = r.frame_packet().unwrap().draw_commands.len();
+    assert!(all >= 101, "every row maps: {all}");
+    assert!(
+        drawn <= 8,
+        "the rows a view above, in and below the view, the bar and the ground: {drawn} of {all}"
+    );
+}
+
+#[test]
+fn a_row_near_the_view_is_drawn_where_the_scroll_puts_it() {
+    let mut r = SceneHost::new();
+    r.set_scene(rows_scene(100, true)).unwrap();
+    r.wheel(10.0, 50.0, 0.0, 5000.0);
+    let moved = r.frame_packet().unwrap();
+    let mut at_top = rows_scene(1, false);
+    at_top["drawables"][1]["id"] = serde_json::json!("row50");
+    let reference = host_of(at_top).frame_packet().unwrap();
+    let row = format!("{:?}", reference.draw_commands.last().unwrap());
+    assert!(
+        moved.draw_commands.iter().any(|c| format!("{c:?}") == row),
+        "row 50 (y 5000) is drawn at the top of the view"
+    );
+}
+
+#[test]
+fn control_a_fixed_drawable_is_drawn_however_far_the_page_scrolls() {
+    let mut r = SceneHost::new();
+    r.set_scene(rows_scene(100, true)).unwrap();
+    let rest = r.frame_packet().unwrap();
+    r.wheel(10.0, 50.0, 0.0, 9000.0);
+    let moved = r.frame_packet().unwrap();
+    let bar = rest
+        .draw_commands
+        .iter()
+        .map(|c| format!("{c:?}"))
+        .find(|c| c.contains("w: 200.0, h: 10.0"))
+        .expect("the bar is drawn at rest");
+    assert!(
+        moved.draw_commands.iter().any(|c| format!("{c:?}") == bar),
+        "the fixed bar stays where it is drawn"
+    );
+}
+
+#[test]
+fn control_a_page_without_scroll_draws_every_row() {
+    let r = host_of(rows_scene(100, false));
+    assert!(r.frame_packet().unwrap().draw_commands.len() >= 101);
+}
+
+#[test]
+fn control_the_contrast_probe_keeps_every_text_however_far_the_page_scrolls() {
+    let mut scene = rows_scene(100, true);
+    for (i, y) in [10, 5000, 9000].into_iter().enumerate() {
+        scene["drawables"].as_array_mut().unwrap().push(serde_json::json!({"type": "draw-text", "id": format!("t{i}"),
+            "text": "hello", "color": "#000000", "position": {"x": 0, "y": y}, "anchor": "top-left"}));
+    }
+    let mut r = SceneHost::new();
+    r.set_scene(scene).unwrap();
+    r.wheel(10.0, 50.0, 0.0, 5000.0);
+    let probe = r.contrast_probe().unwrap();
+    assert_eq!(
+        probe.measure(&[], 1, 1).len(),
+        3,
+        "the audit reads the whole page, not the drawn band"
+    );
+}
+
+fn flung(moves: &[(f64, f32)], up_ms: f64) -> SceneHost {
+    let mut r = SceneHost::new();
+    r.set_scene(rows_scene(100, true)).unwrap();
+    r.set_clock(1000.0);
+    r.input("touch-down", 10.0, 90.0, 0, None);
+    for &(ms, y) in moves {
+        r.set_clock(ms);
+        r.input("touch-move", 10.0, y, 0, None);
+    }
+    r.set_clock(up_ms);
+    let last = moves.last().map_or(90.0, |m| m.1);
+    r.input("touch-up", 10.0, last, 0, None);
+    r
+}
+
+#[test]
+fn a_fling_carries_the_fingers_speed_over_its_last_moments_not_one_jittery_sample() {
+    let r = flung(
+        &[
+            (1016.0, 70.0),
+            (1032.0, 50.0),
+            (1048.0, 30.0),
+            (1049.0, 20.0),
+        ],
+        1050.0,
+    );
+    let v = r.page_scroll.velocity;
+    assert!(
+        (1000.0..2000.0).contains(&v),
+        "70 units in 49 ms is about 1430 a second; one 10-unit sample in 1 ms is 10000: {v}"
+    );
+}
+
+#[test]
+fn a_finger_that_stops_before_it_lifts_does_not_fling() {
+    let mut r = flung(&[(1016.0, 70.0), (1032.0, 50.0), (1048.0, 30.0)], 1200.0);
+    assert_eq!(r.page_scroll.velocity, 0.0);
+    let held = r.page_scroll();
+    r.set_clock(1216.0);
+    assert_eq!(
+        r.page_scroll(),
+        held,
+        "the page stays where the finger left it"
+    );
+}
+
+#[test]
+fn control_a_steady_fling_glides_at_the_fingers_speed() {
+    let r = flung(
+        &[
+            (1016.0, 74.0),
+            (1032.0, 58.0),
+            (1048.0, 42.0),
+            (1064.0, 26.0),
+        ],
+        1064.0,
+    );
+    let v = r.page_scroll.velocity;
+    assert!(
+        (900.0..1100.0).contains(&v),
+        "16 units every 16 ms is 1000 a second: {v}"
+    );
+}
+
+#[test]
+fn a_glide_slows_like_a_phone_page_keeping_about_a_seventh_of_its_speed_after_a_second() {
+    let mut r = flung(
+        &[
+            (1016.0, 74.0),
+            (1032.0, 58.0),
+            (1048.0, 42.0),
+            (1064.0, 26.0),
+        ],
+        1064.0,
+    );
+    let start = r.page_scroll.velocity;
+    let mut t = 1064.0;
+    while t < 2064.0 {
+        t += 16.0;
+        r.set_clock(t);
+    }
+    let ratio = r.page_scroll.velocity / start;
+    assert!(
+        (0.10..0.18).contains(&ratio),
+        "0.998 per ms keeps 0.135 after a second: {ratio}"
+    );
 }
 
 #[test]
@@ -3166,13 +3390,24 @@ fn scroll_to_page(to: Option<serde_json::Value>) -> serde_json::Value {
 #[test]
 fn a_scroll_to_request_moves_the_page_once_per_request_number() {
     let mut host = SceneHost::new();
-    host.set_scene(scroll_to_page(Some(serde_json::json!({"y": 200, "n": 1})))).unwrap();
+    host.set_scene(scroll_to_page(Some(serde_json::json!({"y": 200, "n": 1}))))
+        .unwrap();
     assert_eq!(host.page_scroll(), 200.0, "the request moves the page");
     host.scroll_by(50.0);
-    host.set_scene(scroll_to_page(Some(serde_json::json!({"y": 200, "n": 1})))).unwrap();
-    assert_eq!(host.page_scroll(), 250.0, "the same request number is not applied twice");
-    host.set_scene(scroll_to_page(Some(serde_json::json!({"y": 9999, "n": 2})))).unwrap();
-    assert_eq!(host.page_scroll(), 500.0, "a new request is clamped to the content");
+    host.set_scene(scroll_to_page(Some(serde_json::json!({"y": 200, "n": 1}))))
+        .unwrap();
+    assert_eq!(
+        host.page_scroll(),
+        250.0,
+        "the same request number is not applied twice"
+    );
+    host.set_scene(scroll_to_page(Some(serde_json::json!({"y": 9999, "n": 2}))))
+        .unwrap();
+    assert_eq!(
+        host.page_scroll(),
+        500.0,
+        "a new request is clamped to the content"
+    );
 }
 
 #[test]

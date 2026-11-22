@@ -297,7 +297,12 @@ pub fn has_started_animation(node: &Value) -> bool {
 
 /// Whether any `startMs` animation under `node` has yet to start, still plays or loops at the clock.
 pub fn started_animation_live(node: &Value, epoch_now_ms: f64) -> bool {
-    let mut live = false;
+    started_animation_until(node).is_some_and(|until| epoch_now_ms < until)
+}
+
+/// The epoch instant every `startMs` animation under `node` has ended by (infinite when one loops); `None` without one.
+pub fn started_animation_until(node: &Value) -> Option<f64> {
+    let mut until: Option<f64> = None;
     started_animations(node, &mut |animation| {
         let (Ok(Some(start)), Some(duration)) = (
             orbital_canvas_base::animate::start_ms(animation),
@@ -306,24 +311,39 @@ pub fn started_animation_live(node: &Value, epoch_now_ms: f64) -> bool {
             return;
         };
         let looping = animation.get("loop").and_then(Value::as_bool) != Some(false);
-        live |= looping || epoch_now_ms < start + duration;
+        let end = if looping {
+            f64::INFINITY
+        } else {
+            start + duration
+        };
+        until = Some(until.map_or(end, |u| u.max(end)));
     });
-    live
+    until
 }
 
 /// A live world FX layer needs the host's paint clock even when no authored
 /// packet keyframe animation is present.
 pub fn has_active_fx(node: &Value) -> bool {
-    fx(node, None)
+    active_fx_until(node).is_some()
 }
 
 /// [`has_active_fx`] at the epoch clock `epoch_now_ms`: a drawable paint-clock animation that does not loop counts only
 /// while that clock is inside its duration (on a browser's epoch clock it has long finished and shows its end).
 pub fn active_fx_live(node: &Value, epoch_now_ms: f64) -> bool {
-    fx(node, Some(epoch_now_ms))
+    active_fx_until(node).is_some_and(|until| epoch_now_ms < until)
 }
 
-fn fx(node: &Value, clock: Option<f64>) -> bool {
+/// The epoch instant every fx under `node` has ended by: infinite when one runs on (an animated sprite, a non-empty fx
+/// layer, a looping paint-clock animation, a caret), else the latest non-looping paint-clock duration; `None` without one.
+pub fn active_fx_until(node: &Value) -> Option<f64> {
+    let mut until: Option<f64> = None;
+    fx_ends(node, &mut |end| {
+        until = Some(until.map_or(end, |u| u.max(end)))
+    });
+    until
+}
+
+fn fx_ends(node: &Value, f: &mut dyn FnMut(f64)) {
     let animated_sprite = |sprite: &Value| {
         sprite.get("animation").and_then(Value::as_str).is_some()
             && sprite
@@ -332,56 +352,47 @@ fn fx(node: &Value, clock: Option<f64>) -> bool {
                 .and_then(Value::as_str)
                 .is_some()
     };
-    if node.get("type").and_then(Value::as_str) == Some("draw-sprite") && animated_sprite(node) {
-        return true;
-    }
-    if node.get("type").and_then(Value::as_str) == Some("draw-sprite-layer")
-        && items(node).iter().any(animated_sprite)
+    let kind = node.get("type").and_then(Value::as_str);
+    if (kind == Some("draw-sprite") && animated_sprite(node))
+        || (kind == Some("draw-sprite-layer") && items(node).iter().any(animated_sprite))
+        || (kind == Some("draw-fx-layer")
+            && node
+                .get("items")
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty()))
+        || (kind == Some("draw-text")
+            && node
+                .get("caret")
+                .and_then(Value::as_f64)
+                .is_some_and(|caret| caret >= 0.0))
     {
-        return true;
-    }
-    if node.get("type").and_then(Value::as_str) == Some("draw-fx-layer")
-        && node
-            .get("items")
-            .and_then(Value::as_array)
-            .is_some_and(|items| !items.is_empty())
-    {
-        return true;
+        f(f64::INFINITY);
     }
     if matches!(
-        node.get("type").and_then(Value::as_str),
+        kind,
         Some("draw-shape" | "draw-group" | "draw-text" | "draw-scene3d")
-    ) && node.get("animation").is_some_and(|animation| {
-        !has_start(animation)
-            && animation
+    ) {
+        if let Some(animation) = node.get("animation").filter(|a| {
+            !has_start(a)
+                && a.get("keyframes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|v| !v.is_empty())
+        }) {
+            if let Some(duration) = animation
                 .get("durationMs")
                 .and_then(Value::as_f64)
-                .is_some_and(|v| {
-                    v > 0.0
-                        && (animation.get("loop").and_then(Value::as_bool) != Some(false)
-                            || clock.is_none_or(|now| now < v))
-                })
-            && animation
-                .get("keyframes")
-                .and_then(Value::as_array)
-                .is_some_and(|v| !v.is_empty())
-    }) {
-        return true;
+                .filter(|v| *v > 0.0)
+            {
+                let looping = animation.get("loop").and_then(Value::as_bool) != Some(false);
+                f(if looping { f64::INFINITY } else { duration });
+            }
+        }
     }
-    if node.get("type").and_then(Value::as_str) == Some("draw-text")
-        && node
-            .get("caret")
-            .and_then(Value::as_f64)
-            .is_some_and(|caret| caret >= 0.0)
-    {
-        return true;
+    for key in ["props", "drawables", "children", "items"] {
+        match node.get(key) {
+            Some(Value::Array(items)) => items.iter().for_each(|item| fx_ends(item, f)),
+            Some(child @ Value::Object(_)) => fx_ends(child, f),
+            _ => {}
+        }
     }
-    ["props", "drawables", "children", "items"]
-        .into_iter()
-        .filter_map(|key| node.get(key))
-        .any(|child| match child {
-            Value::Array(items) => items.iter().any(|item| fx(item, clock)),
-            Value::Object(_) => fx(child, clock),
-            _ => false,
-        })
 }

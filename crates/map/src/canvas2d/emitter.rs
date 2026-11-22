@@ -209,14 +209,26 @@ pub fn has_emitter(node: &Value) -> bool {
 
 /// Whether any emitter under `node` still has particles to paint or to be born at the clock.
 pub fn any_live(node: &Value, epoch_now_ms: f64) -> bool {
-    let mut live = false;
+    live_until(node).is_some_and(|until| epoch_now_ms.max(0.0) < until)
+}
+
+/// The epoch instant every emitter under `node` has painted its last particle by: infinite while one streams
+/// (`rate` above zero), else the latest burst's start plus its lifetime; `None` without a live emitter.
+pub fn live_until(node: &Value) -> Option<f64> {
+    let mut until: Option<f64> = None;
     emitters(node, &mut |e| {
         if let Ok(spec) = spec(e) {
-            live |= spec.rate > 0.0
-                || (spec.burst > 0 && local_seconds(&spec, epoch_now_ms) < spec.lifetime);
+            let end = if spec.rate > 0.0 {
+                Some(f64::INFINITY)
+            } else {
+                (spec.burst > 0).then_some(spec.start_ms + spec.lifetime * 1000.0)
+            };
+            if let Some(end) = end {
+                until = Some(until.map_or(end, |u| u.max(end)));
+            }
         }
     });
-    live
+    until
 }
 
 /// An emitter node for the tests here and in the crates that host a mapped scene.
