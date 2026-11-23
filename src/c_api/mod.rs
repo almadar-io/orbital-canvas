@@ -18,6 +18,12 @@ fn get_last_error() -> String {
     LAST_ERROR.with(|e| e.borrow().clone())
 }
 
+/// A scene or packet in JSON text, each float that is exactly an int read as that int (EXEC-EVAL-11).
+fn read_scene<T: serde::de::DeserializeOwned>(json: &str) -> Result<T, String> {
+    let value = orbital_core_base::json_value::from_json_str::<serde_json::Value>(json).map_err(|e| e.to_string())?;
+    orbital_core_base::json_value::from_json_value(&crate::exact_ints::exact_ints(value)).map_err(|e| e.to_string())
+}
+
 /// Run an entry point body so a panic (e.g. a wgpu validation error) never unwinds across the
 /// C boundary: it is reported through `orbital_canvas_last_error` and `on_panic` is returned.
 pub(crate) fn guarded<T>(entry: &str, on_panic: T, body: impl FnOnce() -> T) -> T {
@@ -128,7 +134,7 @@ pub unsafe extern "C" fn orbital_canvas_submit(renderer: *mut Canvas, json_packe
                 return;
             }
         };
-        let packet = match orbital_core_base::json_value::from_json_str::<GameRenderPacket>(json) {
+        let packet = match read_scene::<GameRenderPacket>(json) {
             Ok(p) => p,
             Err(err) => {
                 tracing::error!(error = %err, "failed to parse submit packet");
@@ -168,7 +174,7 @@ pub unsafe extern "C" fn orbital_canvas_set_scene(
                 return 0;
             }
         };
-        let node = match orbital_core_base::json_value::from_json_str::<serde_json::Value>(json) {
+        let node = match read_scene::<serde_json::Value>(json) {
             Ok(v) => v,
             Err(err) => {
                 set_last_error(&format!("set_scene: scene is not valid JSON: {err}"));
@@ -359,10 +365,7 @@ pub unsafe extern "C" fn orbital_canvas_scene_size(
         let node = match CStr::from_ptr(scene_json)
             .to_str()
             .map_err(|e| e.to_string())
-            .and_then(|s| {
-                orbital_core_base::json_value::from_json_str::<serde_json::Value>(s)
-                    .map_err(|e| e.to_string())
-            }) {
+            .and_then(read_scene::<serde_json::Value>) {
             Ok(v) => v,
             Err(err) => {
                 set_last_error(&format!("scene_size: scene is not valid UTF-8 JSON: {err}"));
@@ -586,10 +589,7 @@ pub unsafe extern "C" fn orbital_canvas_render_scene_rgba(
         let node = match CStr::from_ptr(scene_json)
             .to_str()
             .map_err(|e| e.to_string())
-            .and_then(|s| {
-                orbital_core_base::json_value::from_json_str::<serde_json::Value>(s)
-                    .map_err(|e| e.to_string())
-            }) {
+            .and_then(read_scene::<serde_json::Value>) {
             Ok(v) => v,
             Err(err) => {
                 set_last_error(&format!(

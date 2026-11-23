@@ -169,6 +169,47 @@ fn set_scene_maps_canvas_children_to_a_packet() {
     unsafe { orbital_canvas_destroy(renderer) };
 }
 
+fn headed_scene(level: &str) -> CString {
+    CString::new(format!(
+        r##"{{"type":"canvas","projection":"flat","camera":{{"zoom":1.0}},"backgroundColor":"#000000",
+          "children":[{{"type":"draw-text","id":"t","text":"Overview","anchor":"top-left",
+                       "position":{{"x":0.0,"y":0.0}},"color":"#111111",
+                       "semantic":{{"role":"heading","level":{level},"name":"Overview"}}}}]}}"##
+    ))
+    .unwrap()
+}
+
+#[test]
+fn set_scene_reads_a_whole_float_as_the_int_it_is() {
+    let renderer = headless();
+    assert_eq!(
+        unsafe { orbital_canvas_set_scene(renderer, headed_scene("2.0").as_ptr()) },
+        1,
+        "a kernel Number(2.0) is the int 2 (EXEC-EVAL-11): {}",
+        get_last_error()
+    );
+    let control = headless();
+    assert_eq!(
+        unsafe { orbital_canvas_set_scene(control, headed_scene("2.5").as_ptr()) },
+        0,
+        "control: 2.5 is no heading level"
+    );
+    assert!(get_last_error().contains("semantic.level"));
+    set_last_error("");
+    unsafe { orbital_canvas_destroy(renderer) };
+    unsafe { orbital_canvas_destroy(control) };
+}
+
+#[test]
+fn submit_reads_a_whole_float_in_an_integer_field_as_that_int() {
+    let renderer = headless();
+    let packet = CString::new(r#"{"pattern":"canvas","width":10.0,"height":10.0,"draw_commands":[],"fps":30.0}"#).unwrap();
+    unsafe { orbital_canvas_submit(renderer, packet.as_ptr()) };
+    let stored = unsafe { (*renderer).host.packet.clone() }.expect("a packet whose fps is 30.0 is stored");
+    assert_eq!(stored.fps, Some(30));
+    unsafe { orbital_canvas_destroy(renderer) };
+}
+
 #[test]
 fn set_scene_rejections_leave_the_packet_alone_and_report() {
     let renderer = headless();

@@ -47,6 +47,8 @@ pub use orbital_core_base::color;
 pub mod contrast;
 #[path = "support/diagnostics.rs"]
 pub mod diagnostics;
+#[path = "support/exact_ints.rs"]
+pub mod exact_ints;
 #[path = "support/faces.rs"]
 pub mod faces;
 #[path = "support/shader_check.rs"]

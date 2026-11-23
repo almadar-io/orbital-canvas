@@ -38,7 +38,7 @@ pub fn host_node(pattern: &str, props: Value, canvas_theme: Option<&Value>) -> V
     if let Some(theme) = canvas_theme {
         fields.insert("canvasTheme".to_string(), theme.clone());
     }
-    Value::Object(fields)
+    orbital_canvas_base::exact_ints::exact_ints(Value::Object(fields))
 }
 
 /// Map a render-ui node to its scene. The node's `type` names the pattern: the
@@ -272,6 +272,37 @@ mod tests {
     }
 
     use super::*;
+
+    fn headed_canvas(level: serde_json::Value, max_lines: serde_json::Value) -> serde_json::Value {
+        host_node(
+            "canvas",
+            serde_json::json!({"projection": "flat", "camera": {"zoom": 1}, "backgroundColor": "#000000",
+                "children": [{"type": "draw-text", "id": "t", "text": "Overview", "anchor": "top-left",
+                    "position": {"x": 0.5, "y": 0.0}, "color": "#111111", "width": 120.0, "maxLines": max_lines,
+                    "semantic": {"role": "heading", "level": level, "name": "Overview"}}]}),
+            None,
+        )
+    }
+
+    #[test]
+    fn a_host_node_reads_a_whole_float_as_the_int_it_is() {
+        let view = Some((600.0, 400.0));
+        let floated = map_scene(&headed_canvas(serde_json::json!(2.0), serde_json::json!(3.0)), view)
+            .expect("a kernel Number(2.0) is the int 2 (EXEC-EVAL-11)");
+        let int = map_scene(&headed_canvas(serde_json::json!(2), serde_json::json!(3)), view).unwrap();
+        assert_eq!(floated.semantic_nodes[0].level, Some(2));
+        assert_eq!(floated.semantic_nodes, int.semantic_nodes);
+        assert_eq!(format!("{:?}", floated.packet), format!("{:?}", int.packet));
+    }
+
+    #[test]
+    fn control_a_host_node_still_refuses_a_level_that_is_no_int() {
+        let refused = map_scene(&headed_canvas(serde_json::json!(2.5), serde_json::json!(3)), Some((600.0, 400.0)));
+        assert!(
+            matches!(&refused, Err(CanvasSceneError::InvalidProp { field, .. }) if field == "semantic.level"),
+            "{refused:?}"
+        );
+    }
 
     #[test]
     fn authored_3d_canvas_routes_to_one_scene3d_command() {
