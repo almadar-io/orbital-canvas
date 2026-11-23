@@ -4,6 +4,7 @@
 //! through a tiny C ABI. The server/runtime sends a JSON `GameRenderPacket`
 //! (display list); this crate turns it into draw calls.
 
+pub use orbital_canvas_base::PORTABLE_MAX_TEXTURE_SIDE;
 pub use orbital_canvas_base::{
     animate, color, contrast, diagnostics, exact_ints, fx_projection, morph, packet, path_data, projector,
     shader_check, shaders, skinning_2d, spring, targets, transform,

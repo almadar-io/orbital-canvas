@@ -10,6 +10,14 @@ use orbital_canvas_base::targets::{has_live_material, hash_commands, reads};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
+/// The pixel density a texture of logical size `points` is painted at within the device's `limit` per side: `density`,
+/// lowered until the longest side fits, never below one pixel per point.
+pub fn density_within(points: (u32, u32), density: f32, limit: u32) -> f32 {
+    let density = if density.is_finite() && density > 0.0 { density } else { 1.0 };
+    let longest = points.0.max(points.1).max(1) as f32;
+    density.min((limit as f32 / longest).max(1.0))
+}
+
 /// A hash of what a target paints: its size, its commands, the clock when it is live or holds a live material, the
 /// font and asset generations, and the version of every target its children read.
 pub(crate) fn content_hash(
@@ -208,6 +216,25 @@ impl Drop for TargetStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_texture_that_fits_keeps_its_density() {
+        assert_eq!(super::density_within((400, 300), 2.0, 2048), 2.0);
+    }
+
+    #[test]
+    fn a_texture_too_long_for_the_device_is_painted_at_a_density_that_fits() {
+        let density = super::density_within((383, 834), 2.625, 2048);
+        assert!((834.0 * density).round() <= 2048.0, "{density}");
+        assert!(density > 2.4, "control: no lower than it must be ({density})");
+    }
+
+    #[test]
+    fn edge_density_never_drops_below_one_pixel_per_point_and_a_bad_density_is_one() {
+        assert_eq!(super::density_within((5000, 10), 2.0, 2048), 1.0);
+        assert_eq!(super::density_within((10, 10), f32::NAN, 2048), 1.0);
+        assert_eq!(super::density_within((10, 10), 0.0, 2048), 1.0);
+    }
+
     use super::*;
     use orbital_canvas_base::targets::fixtures::*;
 

@@ -16,9 +16,7 @@ impl SharedDeviceRenderer {
         packet: &GameRenderPacket,
     ) {
         let limit = self.device.limits().max_texture_dimension_2d;
-        let density = if density.is_finite() && density > 0.0 { density } else { 1.0 };
-        let longest = points.0.max(points.1).max(1) as f32;
-        let density = density.min((limit as f32 / longest).max(1.0));
+        let density = crate::render_target::density_within(points, density, limit);
         let size = (
             ((points.0 as f32) * density).round().max(1.0) as u32,
             ((points.1 as f32) * density).round().max(1.0) as u32,
