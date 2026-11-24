@@ -310,6 +310,7 @@ impl SceneHost {
     ) {
         let region = self.pointer_regions.iter().rev().find(|r| r.id == id);
         let event = region.and_then(|r| pick(&r.events).clone());
+        let origin = region.and_then(|r| r.origin);
         let y = self.world_y(region.is_some_and(|r| r.fixed), y);
         if let Some(event) = event {
             self.scene_events.push(mappers::scene::Emit {
@@ -318,6 +319,11 @@ impl SceneHost {
                 // `target`, not `id`: a control payload's `id` seeds the dispatch on that row (client_core extract_entity_id)
                 payload: {
                     let mut payload = serde_json::json!({ "target": id, "x": x, "y": y });
+                    // the press in the space of the origin its drawable was placed in
+                    if let Some((ox, oy)) = origin {
+                        payload["originX"] = serde_json::json!(ox);
+                        payload["originY"] = serde_json::json!(oy);
+                    }
                     if let Some(touches) = &self.touch_payload {
                         payload["touches"] = touches.clone();
                     }

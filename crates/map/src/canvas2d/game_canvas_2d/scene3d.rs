@@ -45,6 +45,7 @@ pub(super) fn paint_scene3d_gathering(
         });
         if let Some((rect, rotation)) = placed {
             gathered.regions.push(Region {
+                origin: None,
                 id: id.to_string(),
                 rect,
                 rotation,

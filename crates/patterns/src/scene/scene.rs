@@ -159,6 +159,7 @@ fn game_canvas_scene(
                 wheel: region.wheel,
                 fixed: region.fixed,
                 drag: region.drag,
+                origin: region.origin,
             })
             .collect(),
         measured: gathered.measured,

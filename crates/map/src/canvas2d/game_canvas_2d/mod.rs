@@ -68,6 +68,8 @@ pub struct Region {
     pub fixed: bool,
     /// The drawable declared `drag: true`: a press on it keeps the pointer's travel, the page does not scroll.
     pub drag: bool,
+    /// The resolved offset of the frame origin its top-level drawable named (`origin`), `None` on the page.
+    pub origin: Option<(f32, f32)>,
 }
 
 /// What the drawable walk gathers besides display commands: regions and measured texts, both in paint order.
@@ -144,6 +146,17 @@ fn from_props_sized(
     epoch_now_ms: f64,
 ) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
     from_props_cached(props, viewport, epoch_now_ms, &mut DrawableCache::default())
+}
+
+/// The frame's `origins` resolved to their page offsets, sorted by id: what a canvas reports (`originsEvent`) so the
+/// program can read a placed rect's page position without resolving origin chains itself.
+pub fn frame_origins(props: &Value) -> Result<Vec<(String, f32, f32)>, CanvasSceneError> {
+    let mut resolved: Vec<(String, f32, f32)> = origin::resolve_origins(props)?
+        .into_iter()
+        .map(|(id, (x, y))| (id, x, y))
+        .collect();
+    resolved.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(resolved)
 }
 
 /// [`from_props_sized`] replaying each drawable `cache` kept from the last mapping when it and the walk context are
@@ -304,13 +317,16 @@ fn map_drawables<D: SharedDrawable>(
         asset_generation: generations.0,
         font_generation: generations.1,
     });
+    let origins = origin::resolve_origins(props)?;
     for (index, node) in drawables.iter().enumerate() {
-        if cache.replay(node, index, &mut gathered, &mut draw_commands) {
+        let offset = origin::offset_of(node.value(), &origins)?;
+        if cache.replay(node, index, offset, &mut gathered, &mut draw_commands) {
             continue;
         }
         cache.walk(
             node,
             index,
+            offset,
             &projector,
             &to_screen,
             zoom,
@@ -1119,6 +1135,7 @@ mod drawable_cache;
 pub use self::drawable_cache::{DrawableCache, SharedDrawable};
 mod editing;
 mod group;
+mod origin;
 mod paragraph;
 mod scene3d;
 mod shape;

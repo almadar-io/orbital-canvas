@@ -93,6 +93,8 @@ pub struct SceneHost {
     /// The sizes of the measured texts at the latest layout, and the list last sent as `measureEvent`.
     pub(crate) measured: Vec<mappers::scene::Measured>,
     pub(crate) measure_reported: Vec<(String, f32, f32, u32)>,
+    /// The resolved page offset of every frame origin the last `originsEvent` reported.
+    pub(crate) origins_reported: Vec<(String, f32, f32)>,
     /// The semantic tree of the latest layout, and the size last sent as `resizeEvent`.
     pub(crate) semantic: Vec<mappers::scene::SemanticNode>,
     pub(crate) resize_reported: Option<(f32, f32)>,
@@ -166,6 +168,7 @@ impl SceneHost {
             text_hits: Vec::new(),
             measured: Vec::new(),
             measure_reported: Vec::new(),
+            origins_reported: Vec::new(),
             semantic: Vec::new(),
             resize_reported: None,
             direction_reported: None,
@@ -372,6 +375,7 @@ impl SceneHost {
         }
         self.apply_scroll_to();
         self.report_measured();
+        self.report_origins();
         self.report_resize();
         self.report_direction();
         self.report_motion();

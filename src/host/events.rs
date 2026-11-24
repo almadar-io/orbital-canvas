@@ -107,6 +107,32 @@ impl SceneHost {
         self.measure_reported = current;
     }
 
+    /// Queue one `originsEvent` when the frame's origins resolve to page offsets other than the ones last reported: the
+    /// program reads a rect placed in an origin at its page position from them.
+    pub(super) fn report_origins(&mut self) {
+        let Some((event, current)) = self.frame().and_then(|node| {
+            let props = node.get("props").unwrap_or(node);
+            let event = props.get("originsEvent").and_then(serde_json::Value::as_str)?.to_owned();
+            let current = mappers::game_canvas_2d::frame_origins(props).ok()?;
+            Some((event, current))
+        }) else {
+            return;
+        };
+        if current == self.origins_reported {
+            return;
+        }
+        let offsets: serde_json::Map<String, serde_json::Value> = current
+            .iter()
+            .map(|(id, x, y)| (id.clone(), serde_json::json!({ "x": x, "y": y })))
+            .collect();
+        self.scene_events.push(mappers::scene::Emit {
+            event,
+            arg: String::new(),
+            payload: serde_json::json!({ "offsets": offsets }),
+        });
+        self.origins_reported = current;
+    }
+
     /// Whether scene events are queued that the host has not taken yet.
     pub fn has_scene_events(&self) -> bool {
         !self.scene_events.is_empty()

@@ -123,6 +123,9 @@ pub struct PointerRegion {
     pub fixed: bool,
     /// The drawable declared `drag: true`: a press on it keeps the pointer's travel, the page does not scroll.
     pub drag: bool,
+    /// The resolved offset of the frame origin its drawable named, `None` on the page: a pointer payload carries it so
+    /// the program reads the press in that origin's space.
+    pub origin: Option<(f32, f32)>,
 }
 
 /// One node of a canvas's semantic tree: a drawable with `semantic` and `id`, at its pointer region

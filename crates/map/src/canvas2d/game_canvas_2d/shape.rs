@@ -719,6 +719,7 @@ pub(super) fn paint_sdf_shape(
 
     if let Some(id) = hit_id(node) {
         gathered.regions.push(Region {
+            origin: None,
             id: id.to_string(),
             rect,
             rotation,
@@ -1145,6 +1146,7 @@ pub(super) fn paint_vector_shape(
     if let Some(id) = hit_id(node) {
         if let Some(rect) = commands_bounds(&out[start..]).or(geometry_bounds) {
             gathered.regions.push(Region {
+                origin: None,
                 id: id.to_string(),
                 rect,
                 rotation: 0.0,

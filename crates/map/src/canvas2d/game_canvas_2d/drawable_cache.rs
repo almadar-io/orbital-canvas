@@ -72,6 +72,8 @@ struct Segment {
     live_scenes3d: Vec<LiveScene3d>,
     /// The semantic count it began at, when a node it made takes its order from its paint position.
     paint_ordered_at: Option<usize>,
+    /// The resolved offset of the origin it was walked at.
+    offset: Option<(f32, f32)>,
 }
 
 /// The drawables of the scene last mapped, by `id` (or index when a drawable has none).
@@ -112,13 +114,20 @@ impl DrawableCache {
     }
 
     /// Append the kept output of `node` at `index` when it is reusable here, saying whether it was.
-    pub(super) fn replay<D: SharedDrawable>(&mut self, node: &D, index: usize, gathered: &mut Gathered, out: &mut Vec<DrawCommand>) -> bool {
+    pub(super) fn replay<D: SharedDrawable>(
+        &mut self,
+        node: &D,
+        index: usize,
+        offset: Option<(f32, f32)>,
+        gathered: &mut Gathered,
+        out: &mut Vec<DrawCommand>,
+    ) -> bool {
         let Some(segment) = self.segments.get(&key(node.value(), index)) else {
             return false;
         };
         let (out_start, semantic_start) = (out.len(), gathered.semantic.len());
         let same = node.shared().is_some_and(|shared| Arc::ptr_eq(shared, &segment.node)) || *segment.node == *node.value();
-        if !same || segment.paint_ordered_at.is_some_and(|at| at != semantic_start) {
+        if !same || segment.offset != offset || segment.paint_ordered_at.is_some_and(|at| at != semantic_start) {
             return false;
         }
         out.extend(segment.commands.iter().cloned());
@@ -145,6 +154,7 @@ impl DrawableCache {
         &mut self,
         node: &D,
         index: usize,
+        offset: Option<(f32, f32)>,
         projector: &Projector,
         to_screen: &dyn Fn(f32, f32) -> (f32, f32),
         zoom: f32,
@@ -160,7 +170,11 @@ impl DrawableCache {
         let texts = std::mem::take(&mut gathered.texts);
         let labelled = std::mem::take(&mut gathered.labelled);
         let valued = std::mem::take(&mut gathered.valued);
-        let walked = super::walk(node.value(), projector, to_screen, zoom, epoch_now_ms, gathered, out);
+        let walked = super::walk(node.value(), projector, to_screen, zoom, epoch_now_ms, gathered, out).map(|()| {
+            if let Some(offset) = offset {
+                super::origin::move_to_origin(offset, projector, to_screen, gathered, out, out_start, (region_start, measured_start, hit_start, semantic_start));
+            }
+        });
         let own_texts = std::mem::replace(&mut gathered.texts, texts);
         let own_labelled = std::mem::replace(&mut gathered.labelled, labelled);
         let own_valued = std::mem::replace(&mut gathered.valued, valued);
@@ -202,6 +216,7 @@ impl DrawableCache {
                     .collect(),
                 live_scenes3d: gathered.live_scenes3d[live_start..].to_vec(),
                 paint_ordered_at: paint_ordered.then_some(semantic_start),
+                offset,
             },
         );
         Ok(())

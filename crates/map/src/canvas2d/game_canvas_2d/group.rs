@@ -116,6 +116,57 @@ pub(super) fn paint_group(
     };
     let scale = get_f32(node, "scale", 1.0) * animated_number("scale", 1.0);
     let opacity = get_f32(node, "opacity", 1.0) * animated_number("opacity", 1.0);
+    transform_walked(
+        gathered,
+        out,
+        Walked {
+            commands: start,
+            regions: region_start,
+            measured: measured_start,
+            hits: hits_start,
+            semantic: semantic_start,
+        },
+        origin,
+        translation,
+        scale,
+        radians,
+        opacity,
+    );
+    if rect_clip {
+        if let Some(DrawCommand::ClipGroup { clip, .. }) = out.get(start) {
+            if let Some(bounds) = path_bounds(clip) {
+                cut_regions_to(&mut gathered.regions, region_start, bounds);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Where a walk began in each list it appends to, so what it walked can be moved as one.
+#[derive(Clone, Copy)]
+pub(super) struct Walked {
+    pub commands: usize,
+    pub regions: usize,
+    pub measured: usize,
+    pub hits: usize,
+    pub semantic: usize,
+}
+
+/// Move everything walked since `from` by a group's transform: its commands, hit regions, semantic boxes, text hits
+/// and measured sizes.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn transform_walked(
+    gathered: &mut Gathered,
+    out: &mut [DrawCommand],
+    from: Walked,
+    origin: Vec2,
+    translation: Vec2,
+    scale: f32,
+    radians: f32,
+    opacity: f32,
+) {
+    let (start, region_start, measured_start, hits_start, semantic_start) =
+        (from.commands, from.regions, from.measured, from.hits, from.semantic);
     orbital_canvas_base::animate::transform_group_commands(
         &mut out[start..],
         origin,
@@ -230,14 +281,6 @@ pub(super) fn paint_group(
         entry.width *= scale.abs();
         entry.height *= scale.abs();
     }
-    if rect_clip {
-        if let Some(DrawCommand::ClipGroup { clip, .. }) = out.get(start) {
-            if let Some(bounds) = path_bounds(clip) {
-                cut_regions_to(&mut gathered.regions, region_start, bounds);
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Replace the two SDF shapes a `smoothUnion` group painted by one [`DrawCommand::SdfBlend`] (contract 14.4).

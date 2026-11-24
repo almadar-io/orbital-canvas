@@ -357,6 +357,7 @@ pub(super) fn paint_text(
         if let Some(id) = id {
             if hit_id(node).is_some() {
                 gathered.regions.push(Region {
+                    origin: None,
                     id: id.to_string(),
                     rect: Rect {
                         x: sx,
@@ -454,6 +455,7 @@ pub(super) fn paint_text(
             };
             if tracked {
                 gathered.regions.push(Region {
+                    origin: None,
                     id: id.to_string(),
                     rect: Rect {
                         x: left,

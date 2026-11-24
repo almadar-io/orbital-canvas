@@ -242,6 +242,7 @@ fn region(
             leave: name("LEAVE"),
             moved: name("MOVE"),
         },
+        origin: None,
         wheel: false,
         fixed: false,
         drag: false,
@@ -3473,4 +3474,61 @@ fn a_split_scene_reads_the_liveness_of_the_whole_one_and_only_its_new_drawables(
     let now = host.liveness_parts.get(&(std::sync::Arc::as_ptr(&first.drawables.as_ref().unwrap()[1]) as usize)).cloned();
     assert_eq!(kept.map(|k| k.1), now.map(|n| n.1), "the shared drawable's part is carried over");
     assert_eq!(host.liveness_parts.len(), 2, "control: parts of drawables that left are dropped");
+}
+
+#[test]
+fn a_press_on_a_drawable_in_an_origin_reports_that_origins_offset_and_a_page_drawable_reports_none() {
+    let mut r = SceneHost::new();
+    r.set_scene(serde_json::json!({
+        "type": "canvas", "mode": "2d", "projection": "free", "camera": {"zoom": 1}, "pointerDownEvent": "DOWN",
+        "origins": {"card": {"x": 100, "y": 50}},
+        "drawables": [
+            {"type": "draw-shape", "id": "in", "shape": "rect", "anchor": "top-left", "origin": "card",
+             "position": {"x": 0, "y": 0}, "width": 40, "height": 20, "fill": "#000000", "hit": true},
+            {"type": "draw-shape", "id": "page", "shape": "rect", "anchor": "top-left",
+             "position": {"x": 0, "y": 200}, "width": 40, "height": 20, "fill": "#000000", "hit": true}]
+    }))
+    .unwrap();
+    r.input("touch-down", 110.0, 55.0, 0, None);
+    let down = r.take_scene_events();
+    assert_eq!(down[0].payload["target"], "in");
+    assert_eq!((down[0].payload["originX"].clone(), down[0].payload["originY"].clone()), (serde_json::json!(100.0), serde_json::json!(50.0)));
+    r.input("touch-up", 110.0, 55.0, 0, None);
+    r.take_scene_events();
+    r.input("touch-down", 10.0, 205.0, 0, None);
+    let down = r.take_scene_events();
+    assert_eq!(down[0].payload["target"], "page");
+    assert!(down[0].payload.get("originX").is_none(), "control: a page drawable's press names no origin");
+}
+
+#[test]
+fn a_canvas_reports_its_resolved_origins_once_per_change_and_a_canvas_without_the_event_reports_none() {
+    let scene = |card_x: f64, event: bool| {
+        let mut s = serde_json::json!({
+            "type": "canvas", "mode": "2d", "projection": "free", "camera": {"zoom": 1},
+            "origins": {"card": {"x": card_x, "y": 10}, "inner": {"x": 5, "y": 5, "origin": "card"}},
+            "drawables": [{"type": "draw-shape", "id": "a", "shape": "rect", "anchor": "top-left", "origin": "inner",
+                "position": {"x": 0, "y": 0}, "width": 4, "height": 4, "fill": "#000000"}]
+        });
+        if event {
+            s["originsEvent"] = serde_json::json!("ORIGINS");
+        }
+        s
+    };
+    let mut r = SceneHost::new();
+    r.set_scene(scene(100.0, true)).unwrap();
+    let sent: Vec<_> = r.take_scene_events().into_iter().filter(|e| e.event == "ORIGINS").collect();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].payload,
+        serde_json::json!({"offsets": {"card": {"x": 100.0, "y": 10.0}, "inner": {"x": 105.0, "y": 15.0}}})
+    );
+    r.set_scene(scene(100.0, true)).unwrap();
+    assert!(r.take_scene_events().iter().all(|e| e.event != "ORIGINS"), "unchanged origins are not reported again");
+    r.set_scene(scene(140.0, true)).unwrap();
+    let moved: Vec<_> = r.take_scene_events().into_iter().filter(|e| e.event == "ORIGINS").collect();
+    assert_eq!(moved[0].payload["offsets"]["inner"], serde_json::json!({"x": 145.0, "y": 15.0}));
+    let mut quiet = SceneHost::new();
+    quiet.set_scene(scene(100.0, false)).unwrap();
+    assert!(quiet.take_scene_events().iter().all(|e| e.event != "ORIGINS"), "control: no originsEvent, no report");
 }

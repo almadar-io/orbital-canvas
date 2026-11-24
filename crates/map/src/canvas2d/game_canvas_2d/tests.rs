@@ -4673,3 +4673,66 @@ fn a_split_node_with_children_and_no_list_maps_as_the_whole_node() {
     let whole = from_canvas_node_in_viewport_mapped(&node, 300.0, 200.0, 0.0).unwrap().0;
     assert_eq!(format!("{split:?}"), format!("{whole:?}"));
 }
+
+fn origin_props(drawables: Value, origins: Value) -> Value {
+    let mut props = free_props(drawables);
+    props["origins"] = origins;
+    props
+}
+
+#[test]
+fn a_drawable_in_an_origin_maps_as_it_would_in_a_group_at_that_origin_and_its_region_carries_the_offset() {
+    let button = json!({"type": "draw-shape", "shape": "rect", "id": "go", "hit": true, "anchor": "top-left",
+        "position": {"x": 20, "y": 40}, "width": 40, "height": 20, "fill": "#000000",
+        "semantic": {"role": "button", "name": "Go"}});
+    let mut placed = button.clone();
+    placed["origin"] = json!("card");
+    let (packet, gathered) =
+        from_props_mapped(&origin_props(json!([placed]), json!({"card": {"x": 100, "y": 30}})), 0.0).unwrap();
+    let group = json!({"type": "draw-group", "position": {"x": 100, "y": 30}, "items": [button.clone()]});
+    let (grouped_packet, grouped) = from_props_mapped(&free_props(json!([group])), 0.0).unwrap();
+    assert_eq!(serde_json::to_value(&packet).unwrap(), serde_json::to_value(&grouped_packet).unwrap());
+    assert_eq!(gathered.regions[0].rect, grouped.regions[0].rect);
+    assert_eq!(gathered.semantic[0].rect, grouped.semantic[0].rect);
+    assert_eq!(gathered.regions[0].origin, Some((100.0, 30.0)));
+    let (_, plain) = from_props_mapped(&free_props(json!([button])), 0.0).unwrap();
+    assert_eq!(plain.regions[0].origin, None, "control: a drawable on the page names no origin");
+    assert_eq!(plain.regions[0].rect, Rect { x: 20.0, y: 40.0, w: 40.0, h: 20.0 });
+}
+
+#[test]
+fn a_nested_origin_adds_its_parents_offset() {
+    let dot = json!({"type": "draw-shape", "shape": "rect", "id": "dot", "hit": true, "anchor": "top-left", "origin": "inner",
+        "position": {"x": 1, "y": 2}, "width": 4, "height": 4, "fill": "#000000"});
+    let origins = json!({"outer": {"x": 100, "y": 10}, "inner": {"x": 20, "y": 5, "origin": "outer"}});
+    let (_, gathered) = from_props_mapped(&origin_props(json!([dot]), origins), 0.0).unwrap();
+    assert_eq!(gathered.regions[0].rect, Rect { x: 121.0, y: 17.0, w: 4.0, h: 4.0 });
+    assert_eq!(gathered.regions[0].origin, Some((120.0, 15.0)));
+}
+
+#[test]
+fn a_moved_origin_rewalks_only_its_own_drawables() {
+    let scene = |card_x: f32| {
+        origin_props(
+            json!([rect_shape(json!({"id": "a", "origin": "card"})), rect_shape(json!({"id": "b"})), rect_shape(json!({"id": "c", "origin": "card"}))]),
+            json!({"card": {"x": card_x, "y": 0}}),
+        )
+    };
+    let mut cache = DrawableCache::default();
+    from_props_cached_at(&scene(10.0), None, 0.0, false, (0, 0), &mut cache).unwrap();
+    from_props_cached_at(&scene(10.0), None, 0.0, false, (0, 0), &mut cache).unwrap();
+    assert_eq!(cache.reused, 3, "control: an unmoved origin replays every drawable");
+    let moved = from_props_cached_at(&scene(40.0), None, 0.0, false, (0, 0), &mut cache).unwrap();
+    assert_eq!(cache.reused, 1, "only the page drawable is replayed; the two in the moved origin are walked");
+    same_mapping(&moved, &from_props_mapped(&scene(40.0), 0.0).unwrap());
+}
+
+#[test]
+fn an_unknown_or_circular_origin_is_refused() {
+    let shape = rect_shape(json!({"id": "a", "origin": "missing"}));
+    let err = from_props_mapped(&origin_props(json!([shape]), json!({})), 0.0).unwrap_err();
+    assert!(matches!(&err, CanvasSceneError::InvalidProp { field, .. } if field == "origin"), "{err:?}");
+    let shape = rect_shape(json!({"id": "a", "origin": "x"}));
+    let err = from_props_mapped(&origin_props(json!([shape]), json!({"x": {"x": 0, "y": 0, "origin": "y"}, "y": {"x": 0, "y": 0, "origin": "x"}})), 0.0).unwrap_err();
+    assert!(matches!(&err, CanvasSceneError::InvalidProp { field, .. } if field == "origins"), "{err:?}");
+}
