@@ -70,8 +70,12 @@ impl SceneHost {
         self.resize_reported = Some(size);
     }
 
-    /// Queue one `measureEvent` when the measured sizes differ from the list last reported.
+    /// Queue one `measureEvent` when the measured sizes differ from the list last reported, once no theme face is still
+    /// downloading (sizes shaped in the fallback face are not the page's).
     pub(super) fn report_measured(&mut self) {
+        if asset::faces_loading() {
+            return;
+        }
         let current: Vec<(String, f32, f32, u32)> = self
             .measured
             .iter()
@@ -101,6 +105,11 @@ impl SceneHost {
             });
         }
         self.measure_reported = current;
+    }
+
+    /// Whether scene events are queued that the host has not taken yet.
+    pub fn has_scene_events(&self) -> bool {
+        !self.scene_events.is_empty()
     }
 
     /// Drain the scene events that taps queued (`[{event, payload}]` for the host to send).

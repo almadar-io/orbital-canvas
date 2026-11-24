@@ -51,6 +51,11 @@ pub fn face_named(name: &str) -> Option<TextFamily> {
     u16::try_from(id).ok().map(TextFamily::Face)
 }
 
+/// Every registered theme face file URL.
+pub fn face_urls() -> Vec<String> {
+    registry().read().map(|faces| faces.iter().map(|f| f.url.clone()).collect()).unwrap_or_default()
+}
+
 /// The file behind a [`TextFamily::Face`] id.
 pub fn face_file(id: u16) -> Option<FaceFile> {
     registry().read().ok()?.get(usize::from(id)).cloned()

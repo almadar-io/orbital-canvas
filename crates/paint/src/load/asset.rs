@@ -203,6 +203,15 @@ pub fn register_asset(key: &str, bytes: Arc<[u8]>, mime: Option<&str>) {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// Whether a theme face file is still downloading, asking for every one first: text shaped now draws in the fallback
+/// face. Like the web's `@font-face`, a theme's faces load before its text is measured, not when a text first draws.
+pub fn faces_loading() -> bool {
+    let urls = orbital_canvas_base::faces::face_urls();
+    urls.iter().for_each(|url| ensure_asset(url));
+    let map = cache().read().expect("asset cache poisoned");
+    urls.iter().any(|url| matches!(map.get(url), Some(State::InFlight)))
+}
+
 /// Assets whose fetch has not completed.
 pub fn pending() -> usize {
     cache()
@@ -380,6 +389,43 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         None
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn theme_faces_are_loading_until_every_face_file_has_landed_or_failed() {
+        let dir = std::env::temp_dir().join(format!("orbital-canvas-faces-loading-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = dir.join("held.ttf");
+        let _ = std::fs::remove_file(&held);
+        assert!(std::process::Command::new("mkfifo").arg(&held).status().unwrap().success(), "mkfifo");
+        use orbital_canvas_base::faces::register_face;
+        use orbital_canvas_base::packet::TextFamily;
+
+        register_face("faces loading test inline", "data:font/ttf;base64,AAAA", TextFamily::Sans).unwrap();
+        assert!(!faces_loading(), "control: a face whose file is already here is not loading");
+
+        let held_url = held.display().to_string();
+        register_face("faces loading test held", &held_url, TextFamily::Sans).unwrap();
+        assert!(faces_loading(), "a face no text has drawn yet is asked for and loads, like an @font-face");
+
+        let gone = dir.join("gone.ttf").display().to_string();
+        register_face("faces loading test gone", &gone, TextFamily::Sans).unwrap();
+        std::thread::spawn({
+            let held = held.clone();
+            move || std::fs::write(held, b"not a font").unwrap()
+        })
+        .join()
+        .unwrap();
+        assert!(wait_bytes(&held_url).is_some(), "the held file lands");
+        for _ in 0..200 {
+            if fetch_failed(&gone) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!faces_loading(), "a face that landed or failed is final: nothing is loading");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A file:// fixture round-trips through the cache: encode a 2×2 PNG with
