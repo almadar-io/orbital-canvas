@@ -25,6 +25,7 @@ use orbital_canvas_base::packet::{
 };
 use orbital_canvas_base::path_data::{parse_path_data, path_bounds};
 use orbital_canvas_base::projector::{Anchor, Projection, Projector, ScenePos, TILE_WIDTH};
+use orbital_canvas_base::scene_doc::SceneDoc;
 use orbital_canvas_base::transform::Xf;
 use orbital_canvas_paint::asset;
 use orbital_canvas_paint::atlas;
@@ -168,6 +169,25 @@ pub(crate) fn from_props_cached_at(
     generations: (u64, u64),
     cache: &mut DrawableCache,
 ) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
+    let no_drawables = Vec::new();
+    let drawables = props
+        .get("drawables")
+        .and_then(Value::as_array)
+        .unwrap_or(&no_drawables);
+    map_drawables(props, drawables, viewport, epoch_now_ms, settled, generations, cache)
+}
+
+/// The walk of `props` (read for everything but its drawables) over `drawables`.
+#[allow(clippy::too_many_arguments)]
+fn map_drawables<D: SharedDrawable>(
+    props: &Value,
+    drawables: &[D],
+    viewport: Option<(f32, f32)>,
+    epoch_now_ms: f64,
+    settled: bool,
+    generations: (u64, u64),
+    cache: &mut DrawableCache,
+) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
     let mut gathered = Gathered::default();
     // An orbital-painter canvas is sized by its declared world, as the web host sizes it.
     let orbital = props.get("painter").and_then(Value::as_str) == Some("orbital");
@@ -194,19 +214,13 @@ pub(crate) fn from_props_cached_at(
         }),
         None => Projection::Isometric,
     };
-    let no_drawables = Vec::new();
-    let drawables = props
-        .get("drawables")
-        .and_then(Value::as_array)
-        .unwrap_or(&no_drawables);
-
     // Scene extent from drawn positions → baseOffsetX (Canvas2D gridExtent +
     // baseOffsetX useMemo): (maxY + 1 - 1) * scaledTileWidth / 2 for diamond
     // layouts, 0 for square/free.
     let mut max_x = 0.0f32;
     let mut max_y = 0.0f32;
     for node in drawables {
-        collect_positions(node, &mut |p| {
+        collect_positions(node.value(), &mut |p| {
             if p.x > max_x {
                 max_x = p.x;
             }
@@ -458,7 +472,118 @@ pub fn from_prepared_settled(
     from_props_cached_at(prepared, viewport, epoch_now_ms, true, generations, cache).map(|(packet, _)| packet)
 }
 
+/// A split canvas node ([`SceneDoc`]) as the walk reads it: the node's own fields prepared as [`prepare_canvas_node`]
+/// prepares them, and each listed drawable themed on its own, shared while it is unchanged.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PreparedDoc {
+    pub props: Value,
+    /// The drawables the walk reads; `None` when they are inside `props` (a node kept whole).
+    pub drawables: Option<std::sync::Arc<Vec<std::sync::Arc<Value>>>>,
+}
+
+/// Each drawable's themed form by the drawable it came from, kept across preparations under one theme.
+#[derive(Debug, Clone, Default)]
+pub struct ThemeMemo {
+    theme: Option<Value>,
+    themed: std::collections::HashMap<usize, (std::sync::Weak<Value>, std::sync::Arc<Value>)>,
+}
+
+/// [`prepare_canvas_node`] of a split node: a drawable themed by an earlier call under the same theme is reused.
+pub fn prepare_doc(doc: &SceneDoc, memo: &mut ThemeMemo) -> Result<PreparedDoc, CanvasSceneError> {
+    let Some(listed) = &doc.drawables else {
+        return prepare_canvas_node(&doc.frame).map(|props| PreparedDoc { props, drawables: None });
+    };
+    let (props, theme) = canvas_node_props_split(&doc.frame, true)?;
+    let Some(theme) = theme else {
+        memo.theme = None;
+        memo.themed.clear();
+        return Ok(PreparedDoc { props: Value::Object(props), drawables: Some(std::sync::Arc::clone(listed)) });
+    };
+    if memo.theme.as_ref() != Some(&theme) {
+        memo.themed.clear();
+        memo.theme = Some(theme.clone());
+    }
+    let families = crate::theme_refs::families(&theme);
+    let mut themed = std::collections::HashMap::with_capacity(listed.len());
+    let drawables = listed
+        .iter()
+        .map(|drawable| {
+            let at = std::sync::Arc::as_ptr(drawable) as usize;
+            let kept = memo
+                .themed
+                .remove(&at)
+                .filter(|(from, _)| from.upgrade().is_some_and(|from| std::sync::Arc::ptr_eq(&from, drawable)));
+            let shown = match kept {
+                Some((_, shown)) => shown,
+                None => {
+                    let mut shown = (**drawable).clone();
+                    crate::theme_refs::apply_with(&mut shown, &theme, &families);
+                    std::sync::Arc::new(shown)
+                }
+            };
+            themed.insert(at, (std::sync::Arc::downgrade(drawable), std::sync::Arc::clone(&shown)));
+            shown
+        })
+        .collect();
+    memo.themed = themed;
+    Ok(PreparedDoc { props: Value::Object(props), drawables: Some(std::sync::Arc::new(drawables)) })
+}
+
+/// [`from_props_cached`] of a [`PreparedDoc`].
+pub fn from_prepared_doc_cached(
+    prepared: &PreparedDoc,
+    viewport: Option<(f32, f32)>,
+    epoch_now_ms: f64,
+    cache: &mut DrawableCache,
+) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
+    let generations = (orbital_canvas_paint::asset::generation(), orbital_canvas_paint::vector::font_generation());
+    from_prepared_doc_cached_at(prepared, viewport, epoch_now_ms, false, generations, cache)
+}
+
+pub(crate) fn from_prepared_doc_cached_at(
+    prepared: &PreparedDoc,
+    viewport: Option<(f32, f32)>,
+    epoch_now_ms: f64,
+    settled: bool,
+    generations: (u64, u64),
+    cache: &mut DrawableCache,
+) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
+    match &prepared.drawables {
+        Some(listed) => map_drawables(&prepared.props, listed, viewport, epoch_now_ms, settled, generations, cache),
+        None => from_props_cached_at(&prepared.props, viewport, epoch_now_ms, settled, generations, cache),
+    }
+}
+
+/// [`from_prepared_at`] of a [`PreparedDoc`].
+pub fn from_prepared_doc_at(
+    prepared: &PreparedDoc,
+    viewport: Option<(f32, f32)>,
+    epoch_now_ms: f64,
+) -> Result<GameRenderPacket, CanvasSceneError> {
+    from_prepared_doc_cached(prepared, viewport, epoch_now_ms, &mut DrawableCache::default()).map(|(packet, _)| packet)
+}
+
+/// [`from_prepared_settled`] of a [`PreparedDoc`].
+pub fn from_prepared_doc_settled(
+    prepared: &PreparedDoc,
+    viewport: Option<(f32, f32)>,
+    epoch_now_ms: f64,
+    cache: &mut DrawableCache,
+) -> Result<GameRenderPacket, CanvasSceneError> {
+    let generations = (orbital_canvas_paint::asset::generation(), orbital_canvas_paint::vector::font_generation());
+    from_prepared_doc_cached_at(prepared, viewport, epoch_now_ms, true, generations, cache).map(|(packet, _)| packet)
+}
+
 fn canvas_node_props(node: &Value) -> Result<serde_json::Map<String, Value>, CanvasSceneError> {
+    canvas_node_props_split(node, false).map(|(props, _)| props)
+}
+
+/// A canvas node's fields prepared, with its theme. `listed` says its drawables are held apart ([`SceneDoc`]), so its
+/// `children` are not read as drawables in their place and the theme is still to be applied to them.
+fn canvas_node_props_split(
+    node: &Value,
+    listed: bool,
+) -> Result<(serde_json::Map<String, Value>, Option<Value>), CanvasSceneError> {
     let obj = node.as_object().ok_or(CanvasSceneError::NotAnObject)?;
     let fields = match obj.get("props") {
         Some(Value::Object(nested)) => nested,
@@ -473,10 +598,11 @@ fn canvas_node_props(node: &Value) -> Result<serde_json::Map<String, Value>, Can
     props.remove("type");
     let host = props.remove("canvasTheme");
     let layer = props.remove("themeLayer");
-    if let Some(theme) = crate::theme_refs::layered(host, layer) {
-        crate::theme_refs::apply(&mut props, &theme);
+    let theme = crate::theme_refs::layered(host, layer);
+    if let Some(theme) = &theme {
+        crate::theme_refs::apply(&mut props, theme);
     }
-    if !props.contains_key("drawables") {
+    if !listed && !props.contains_key("drawables") {
         if let Some(children) = props.get("children") {
             props.insert(
                 "drawables".into(),
@@ -497,7 +623,7 @@ fn canvas_node_props(node: &Value) -> Result<serde_json::Map<String, Value>, Can
             props.insert("bgColor".into(), color.clone());
         }
     }
-    Ok(props)
+    Ok((props, theme))
 }
 
 /// `UISlotRenderer.toDrawableNodes`: each object child becomes its fields
@@ -990,7 +1116,7 @@ pub fn get_string(props: &Value, key: &str) -> Option<String> {
 
 mod animation;
 mod drawable_cache;
-pub use self::drawable_cache::DrawableCache;
+pub use self::drawable_cache::{DrawableCache, SharedDrawable};
 mod editing;
 mod group;
 mod paragraph;

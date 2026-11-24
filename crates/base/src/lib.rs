@@ -16,6 +16,8 @@ pub mod packet;
 pub mod path_data;
 #[path = "scene/targets.rs"]
 pub mod targets;
+#[path = "scene/scene_doc.rs"]
+pub mod scene_doc;
 
 // motion: how drawables change over time
 #[path = "motion/animate/mod.rs"]

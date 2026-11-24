@@ -17,6 +17,16 @@ pub fn apply(props: &mut Map<String, Value>, theme: &Value) {
     walk_object(props, theme, &families);
 }
 
+/// The families of `theme`, registered once for many [`apply_with`] calls.
+pub fn families(theme: &Value) -> Vec<(&'static str, String)> {
+    register_families(theme)
+}
+
+/// Resolve every theme reference under `value` against `theme`, with its [`families`].
+pub fn apply_with(value: &mut Value, theme: &Value, families: &[(&'static str, String)]) {
+    walk(value, theme, families);
+}
+
 /// The host's `canvasTheme` with the program's `themeLayer` laid over it: each `palette` colour and `fonts` role
 /// the layer names replaces the host's, and everything else the host gives stays.
 pub fn layered(host: Option<Value>, layer: Option<Value>) -> Option<Value> {

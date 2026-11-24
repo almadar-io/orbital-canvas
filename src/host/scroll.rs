@@ -51,7 +51,7 @@ impl SceneHost {
     /// The canvas's `scroll` declaration: the content height in packet units, the event it reports the offset on,
     /// and the least time in ms between reports while it moves (0: every change).
     pub(super) fn scroll_declared(&self) -> Option<(f32, Option<String>, f64)> {
-        let node = self.scene.as_ref()?;
+        let node = self.frame()?;
         let declared = node.get("props").unwrap_or(node).get("scroll")?;
         let height = declared.get("height")?.as_f64().filter(|h| h.is_finite())? as f32;
         let event = declared
@@ -67,7 +67,7 @@ impl SceneHost {
 
     /// The canvas's `scroll.to` request: the offset to move to and the number that names this request.
     pub(super) fn scroll_to_declared(&self) -> Option<(f32, f64)> {
-        let node = self.scene.as_ref()?;
+        let node = self.frame()?;
         let to = node.get("props").unwrap_or(node).get("scroll")?.get("to")?;
         let y = to.get("y")?.as_f64().filter(|y| y.is_finite())? as f32;
         let n = to.get("n")?.as_f64().filter(|n| n.is_finite())?;

@@ -5,7 +5,7 @@ use super::*;
 impl SceneHost {
     /// The prop `name` of the current canvas node, when it declares it.
     pub(super) fn canvas_event(&self, name: &str) -> Option<String> {
-        self.scene.as_ref().and_then(|node| {
+        self.frame().and_then(|node| {
             node.get("props")
                 .unwrap_or(node)
                 .get(name)
@@ -84,7 +84,7 @@ impl SceneHost {
         if current == self.measure_reported {
             return;
         }
-        let event = self.scene.as_ref().and_then(|node| {
+        let event = self.frame().and_then(|node| {
             node.get("props")
                 .unwrap_or(node)
                 .get("measureEvent")

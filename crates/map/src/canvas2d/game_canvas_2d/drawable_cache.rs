@@ -4,6 +4,39 @@
 
 use super::*;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+/// A top-level drawable as the walk reads it: a plain value, or a shared one whose handle tells an unchanged drawable
+/// from a changed one without comparing them.
+pub trait SharedDrawable {
+    fn value(&self) -> &Value;
+    fn shared(&self) -> Option<&Arc<Value>>;
+    fn to_shared(&self) -> Arc<Value>;
+}
+
+impl SharedDrawable for Value {
+    fn value(&self) -> &Value {
+        self
+    }
+    fn shared(&self) -> Option<&Arc<Value>> {
+        None
+    }
+    fn to_shared(&self) -> Arc<Value> {
+        Arc::new(self.clone())
+    }
+}
+
+impl SharedDrawable for Arc<Value> {
+    fn value(&self) -> &Value {
+        self
+    }
+    fn shared(&self) -> Option<&Arc<Value>> {
+        Some(self)
+    }
+    fn to_shared(&self) -> Arc<Value> {
+        Arc::clone(self)
+    }
+}
 
 /// Everything a walk's output depends on besides the drawable itself.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -25,7 +58,7 @@ pub(super) struct WalkContext {
 /// One drawable's walk output, its indexes relative to the command and semantic counts it began at.
 #[derive(Debug, Clone)]
 struct Segment {
-    node: Value,
+    node: Arc<Value>,
     commands: Vec<DrawCommand>,
     regions: Vec<Region>,
     measured: Vec<Measured>,
@@ -79,12 +112,13 @@ impl DrawableCache {
     }
 
     /// Append the kept output of `node` at `index` when it is reusable here, saying whether it was.
-    pub(super) fn replay(&mut self, node: &Value, index: usize, gathered: &mut Gathered, out: &mut Vec<DrawCommand>) -> bool {
-        let Some(segment) = self.segments.get(&key(node, index)) else {
+    pub(super) fn replay<D: SharedDrawable>(&mut self, node: &D, index: usize, gathered: &mut Gathered, out: &mut Vec<DrawCommand>) -> bool {
+        let Some(segment) = self.segments.get(&key(node.value(), index)) else {
             return false;
         };
         let (out_start, semantic_start) = (out.len(), gathered.semantic.len());
-        if segment.node != *node || segment.paint_ordered_at.is_some_and(|at| at != semantic_start) {
+        let same = node.shared().is_some_and(|shared| Arc::ptr_eq(shared, &segment.node)) || *segment.node == *node.value();
+        if !same || segment.paint_ordered_at.is_some_and(|at| at != semantic_start) {
             return false;
         }
         out.extend(segment.commands.iter().cloned());
@@ -107,9 +141,9 @@ impl DrawableCache {
 
     /// Walk `node` at `index` and keep what it produced for the next mapping.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn walk(
+    pub(super) fn walk<D: SharedDrawable>(
         &mut self,
-        node: &Value,
+        node: &D,
         index: usize,
         projector: &Projector,
         to_screen: &dyn Fn(f32, f32) -> (f32, f32),
@@ -126,7 +160,7 @@ impl DrawableCache {
         let texts = std::mem::take(&mut gathered.texts);
         let labelled = std::mem::take(&mut gathered.labelled);
         let valued = std::mem::take(&mut gathered.valued);
-        let walked = super::walk(node, projector, to_screen, zoom, epoch_now_ms, gathered, out);
+        let walked = super::walk(node.value(), projector, to_screen, zoom, epoch_now_ms, gathered, out);
         let own_texts = std::mem::replace(&mut gathered.texts, texts);
         let own_labelled = std::mem::replace(&mut gathered.labelled, labelled);
         let own_valued = std::mem::replace(&mut gathered.valued, valued);
@@ -134,7 +168,7 @@ impl DrawableCache {
         gathered.labelled.extend(own_labelled.iter().cloned());
         gathered.valued.extend(own_valued.iter().cloned());
         walked?;
-        let key = key(node, index);
+        let key = key(node.value(), index);
         // An unnamed 3D scene is named by how many came before it, which a replay elsewhere would not keep.
         if gathered.scene3d_count != scene3d_before || gathered.pinned.len() < pinned_start {
             self.segments.remove(&key);
@@ -148,7 +182,7 @@ impl DrawableCache {
         self.segments.insert(
             key,
             Segment {
-                node: node.clone(),
+                node: node.to_shared(),
                 commands: out[out_start..].to_vec(),
                 regions: gathered.regions[region_start..].to_vec(),
                 measured: gathered.measured[measured_start..].to_vec(),

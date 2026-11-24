@@ -7,7 +7,7 @@
 pub use orbital_canvas_base::PORTABLE_MAX_TEXTURE_SIDE;
 pub use orbital_canvas_base::{
     animate, color, contrast, diagnostics, exact_ints, fx_projection, morph, packet, path_data, projector,
-    shader_check, shaders, skinning_2d, spring, targets, transform,
+    scene_doc, shader_check, shaders, skinning_2d, spring, targets, transform,
 };
 #[cfg(feature = "system-fonts")]
 pub use orbital_canvas_paint::system_fonts;

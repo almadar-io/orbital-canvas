@@ -5,6 +5,7 @@ pub use orbital_canvas_map::scene::*;
 use crate::{diagram, learning};
 use orbital_canvas_base::packet::GameRenderPacket;
 use orbital_canvas_map::error::CanvasSceneError;
+use orbital_canvas_base::scene_doc::SceneDoc;
 use orbital_canvas_map::game_canvas_2d;
 use serde_json::Value;
 
@@ -86,10 +87,58 @@ fn map_scene_cached(
     if let Some(pattern) = pattern.filter(|p| diagram::handles(p)) {
         return diagram::map(pattern, &Value::Object(fields.clone()), viewport);
     }
-    let (packet, gathered) = match viewport {
-        Some((w, h)) => game_canvas_2d::from_canvas_node_in_viewport_cached(node, w, h, 0.0, cache)?,
-        None => game_canvas_2d::from_canvas_node_cached(node, 0.0, cache)?,
+    let prepared = game_canvas_2d::PreparedDoc { props: game_canvas_2d::prepare_canvas_node(node)?, drawables: None };
+    let (packet, gathered) = game_canvas_2d::from_prepared_doc_cached(&prepared, viewport, 0.0, cache)?;
+    Ok(game_canvas_scene(fields, packet, gathered, prepared))
+}
+
+/// Whether `node` is drawn by the 2D drawable walk, whose drawables a host may hold apart ([`SceneDoc`]).
+pub fn walks_drawables(node: &Value) -> bool {
+    let Some(obj) = node.as_object() else {
+        return false;
     };
+    let fields = match obj.get("props") {
+        Some(Value::Object(nested)) => nested,
+        _ => obj,
+    };
+    let pattern = obj.get("type").or_else(|| fields.get("type")).and_then(Value::as_str);
+    pattern_walks_drawables(pattern, fields.get("mode").and_then(Value::as_str))
+}
+
+/// [`walks_drawables`] of a node of `pattern` in `mode`.
+pub fn pattern_walks_drawables(pattern: Option<&str>, mode: Option<&str>) -> bool {
+    let three_d = mode == Some("3d");
+    !(pattern == Some("graph-canvas")
+        || (three_d && matches!(pattern, Some("canvas" | "physics-canvas" | "biology-canvas" | "chemistry-canvas")))
+        || pattern.is_some_and(|p| learning::handles(p) || diagram::handles(p)))
+}
+
+/// [`map_scene_with`] of a scene whose drawables are held apart: only a drawable that is new since the last mapping
+/// is themed and walked again. A scene kept whole maps as [`map_scene_with`] maps it.
+pub fn map_scene_doc_with(
+    doc: &SceneDoc,
+    viewport: Option<(f32, f32)>,
+    memory: &mut SceneMemory,
+) -> Result<MappedScene, CanvasSceneError> {
+    if doc.drawables.is_none() {
+        return map_scene_with(&doc.frame, viewport, memory);
+    }
+    let fields = doc.root().as_object().ok_or(CanvasSceneError::NotAnObject)?;
+    let pattern = doc.frame.get("type").or_else(|| fields.get("type")).and_then(Value::as_str);
+    if memory.pattern.as_deref() != pattern {
+        *memory = SceneMemory { pattern: pattern.map(str::to_string), ..SceneMemory::default() };
+    }
+    let prepared = game_canvas_2d::prepare_doc(doc, &mut memory.themed)?;
+    let (packet, gathered) = game_canvas_2d::from_prepared_doc_cached(&prepared, viewport, 0.0, &mut memory.drawables)?;
+    Ok(game_canvas_scene(fields, packet, gathered, prepared))
+}
+
+fn game_canvas_scene(
+    fields: &serde_json::Map<String, Value>,
+    packet: GameRenderPacket,
+    gathered: game_canvas_2d::Gathered,
+    prepared: game_canvas_2d::PreparedDoc,
+) -> MappedScene {
     let event = |key: &str| fields.get(key).and_then(Value::as_str).map(str::to_string);
     let events = PointerEvents {
         down: event("pointerDownEvent"),
@@ -98,7 +147,7 @@ fn map_scene_cached(
         leave: event("pointerLeaveEvent"),
         moved: event("pointerMoveEvent"),
     };
-    Ok(MappedScene {
+    MappedScene {
         pointer_regions: gathered
             .regions
             .into_iter()
@@ -120,8 +169,9 @@ fn map_scene_cached(
             nodes
         },
         live_scenes3d: gathered.live_scenes3d,
+        prepared: Some(prepared),
         ..MappedScene::drawn(packet)
-    })
+    }
 }
 
 /// A 3D canvas as one [`DrawCommand::Scene3D`](orbital_canvas_base::packet::DrawCommand::Scene3D) across the viewport.

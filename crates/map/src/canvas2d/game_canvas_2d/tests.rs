@@ -4623,3 +4623,53 @@ fn a_settled_scene_reuses_its_drawables_at_any_clock_and_a_live_one_does_not() {
     from_props_cached_at(&props, None, 2000.0, false, (0, 0), &mut live).unwrap();
     assert_eq!(live.reused, 0, "control: while animations play, a new clock is a new walk");
 }
+
+#[test]
+fn a_split_themed_scene_maps_to_the_packet_of_the_whole_node_and_reuses_each_unchanged_themed_drawable() {
+    let node = |label: &str| {
+        json!({"type": "canvas", "mode": "2d", "projection": "free", "scale": 1, "width": 200, "height": 100,
+            "canvasTheme": {"palette": {"ink": "#112233"}},
+            "drawables": [
+                {"id": "box", "type": "draw-shape", "shape": "rect", "position": {"x": 1, "y": 2}, "width": 10, "height": 5, "fill": "ink"},
+                {"id": "label", "type": "draw-text", "text": label, "color": "ink", "font": "12px sans-serif", "position": {"x": 5, "y": 5}}
+            ]})
+    };
+    let whole = from_canvas_node_in_viewport_mapped(&node("one"), 200.0, 100.0, 0.0).unwrap().0;
+    let mut memo = ThemeMemo::default();
+    let first = SceneDoc::split(node("one"));
+    let prepared = prepare_doc(&first, &mut memo).unwrap();
+    let (split, _) = from_prepared_doc_cached(&prepared, Some((200.0, 100.0)), 0.0, &mut DrawableCache::default()).unwrap();
+    assert_eq!(format!("{split:?}"), format!("{whole:?}"), "the split scene draws exactly what the whole node draws");
+    assert_eq!(prepared.drawables.as_ref().unwrap()[0]["fill"], json!("#112233"), "each drawable is themed");
+
+    let mut next = SceneDoc::split(node("two"));
+    let listed = std::sync::Arc::make_mut(next.drawables.as_mut().unwrap());
+    listed[0] = std::sync::Arc::clone(&first.drawables.as_ref().unwrap()[0]);
+    let again = prepare_doc(&next, &mut memo).unwrap();
+    let (before, after) = (prepared.drawables.as_ref().unwrap(), again.drawables.as_ref().unwrap());
+    assert!(std::sync::Arc::ptr_eq(&before[0], &after[0]), "an unchanged drawable keeps its themed copy");
+    assert!(!std::sync::Arc::ptr_eq(&before[1], &after[1]), "control: the changed one is themed anew");
+    assert_eq!(after[1]["text"], json!("two"));
+
+    let mut cache = DrawableCache::default();
+    let _ = from_prepared_doc_cached(&prepared, Some((200.0, 100.0)), 0.0, &mut cache).unwrap();
+    let _ = from_prepared_doc_cached(&again, Some((200.0, 100.0)), 0.0, &mut cache).unwrap();
+    assert_eq!(cache.reused, 1, "the walk replays the shared drawable");
+
+    let mut retheme = node("two");
+    retheme["canvasTheme"]["palette"]["ink"] = json!("#445566");
+    let rethemed = prepare_doc(&SceneDoc::split(retheme), &mut memo).unwrap();
+    assert_eq!(rethemed.drawables.as_ref().unwrap()[0]["fill"], json!("#445566"), "control: a new theme themes anew");
+}
+
+#[test]
+fn a_split_node_with_children_and_no_list_maps_as_the_whole_node() {
+    let node = json!({"type": "canvas", "mode": "2d", "projection": "free", "scale": 1,
+        "children": [{"type": "draw-shape", "shape": "rect", "position": {"x": 1, "y": 2}, "width": 10, "height": 5, "fill": "#ff0000"}]});
+    let doc = SceneDoc::split(node.clone());
+    assert!(doc.drawables.is_none());
+    let prepared = prepare_doc(&doc, &mut ThemeMemo::default()).unwrap();
+    let (split, _) = from_prepared_doc_cached(&prepared, Some((300.0, 200.0)), 0.0, &mut DrawableCache::default()).unwrap();
+    let whole = from_canvas_node_in_viewport_mapped(&node, 300.0, 200.0, 0.0).unwrap().0;
+    assert_eq!(format!("{split:?}"), format!("{whole:?}"));
+}

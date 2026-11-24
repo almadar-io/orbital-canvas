@@ -131,7 +131,7 @@ impl SceneHost {
             if let Some(scene) = self.scene.as_ref().filter(|scene| {
                 self.liveness.timed
                     && matches!(
-                        scene.get("type").and_then(serde_json::Value::as_str),
+                        scene.frame.get("type").and_then(serde_json::Value::as_str),
                         Some("canvas" | "canvas-2d")
                     )
             }) {
@@ -160,21 +160,25 @@ impl SceneHost {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if prepared.is_none() {
-                    let shown = (!self.springs.is_empty()).then(|| self.springs.apply(scene));
-                    *prepared = mappers::game_canvas_2d::prepare_canvas_node(
+                    #[cfg(test)]
+                    self.timed_prepares
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let shown = (!self.springs.is_empty()).then(|| self.springs.apply_doc_with(scene, &self.spring_parts));
+                    *prepared = mappers::game_canvas_2d::prepare_doc(
                         shown.as_ref().unwrap_or(scene),
+                        &mut Default::default(),
                     )
                     .ok();
                 }
                 let remapped = prepared.as_ref().map(|props| {
                     if live {
-                        mappers::game_canvas_2d::from_prepared_at(props, viewport, self.epoch_clock_ms)
+                        mappers::game_canvas_2d::from_prepared_doc_at(props, viewport, self.epoch_clock_ms)
                     } else {
                         let mut drawables = self
                             .settled_drawables
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        mappers::game_canvas_2d::from_prepared_settled(props, viewport, self.epoch_clock_ms, &mut drawables)
+                        mappers::game_canvas_2d::from_prepared_doc_settled(props, viewport, self.epoch_clock_ms, &mut drawables)
                     }
                 });
                 if let Some(Ok(packet)) = remapped {
@@ -310,7 +314,7 @@ pub(crate) type ClockedMaterial = (bool, bool, Option<(f32, f32, bool)>);
 /// What keeps a scene moving, read once when it is set: the epoch instant its fx, emitters, text reveals and
 /// `startMs` animations have all ended by (infinite while one runs on), whether it has any of them, and each top-level
 /// drawable that paints a clocked material.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Liveness {
     until: Option<f64>,
     /// The scene has fx, emitters, reveals or `startMs` animations: frames map it again at the epoch clock.
@@ -319,21 +323,73 @@ pub(crate) struct Liveness {
     pub(crate) materials: Vec<ClockedMaterial>,
 }
 
+/// One top-level drawable's share of a scene's [`Liveness`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct LivenessPart {
+    until: Option<f64>,
+    timed: bool,
+    material: Option<ClockedMaterial>,
+}
+
+impl LivenessPart {
+    pub(crate) fn read(drawable: &serde_json::Value) -> Self {
+        let Liveness { until, timed, .. } = Liveness::scan(drawable);
+        let (live, anchored) = clocked(drawable);
+        Self { until, timed, material: (live || anchored).then(|| (live, anchored, placed_rows(drawable))) }
+    }
+}
+
+impl SceneHost {
+    /// The liveness of `doc`, reading again only the drawables that are new since the last scene.
+    pub(crate) fn read_liveness(&mut self, doc: &orbital_canvas_base::scene_doc::SceneDoc) -> Liveness {
+        let Some(listed) = &doc.drawables else {
+            self.liveness_parts.clear();
+            return Liveness::read(&doc.frame);
+        };
+        let mut parts = std::collections::HashMap::with_capacity(listed.len());
+        let mut out = Liveness::scan(&doc.frame);
+        let mut materials = Vec::new();
+        for drawable in listed.iter() {
+            let at = std::sync::Arc::as_ptr(drawable) as usize;
+            let part = self
+                .liveness_parts
+                .remove(&at)
+                .filter(|(from, _)| from.upgrade().is_some_and(|from| std::sync::Arc::ptr_eq(&from, drawable)))
+                .map(|(_, part)| part)
+                .unwrap_or_else(|| LivenessPart::read(drawable));
+            out.until = [out.until, part.until].into_iter().flatten().reduce(f64::max);
+            out.timed |= part.timed;
+            materials.extend(part.material);
+            parts.insert(at, (std::sync::Arc::downgrade(drawable), part));
+        }
+        materials.append(&mut Liveness::read(&doc.frame).materials);
+        out.materials = materials;
+        self.liveness_parts = parts;
+        out
+    }
+}
+
 impl Liveness {
-    pub(crate) fn read(scene: &serde_json::Value) -> Self {
+    /// The fx, emitter, reveal and `startMs` animation clocks under `node`, its materials aside.
+    fn scan(node: &serde_json::Value) -> Self {
         let until = [
-            mappers::game_canvas_2d::active_fx_until(scene),
-            mappers::emitter::live_until(scene),
-            mappers::text_reveal::live_until(scene),
-            mappers::game_canvas_2d::started_animation_until(scene),
+            mappers::game_canvas_2d::active_fx_until(node),
+            mappers::emitter::live_until(node),
+            mappers::text_reveal::live_until(node),
+            mappers::game_canvas_2d::started_animation_until(node),
         ]
         .into_iter()
         .flatten()
         .reduce(f64::max);
-        let timed = mappers::game_canvas_2d::has_active_fx(scene)
-            || mappers::emitter::has_emitter(scene)
-            || mappers::text_reveal::has_reveal(scene)
-            || mappers::game_canvas_2d::has_started_animation(scene);
+        let timed = mappers::game_canvas_2d::has_active_fx(node)
+            || mappers::emitter::has_emitter(node)
+            || mappers::text_reveal::has_reveal(node)
+            || mappers::game_canvas_2d::has_started_animation(node);
+        Self { until, timed, materials: Vec::new() }
+    }
+
+    pub(crate) fn read(scene: &serde_json::Value) -> Self {
+        let Self { until, timed, .. } = Self::scan(scene);
         let root = scene.get("props").unwrap_or(scene);
         let materials = ["drawables", "children"]
             .into_iter()

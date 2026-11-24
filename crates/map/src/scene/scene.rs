@@ -48,6 +48,8 @@ pub struct SceneMemory {
     pub pressed: Option<String>,
     /// Each top-level drawable's walk output from the last mapping, replayed when it is unchanged.
     pub drawables: crate::game_canvas_2d::DrawableCache,
+    /// Each drawable's themed form from the last preparation of a split scene.
+    pub themed: crate::game_canvas_2d::ThemeMemo,
 }
 
 /// An event a tap emits. `payload` is the value the web component passes to the callback; the
@@ -224,6 +226,8 @@ pub struct MappedScene {
     pub semantic_nodes: Vec<SemanticNode>,
     /// Embedded 3D scenes that play by themselves; a host re-maps each alone per frame.
     pub live_scenes3d: Vec<crate::game_canvas_2d::LiveScene3d>,
+    /// A 2D canvas's props as this mapping prepared them, for the host's timed re-maps of the same scene.
+    pub prepared: Option<crate::game_canvas_2d::PreparedDoc>,
 }
 
 impl MappedScene {

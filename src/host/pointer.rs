@@ -352,7 +352,7 @@ impl SceneHost {
     pub(super) fn pointer_moved(&mut self, x: f32, y: f32) {
         self.hover_to(x, y);
         // `pointerMoves: "captured"` (declared on the canvas) sends a move only while a press holds capture.
-        let captured_only = self.scene.as_ref().is_some_and(|node| {
+        let captured_only = self.frame().is_some_and(|node| {
             node.get("props")
                 .unwrap_or(node)
                 .get("pointerMoves")
@@ -450,8 +450,7 @@ impl SceneHost {
             _ => scene3d::Button::Primary,
         };
         let declared = |key: &str| {
-            self.scene
-                .as_ref()
+            self.frame()
                 .and_then(|node| node.get("props").unwrap_or(node).get(key))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)

@@ -78,6 +78,71 @@ impl Channel {
     }
 }
 
+/// A walk that hands each drawable of a scene to its argument.
+type VisitDrawables<'a> = &'a mut dyn FnMut(&mut dyn FnMut(&Value));
+
+/// One spring-driven field a drawable declares: its drawable `id`, the field's pointer, target and spring.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpringField {
+    id: String,
+    pointer: String,
+    target: [f64; 4],
+    color: bool,
+    stiffness: f64,
+    damping: f64,
+}
+
+/// A top-level drawable's spring fields and the ids anywhere in it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DrawableSprings {
+    fields: Vec<SpringField>,
+    ids: Vec<String>,
+}
+
+impl DrawableSprings {
+    fn read(drawable: &Value) -> Self {
+        let mut out = Self::default();
+        visit_tree(drawable, &mut |d| {
+            spring_fields(d, &mut out.fields);
+            if let Some(id) = d.get("id").and_then(Value::as_str) {
+                out.ids.push(id.to_owned());
+            }
+        });
+        out
+    }
+}
+
+/// Each top-level drawable's [`DrawableSprings`] by the drawable they were read from, kept across scenes.
+#[derive(Debug, Clone, Default)]
+pub struct SpringParts(HashMap<usize, (std::sync::Weak<Value>, std::sync::Arc<DrawableSprings>)>);
+
+impl SpringParts {
+    fn kept(&self, drawable: &std::sync::Arc<Value>) -> Option<&DrawableSprings> {
+        self.0
+            .get(&(std::sync::Arc::as_ptr(drawable) as usize))
+            .filter(|(from, _)| from.upgrade().is_some_and(|from| std::sync::Arc::ptr_eq(&from, drawable)))
+            .map(|(_, part)| &**part)
+    }
+}
+
+fn spring_fields(d: &Value, out: &mut Vec<SpringField>) {
+    let Some(id) = d.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(spring) = d.get("spring") else {
+        return;
+    };
+    let (Some(stiffness), Some(damping)) = (
+        spring.get("stiffness").and_then(Value::as_f64),
+        spring.get("damping").and_then(Value::as_f64),
+    ) else {
+        return;
+    };
+    for (pointer, target, color) in animatable(d) {
+        out.push(SpringField { id: id.to_owned(), pointer, target, color, stiffness, damping });
+    }
+}
+
 /// The displayed value of every spring-driven field of a scene.
 #[derive(Debug, Clone)]
 pub struct SpringBank {
@@ -100,13 +165,23 @@ fn for_each_drawable(items: &Value, f: &mut dyn FnMut(&Value)) {
         return;
     };
     for item in items {
-        f(item);
-        for key in CHILD_KEYS {
-            if let Some(children) = item.get(key) {
-                for_each_drawable(children, f);
-            }
+        visit_tree(item, f);
+    }
+}
+
+/// `item` and every drawable it groups.
+pub(crate) fn visit_tree(item: &Value, f: &mut dyn FnMut(&Value)) {
+    f(item);
+    for key in CHILD_KEYS {
+        if let Some(children) = item.get(key) {
+            for_each_drawable(children, f);
         }
     }
+}
+
+/// Every drawable of the list `items`, groups included.
+pub(crate) fn visit_items(items: &Value, f: &mut dyn FnMut(&Value)) {
+    for_each_drawable(items, f);
 }
 
 fn for_each_drawable_mut(items: &mut Value, f: &mut dyn FnMut(&mut Value)) {
@@ -114,11 +189,15 @@ fn for_each_drawable_mut(items: &mut Value, f: &mut dyn FnMut(&mut Value)) {
         return;
     };
     for item in items {
-        f(item);
-        for key in CHILD_KEYS {
-            if let Some(children) = item.get_mut(key) {
-                for_each_drawable_mut(children, f);
-            }
+        visit_tree_mut(item, f);
+    }
+}
+
+fn visit_tree_mut(item: &mut Value, f: &mut dyn FnMut(&mut Value)) {
+    f(item);
+    for key in CHILD_KEYS {
+        if let Some(children) = item.get_mut(key) {
+            for_each_drawable_mut(children, f);
         }
     }
 }
@@ -135,8 +214,17 @@ pub(crate) fn drawables(scene: &Value, f: &mut dyn FnMut(&Value)) {
 
 /// Whether any drawable paints a `material` that reads the clock (`live: true`).
 pub fn has_live_material(scene: &Value) -> bool {
+    live_material_in(&mut |f| drawables(scene, f))
+}
+
+/// [`has_live_material`] of a split scene.
+pub fn has_live_material_doc(doc: &crate::scene_doc::SceneDoc) -> bool {
+    live_material_in(&mut |f| doc.for_each_drawable(f))
+}
+
+fn live_material_in(visit: VisitDrawables<'_>) -> bool {
     let mut live = false;
-    drawables(scene, &mut |d| {
+    visit(&mut |d| {
         live |= d
             .pointer("/material/live")
             .and_then(Value::as_bool)
@@ -222,44 +310,76 @@ impl SpringBank {
     /// A new scene arrived: each animatable field of a drawable with an `id` and a `spring` keeps
     /// the value it displays now and heads for the scene's value.
     pub fn retarget(&mut self, scene: &Value) {
+        self.retarget_in(&mut |f| drawables(scene, f));
+    }
+
+    /// [`Self::retarget`] to a split scene.
+    pub fn retarget_doc(&mut self, doc: &crate::scene_doc::SceneDoc) {
+        self.retarget_in(&mut |f| doc.for_each_drawable(f));
+    }
+
+    fn retarget_in(&mut self, visit: VisitDrawables<'_>) {
+        let mut fields = Vec::new();
+        visit(&mut |d| spring_fields(d, &mut fields));
+        self.retarget_fields(fields.iter());
+    }
+
+    /// [`Self::retarget_doc`] reading each top-level drawable's spring fields from `parts` when it is unchanged.
+    pub fn retarget_doc_with(&mut self, doc: &crate::scene_doc::SceneDoc, parts: &mut SpringParts) {
+        let Some(listed) = &doc.drawables else {
+            parts.0.clear();
+            return self.retarget_doc(doc);
+        };
+        let mut kept = HashMap::with_capacity(listed.len());
+        let mut own = Vec::new();
+        for drawable in listed.iter() {
+            let at = std::sync::Arc::as_ptr(drawable) as usize;
+            let fields = parts
+                .0
+                .remove(&at)
+                .filter(|(from, _)| from.upgrade().is_some_and(|from| std::sync::Arc::ptr_eq(&from, drawable)))
+                .map(|(_, part)| part)
+                .unwrap_or_else(|| std::sync::Arc::new(DrawableSprings::read(drawable)));
+            kept.insert(at, (std::sync::Arc::downgrade(drawable), fields));
+        }
+        if let Some(children) = doc.root().get("children") {
+            visit_items(children, &mut |d| spring_fields(d, &mut own));
+        }
+        parts.0 = kept;
+        let ordered: Vec<&SpringField> = listed
+            .iter()
+            .flat_map(|d| parts.0.get(&(std::sync::Arc::as_ptr(d) as usize)).map(|(_, p)| p.fields.iter()).into_iter().flatten())
+            .chain(own.iter())
+            .collect();
+        self.retarget_fields(ordered.into_iter());
+    }
+
+    fn retarget_fields<'a>(&mut self, fields: impl Iterator<Item = &'a SpringField>) {
         let mut next = HashMap::new();
-        drawables(scene, &mut |d| {
-            let Some(id) = d.get("id").and_then(Value::as_str) else {
-                return;
+        for field in fields {
+            let key = (field.id.clone(), field.pointer.clone());
+            let (target, stiffness, damping, color) = (field.target, field.stiffness, field.damping, field.color);
+            let mut channel = match self.channels.get(&key) {
+                Some(old) if old.color == color => Channel {
+                    target,
+                    stiffness,
+                    damping,
+                    ..old.clone()
+                },
+                _ => Channel {
+                    color,
+                    value: target,
+                    velocity: [0.0; 4],
+                    target,
+                    stiffness,
+                    damping,
+                },
             };
-            let Some(spring) = d.get("spring") else {
-                return;
-            };
-            let (Some(stiffness), Some(damping)) = (
-                spring.get("stiffness").and_then(Value::as_f64),
-                spring.get("damping").and_then(Value::as_f64),
-            ) else {
-                return;
-            };
-            for (pointer, target, color) in animatable(d) {
-                let key = (id.to_owned(), pointer);
-                let mut channel = match self.channels.get(&key) {
-                    Some(old) if old.color == color => Channel {
-                        target,
-                        stiffness,
-                        damping,
-                        ..old.clone()
-                    },
-                    _ => Channel {
-                        color,
-                        value: target,
-                        velocity: [0.0; 4],
-                        target,
-                        stiffness,
-                        damping,
-                    },
-                };
-                if !self.motion {
-                    channel.snap();
-                }
-                next.insert(key, channel);
+            if !self.motion {
+                channel.snap();
             }
-        });
+            next.insert(key, channel);
+        }
         self.channels = next;
     }
 
@@ -320,6 +440,71 @@ impl SpringBank {
             }
         }
         shown
+    }
+
+    /// [`Self::apply`] to a split scene: only a drawable a spring drives is copied, every other one stays shared.
+    pub fn apply_doc(&self, doc: &crate::scene_doc::SceneDoc) -> crate::scene_doc::SceneDoc {
+        self.apply_doc_with(doc, &SpringParts::default())
+    }
+
+    /// [`Self::apply_doc`] skipping, without a walk, each drawable `parts` knows declares no spring.
+    pub fn apply_doc_with(&self, doc: &crate::scene_doc::SceneDoc, parts: &SpringParts) -> crate::scene_doc::SceneDoc {
+        let Some(listed) = &doc.drawables else {
+            return crate::scene_doc::SceneDoc::whole(self.apply(&doc.frame));
+        };
+        if self.channels.is_empty() {
+            return doc.clone();
+        }
+        let mut by_id: HashMap<&str, Vec<(&str, &Channel)>> = HashMap::new();
+        for ((id, pointer), channel) in &self.channels {
+            by_id.entry(id.as_str()).or_default().push((pointer.as_str(), channel));
+        }
+        let driven = |d: &Value| {
+            let mut found = false;
+            visit_tree(d, &mut |n| found |= n.get("id").and_then(Value::as_str).is_some_and(|id| by_id.contains_key(id)));
+            found
+        };
+        let mut write = |d: &mut Value| {
+            let Some(id) = d.get("id").and_then(Value::as_str).map(str::to_owned) else {
+                return;
+            };
+            for (pointer, channel) in by_id.get(id.as_str()).into_iter().flatten() {
+                if let (Some(slot), Some(value)) = (d.pointer_mut(pointer), channel.json()) {
+                    *slot = value;
+                }
+            }
+        };
+        let drawables = listed
+            .iter()
+            .map(|d| {
+                let driven = match parts.kept(d) {
+                    Some(part) => part.ids.iter().any(|id| by_id.contains_key(id.as_str())),
+                    None => driven(d),
+                };
+                if !driven {
+                    return std::sync::Arc::clone(d);
+                }
+                let mut shown = (**d).clone();
+                visit_tree_mut(&mut shown, &mut write);
+                std::sync::Arc::new(shown)
+            })
+            .collect();
+        let children_driven = doc.root().get("children").is_some_and(|c| {
+            let mut found = false;
+            visit_items(c, &mut |n| found |= n.get("id").and_then(Value::as_str).is_some_and(|id| by_id.contains_key(id)));
+            found
+        });
+        let frame = if children_driven {
+            let mut frame = (*doc.frame).clone();
+            let root = if frame.get("props").is_some() { &mut frame["props"] } else { &mut frame };
+            if let Some(children) = root.get_mut("children") {
+                for_each_drawable_mut(children, &mut write);
+            }
+            std::sync::Arc::new(frame)
+        } else {
+            std::sync::Arc::clone(&doc.frame)
+        };
+        crate::scene_doc::SceneDoc { frame, drawables: Some(std::sync::Arc::new(drawables)) }
     }
 
     /// Whether every spring rests at its target.

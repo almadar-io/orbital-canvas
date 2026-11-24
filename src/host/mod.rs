@@ -27,12 +27,15 @@ pub struct SceneHost {
     pub(crate) settled: std::sync::Mutex<Option<(u64, GameRenderPacket)>>,
     /// The current scene's props prepared for timed re-maps ([`mappers::game_canvas_2d::prepare_canvas_node`]), made
     /// on the first one and dropped with the scene.
-    pub(crate) prepared: std::sync::Mutex<Option<serde_json::Value>>,
+    pub(crate) prepared: std::sync::Mutex<Option<mappers::game_canvas_2d::PreparedDoc>>,
     /// Each drawable of the settled timed re-maps, replayed while it is unchanged ([`mappers::game_canvas_2d::from_prepared_settled`]).
     pub(crate) settled_drawables: std::sync::Mutex<mappers::game_canvas_2d::DrawableCache>,
     /// Timed mappings made for frames (observability for tests).
     #[cfg(test)]
     pub(crate) timed_maps: std::sync::atomic::AtomicUsize,
+    /// Props prepared by a frame rather than handed over by the mapping (observability for tests).
+    #[cfg(test)]
+    pub(crate) timed_prepares: std::sync::atomic::AtomicUsize,
     /// Pending input events forwarded via the C ABI; drained each render tick.
     pub(crate) input_queue: Vec<InputEvent>,
     /// Surface size in PHYSICAL pixels, set by `resize` / surface init.
@@ -41,8 +44,11 @@ pub struct SceneHost {
     /// logical points (`viewport / density`, like the web's CSS-pixel measured viewport)
     /// and drawn onto the physical surface.
     pub(crate) density: f32,
-    /// Last `canvas` render-ui node handed to `set_scene`; re-mapped when the viewport changes.
-    pub(crate) scene: Option<std::sync::Arc<serde_json::Value>>,
+    /// Last `canvas` render-ui node handed to `set_scene`, its drawables held apart when the 2D walk draws it;
+    /// re-mapped when the viewport changes.
+    pub(crate) scene: Option<orbital_canvas_base::scene_doc::SceneDoc>,
+    /// Each top-level drawable's part of the scene's liveness, by the drawable it was read from.
+    pub(crate) liveness_parts: std::collections::HashMap<usize, (std::sync::Weak<serde_json::Value>, frame::LivenessPart)>,
     /// Tappable regions of the current scene, in logical points.
     pub(crate) hits: Vec<mappers::scene::Hit>,
     /// The asset-cache generation the current scene was mapped at; a later one re-maps the scene
@@ -78,6 +84,8 @@ pub struct SceneHost {
     pub(crate) view3d_moving: bool,
     /// Springs of the current scene's drawables; the host maps the scene as they display it.
     pub(crate) springs: spring::SpringBank,
+    /// Each top-level drawable's spring fields, read again only for a drawable new since the last scene.
+    pub(crate) spring_parts: spring::SpringParts,
     /// Pointer regions of the current scene (draw order), in logical points.
     pub(crate) pointer_regions: Vec<mappers::scene::PointerRegion>,
     /// The caret positions of each hit `draw-text`, so a press reports the caret index nearest it.
@@ -147,10 +155,13 @@ impl SceneHost {
             settled_drawables: std::sync::Mutex::new(Default::default()),
             #[cfg(test)]
             timed_maps: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            timed_prepares: std::sync::atomic::AtomicUsize::new(0),
             motion: true,
             view3d: None,
             view3d_moving: false,
             springs: spring::SpringBank::new(),
+            spring_parts: spring::SpringParts::default(),
             pointer_regions: Vec::new(),
             text_hits: Vec::new(),
             measured: Vec::new(),
@@ -164,6 +175,7 @@ impl SceneHost {
             pointer: None,
             live_material: false,
             liveness: frame::Liveness::default(),
+            liveness_parts: std::collections::HashMap::new(),
             #[cfg(test)]
             liveness_reads: std::sync::atomic::AtomicUsize::new(0),
             live_scenes3d: Vec::new(),
@@ -198,8 +210,13 @@ impl SceneHost {
     }
 
     /// The node the current scene was mapped from.
-    pub fn scene(&self) -> Option<&serde_json::Value> {
-        self.scene.as_deref()
+    pub fn scene(&self) -> Option<serde_json::Value> {
+        self.scene.as_ref().map(orbital_canvas_base::scene_doc::SceneDoc::node)
+    }
+
+    /// The current scene's own fields (its drawables aside).
+    pub(crate) fn frame(&self) -> Option<&serde_json::Value> {
+        self.scene.as_ref().map(|doc| &*doc.frame)
     }
 
     /// The host surface in physical pixels, once known.
@@ -238,9 +255,23 @@ impl SceneHost {
         node: impl Into<std::sync::Arc<serde_json::Value>>,
     ) -> std::result::Result<(), mappers::error::CanvasSceneError> {
         let node: std::sync::Arc<serde_json::Value> = node.into();
+        let doc = if mappers::scene::walks_drawables(&node) {
+            orbital_canvas_base::scene_doc::SceneDoc::split(std::sync::Arc::try_unwrap(node).unwrap_or_else(|node| (*node).clone()))
+        } else {
+            orbital_canvas_base::scene_doc::SceneDoc::whole(node)
+        };
+        self.set_scene_doc(doc)
+    }
+
+    /// [`Self::set_scene`] of a scene whose drawables the caller already holds apart: a drawable shared with the
+    /// last scene is not copied, themed, compared or walked again.
+    pub fn set_scene_doc(
+        &mut self,
+        node: orbital_canvas_base::scene_doc::SceneDoc,
+    ) -> std::result::Result<(), mappers::error::CanvasSceneError> {
         let generation = asset::generation();
         let mut bank = self.springs.clone();
-        bank.retarget(&node);
+        bank.retarget_doc_with(&node, &mut self.spring_parts);
         let previous = std::mem::replace(&mut self.springs, bank);
         let mapped = match self.map_scene(&node) {
             Ok(mapped) => mapped,
@@ -250,27 +281,23 @@ impl SceneHost {
             }
         };
         self.asset_generation = generation;
-        self.live_material = spring::has_live_material(&node);
-        self.liveness = frame::Liveness::read(&node);
+        self.live_material = spring::has_live_material_doc(&node);
+        self.liveness = self.read_liveness(&node);
         #[cfg(test)]
         self.liveness_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.scene = Some(node);
-        *self
-            .prepared
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        retire::retire(self.scene.replace(node));
         self.install(mapped);
         Ok(())
     }
 
     fn map_scene(
         &mut self,
-        node: &serde_json::Value,
+        node: &orbital_canvas_base::scene_doc::SceneDoc,
     ) -> std::result::Result<mappers::scene::MappedScene, mappers::error::CanvasSceneError> {
         let density = self.density;
-        let shown = (!self.springs.is_empty()).then(|| self.springs.apply(node));
-        mappers::scene::map_scene_with(
+        let shown = (!self.springs.is_empty()).then(|| self.springs.apply_doc_with(node, &self.spring_parts));
+        mappers::scene::map_scene_doc_with(
             shown.as_ref().unwrap_or(node),
             self.viewport
                 .map(|(w, h)| (w as f32 / density, h as f32 / density)),
@@ -278,15 +305,19 @@ impl SceneHost {
         )
     }
 
-    fn install(&mut self, mapped: mappers::scene::MappedScene) {
-        *self
-            .settled
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        *self
-            .prepared
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    fn install(&mut self, mut mapped: mappers::scene::MappedScene) {
+        retire::retire(
+            self.settled
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+        retire::retire(std::mem::replace(
+            self.prepared
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            mapped.prepared.take(),
+        ));
         let scene = mapped.packet.draw_commands.iter().find_map(|c| match c {
             DrawCommand::Scene3D { scene } => Some(scene.as_ref().clone()),
             _ => None,
@@ -306,8 +337,8 @@ impl SceneHost {
                         .map(|start_eye| scene3d::view::Follow { start_eye }),
                 );
                 let interaction = &scene.interaction;
-                let ground_events = self.scene.as_ref().is_some_and(|node| {
-                    let f = node.get("props").unwrap_or(node);
+                let ground_events = self.scene.as_ref().is_some_and(|doc| {
+                    let f = doc.root();
                     f.get("tileClickEvent").is_some() || f.get("unitClickEvent").is_some()
                 });
                 let picks_ground =
@@ -322,7 +353,7 @@ impl SceneHost {
             }
             None => self.view3d = None,
         }
-        self.packet = Some(mapped.packet);
+        retire::retire(self.packet.replace(mapped.packet));
         self.hits = mapped.hits;
         self.drags = mapped.drags;
         self.double_hits = mapped.double_hits;
@@ -381,6 +412,7 @@ mod canvas;
 mod events;
 mod frame;
 mod pointer;
+mod retire;
 mod scroll;
 pub use self::access::*;
 pub use self::audit::*;
