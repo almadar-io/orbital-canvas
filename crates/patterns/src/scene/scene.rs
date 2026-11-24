@@ -49,6 +49,15 @@ pub fn map_scene(
     node: &Value,
     viewport: Option<(f32, f32)>,
 ) -> Result<MappedScene, CanvasSceneError> {
+    map_scene_cached(node, viewport, &mut game_canvas_2d::DrawableCache::default())
+}
+
+/// [`map_scene`] replaying the unchanged drawables of a game canvas `cache` kept from the last mapping.
+fn map_scene_cached(
+    node: &Value,
+    viewport: Option<(f32, f32)>,
+    cache: &mut game_canvas_2d::DrawableCache,
+) -> Result<MappedScene, CanvasSceneError> {
     let obj = node.as_object().ok_or(CanvasSceneError::NotAnObject)?;
     let fields = match obj.get("props") {
         Some(Value::Object(nested)) => nested,
@@ -78,8 +87,8 @@ pub fn map_scene(
         return diagram::map(pattern, &Value::Object(fields.clone()), viewport);
     }
     let (packet, gathered) = match viewport {
-        Some((w, h)) => game_canvas_2d::from_canvas_node_in_viewport_mapped(node, w, h, 0.0)?,
-        None => game_canvas_2d::from_canvas_node_mapped(node, 0.0)?,
+        Some((w, h)) => game_canvas_2d::from_canvas_node_in_viewport_cached(node, w, h, 0.0, cache)?,
+        None => game_canvas_2d::from_canvas_node_cached(node, 0.0, cache)?,
     };
     let event = |key: &str| fields.get(key).and_then(Value::as_str).map(str::to_string);
     let events = PointerEvents {
@@ -177,7 +186,7 @@ pub fn map_scene_with(
     if pattern == Some("graph-canvas") {
         return learning::graph_canvas::map_with(&Value::Object(fields.clone()), viewport, memory);
     }
-    map_scene(node, viewport)
+    map_scene_cached(node, viewport, &mut memory.drawables)
 }
 
 /// The scene's own size in logical units (what the host sizes its surface to by aspect ratio):

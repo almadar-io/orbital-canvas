@@ -28,6 +28,8 @@ pub struct SceneHost {
     /// The current scene's props prepared for timed re-maps ([`mappers::game_canvas_2d::prepare_canvas_node`]), made
     /// on the first one and dropped with the scene.
     pub(crate) prepared: std::sync::Mutex<Option<serde_json::Value>>,
+    /// Each drawable of the settled timed re-maps, replayed while it is unchanged ([`mappers::game_canvas_2d::from_prepared_settled`]).
+    pub(crate) settled_drawables: std::sync::Mutex<mappers::game_canvas_2d::DrawableCache>,
     /// Timed mappings made for frames (observability for tests).
     #[cfg(test)]
     pub(crate) timed_maps: std::sync::atomic::AtomicUsize,
@@ -40,7 +42,7 @@ pub struct SceneHost {
     /// and drawn onto the physical surface.
     pub(crate) density: f32,
     /// Last `canvas` render-ui node handed to `set_scene`; re-mapped when the viewport changes.
-    pub(crate) scene: Option<serde_json::Value>,
+    pub(crate) scene: Option<std::sync::Arc<serde_json::Value>>,
     /// Tappable regions of the current scene, in logical points.
     pub(crate) hits: Vec<mappers::scene::Hit>,
     /// The asset-cache generation the current scene was mapped at; a later one re-maps the scene
@@ -142,6 +144,7 @@ impl SceneHost {
             epoch_clock_ms: 0.0,
             settled: std::sync::Mutex::new(None),
             prepared: std::sync::Mutex::new(None),
+            settled_drawables: std::sync::Mutex::new(Default::default()),
             #[cfg(test)]
             timed_maps: std::sync::atomic::AtomicUsize::new(0),
             motion: true,
@@ -196,7 +199,7 @@ impl SceneHost {
 
     /// The node the current scene was mapped from.
     pub fn scene(&self) -> Option<&serde_json::Value> {
-        self.scene.as_ref()
+        self.scene.as_deref()
     }
 
     /// The host surface in physical pixels, once known.
@@ -232,8 +235,9 @@ impl SceneHost {
     /// on every resize and density change.
     pub fn set_scene(
         &mut self,
-        node: serde_json::Value,
+        node: impl Into<std::sync::Arc<serde_json::Value>>,
     ) -> std::result::Result<(), mappers::error::CanvasSceneError> {
+        let node: std::sync::Arc<serde_json::Value> = node.into();
         let generation = asset::generation();
         let mut bank = self.springs.clone();
         bank.retarget(&node);

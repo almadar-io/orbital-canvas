@@ -167,7 +167,15 @@ impl SceneHost {
                     .ok();
                 }
                 let remapped = prepared.as_ref().map(|props| {
-                    mappers::game_canvas_2d::from_prepared_at(props, viewport, self.epoch_clock_ms)
+                    if live {
+                        mappers::game_canvas_2d::from_prepared_at(props, viewport, self.epoch_clock_ms)
+                    } else {
+                        let mut drawables = self
+                            .settled_drawables
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        mappers::game_canvas_2d::from_prepared_settled(props, viewport, self.epoch_clock_ms, &mut drawables)
+                    }
                 });
                 if let Some(Ok(packet)) = remapped {
                     if !live {

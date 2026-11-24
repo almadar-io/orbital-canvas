@@ -46,6 +46,8 @@ pub struct SceneMemory {
     /// element it resolved to: the touch stand-in for the web's hover.
     pub pending_press: Option<(f32, f32)>,
     pub pressed: Option<String>,
+    /// Each top-level drawable's walk output from the last mapping, replayed when it is unchanged.
+    pub drawables: crate::game_canvas_2d::DrawableCache,
 }
 
 /// An event a tap emits. `payload` is the value the web component passes to the callback; the

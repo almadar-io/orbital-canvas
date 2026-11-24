@@ -541,7 +541,7 @@ fn measured(id: &str, width: f32) -> mappers::scene::Measured {
 #[test]
 fn a_changed_measurement_is_reported_once_and_an_unchanged_one_is_not_repeated() {
     let mut r = SceneHost::new();
-    r.scene = Some(serde_json::json!({"type": "canvas", "measureEvent": "MEASURED"}));
+    r.scene = Some(serde_json::json!({"type": "canvas", "measureEvent": "MEASURED"}).into());
     r.measured = vec![measured("t", 80.0)];
     r.report_measured();
     let sent = r.take_scene_events();
@@ -561,7 +561,7 @@ fn a_changed_measurement_is_reported_once_and_an_unchanged_one_is_not_repeated()
 #[test]
 fn measurements_without_a_measure_event_send_nothing() {
     let mut r = SceneHost::new();
-    r.scene = Some(serde_json::json!({"type": "canvas"}));
+    r.scene = Some(serde_json::json!({"type": "canvas"}).into());
     r.measured = vec![measured("t", 80.0)];
     r.report_measured();
     assert!(events(&mut r).is_empty());
@@ -658,7 +658,7 @@ fn the_declared_direction_is_reported_once_and_on_change() {
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].event, "DIR");
     assert_eq!(sent[0].payload, serde_json::json!({"direction": "rtl"}));
-    let mut node = r.scene.clone().unwrap();
+    let mut node = (*r.scene.clone().unwrap()).clone();
     r.set_scene(node.clone()).unwrap();
     assert!(r.take_scene_events().is_empty(), "same direction: nothing");
     node["direction"] = serde_json::json!("ltr");

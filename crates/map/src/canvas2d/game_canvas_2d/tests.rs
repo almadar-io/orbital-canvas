@@ -4549,3 +4549,77 @@ fn a_canvas_nodes_theme_layer_is_laid_over_its_host_theme_before_references_reso
     assert!(laid.get("themeLayer").is_none(), "the layer is consumed, not drawn");
     assert_eq!(node(false)["drawables"][0]["fill"], "#ffffff");
 }
+
+fn cached_scene(first_height: f64) -> Value {
+    free_props(json!([
+        rect_shape(json!({"id": "first", "height": first_height})),
+        {"type": "draw-group", "id": "grow", "position": {"x": 0, "y": 0},
+         "items": if first_height > 40.0 { json!([rect_shape(json!({"id": "a"})), rect_shape(json!({"id": "b"}))]) } else { json!([rect_shape(json!({"id": "a"}))]) }},
+        rect_shape(json!({"id": "pinned", "fixed": true,
+            "animation": {"durationMs": 400, "startMs": 0, "loop": false, "keyframes": [{"at": 0, "opacity": 0}, {"at": 1, "opacity": 1}]}})),
+        {"type": "draw-text", "id": "label", "text": "Name", "position": {"x": 5, "y": 5}},
+        rect_shape(json!({"id": "named", "semantic": {"role": "button", "labelledBy": "label"}}))
+    ]))
+}
+
+fn same_mapping(cached: &(GameRenderPacket, Gathered), plain: &(GameRenderPacket, Gathered)) {
+    assert_eq!(serde_json::to_value(&cached.0).unwrap(), serde_json::to_value(&plain.0).unwrap(), "the reused packet is the walked one");
+    assert_eq!(cached.1, plain.1, "the reused regions, texts, semantics, pins and animations are the walked ones");
+}
+
+#[test]
+fn a_second_mapping_of_the_same_scene_reuses_every_drawable_and_maps_the_same() {
+    let props = cached_scene(32.0);
+    let mut cache = DrawableCache::default();
+    let first = from_props_cached_at(&props, None, 0.0, false, (0, 0), &mut cache).unwrap();
+    same_mapping(&first, &from_props_mapped(&props, 0.0).unwrap());
+    assert_eq!(cache.reused, 0, "control: a first mapping walks every drawable");
+    let again = from_props_cached_at(&props, None, 0.0, false, (0, 0), &mut cache).unwrap();
+    assert_eq!(cache.reused, 5, "nothing changed: every drawable is reused");
+    same_mapping(&again, &first);
+}
+
+#[test]
+fn a_changed_drawable_is_walked_again_and_the_ones_after_it_shift_their_indexes() {
+    let mut cache = DrawableCache::default();
+    from_props_cached_at(&cached_scene(32.0), None, 0.0, false, (0, 0), &mut cache).unwrap();
+    let grown = cached_scene(64.0);
+    let mapped = from_props_cached_at(&grown, None, 0.0, false, (0, 0), &mut cache).unwrap();
+    assert_eq!(cache.reused, 3, "the two changed drawables are walked, the three after them reused");
+    same_mapping(&mapped, &from_props_mapped(&grown, 0.0).unwrap());
+}
+
+#[test]
+fn a_new_viewport_reuses_nothing() {
+    let props = cached_scene(32.0);
+    let mut cache = DrawableCache::default();
+    from_props_cached_at(&props, Some((200.0, 100.0)), 0.0, false, (0, 0), &mut cache).unwrap();
+    from_props_cached_at(&props, Some((400.0, 100.0)), 0.0, false, (0, 0), &mut cache).unwrap();
+    assert_eq!(cache.reused, 0, "the walk context changed, so no drawable's output is the same");
+}
+
+#[test]
+fn a_font_or_asset_that_lands_reuses_nothing() {
+    let props = cached_scene(32.0);
+    let mut cache = DrawableCache::default();
+    from_props_cached_at(&props, None, 0.0, false, (0, 0), &mut cache).unwrap();
+    from_props_cached_at(&props, None, 0.0, false, (0, 1), &mut cache).unwrap();
+    assert_eq!(cache.reused, 0, "text laid out before a font landed is not the text now");
+    from_props_cached_at(&props, None, 0.0, false, (1, 1), &mut cache).unwrap();
+    assert_eq!(cache.reused, 0, "a sprite sized before its image landed is not the sprite now");
+    from_props_cached_at(&props, None, 0.0, false, (1, 1), &mut cache).unwrap();
+    assert_eq!(cache.reused, 5, "control: nothing moved since, so every drawable is reused");
+}
+
+#[test]
+fn a_settled_scene_reuses_its_drawables_at_any_clock_and_a_live_one_does_not() {
+    let props = cached_scene(32.0);
+    let mut settled = DrawableCache::default();
+    from_props_cached_at(&props, None, 1000.0, true, (0, 0), &mut settled).unwrap();
+    from_props_cached_at(&props, None, 2000.0, true, (0, 0), &mut settled).unwrap();
+    assert_eq!(settled.reused, 5, "nothing moves with the clock once settled");
+    let mut live = DrawableCache::default();
+    from_props_cached_at(&props, None, 1000.0, false, (0, 0), &mut live).unwrap();
+    from_props_cached_at(&props, None, 2000.0, false, (0, 0), &mut live).unwrap();
+    assert_eq!(live.reused, 0, "control: while animations play, a new clock is a new walk");
+}

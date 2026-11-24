@@ -142,6 +142,32 @@ fn from_props_sized(
     viewport: Option<(f32, f32)>,
     epoch_now_ms: f64,
 ) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
+    from_props_cached(props, viewport, epoch_now_ms, &mut DrawableCache::default())
+}
+
+/// [`from_props_sized`] replaying each drawable `cache` kept from the last mapping when it and the walk context are
+/// unchanged, and keeping what this mapping walks.
+pub fn from_props_cached(
+    props: &Value,
+    viewport: Option<(f32, f32)>,
+    epoch_now_ms: f64,
+    cache: &mut DrawableCache,
+) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
+    let generations = (orbital_canvas_paint::asset::generation(), orbital_canvas_paint::vector::font_generation());
+    from_props_cached_at(props, viewport, epoch_now_ms, false, generations, cache)
+}
+
+/// [`from_props_cached`] with the asset and font generations the walk reads given: a kept output is stale once either moves.
+/// `settled` says the scene's animations have all settled, so no drawable moves with the clock and a kept output
+/// holds at any clock.
+pub(crate) fn from_props_cached_at(
+    props: &Value,
+    viewport: Option<(f32, f32)>,
+    epoch_now_ms: f64,
+    settled: bool,
+    generations: (u64, u64),
+    cache: &mut DrawableCache,
+) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
     let mut gathered = Gathered::default();
     // An orbital-painter canvas is sized by its declared world, as the web host sizes it.
     let orbital = props.get("painter").and_then(Value::as_str) == Some("orbital");
@@ -252,9 +278,25 @@ fn from_props_sized(
     }
     gathered.pinned.push((0, draw_commands.len()));
 
-    for node in drawables {
-        walk(
+    cache.begin(drawable_cache::WalkContext {
+        width,
+        height,
+        zoom,
+        camera: cam,
+        projector_scale,
+        base_offset_x,
+        projection,
+        clock: (!settled).then_some(epoch_now_ms),
+        asset_generation: generations.0,
+        font_generation: generations.1,
+    });
+    for (index, node) in drawables.iter().enumerate() {
+        if cache.replay(node, index, &mut gathered, &mut draw_commands) {
+            continue;
+        }
+        cache.walk(
             node,
+            index,
             &projector,
             &to_screen,
             zoom,
@@ -334,7 +376,16 @@ pub fn from_canvas_node_mapped(
     node: &Value,
     epoch_now_ms: f64,
 ) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
-    canvas_node_props(node).and_then(|props| from_props_mapped(&Value::Object(props), epoch_now_ms))
+    from_canvas_node_cached(node, epoch_now_ms, &mut DrawableCache::default())
+}
+
+/// [`from_canvas_node_mapped`] replaying the unchanged drawables `cache` kept ([`from_props_cached`]).
+pub fn from_canvas_node_cached(
+    node: &Value,
+    epoch_now_ms: f64,
+    cache: &mut DrawableCache,
+) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
+    canvas_node_props(node).and_then(|props| from_props_cached(&Value::Object(props), None, epoch_now_ms, cache))
 }
 
 /// [`from_canvas_node`] laid out in the host's own viewport. `Canvas2D.tsx`
@@ -365,11 +416,18 @@ pub fn from_canvas_node_in_viewport_mapped(
     height: f32,
     epoch_now_ms: f64,
 ) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
-    from_props_sized(
-        &prepare_canvas_node(node)?,
-        Some((width, height)),
-        epoch_now_ms,
-    )
+    from_canvas_node_in_viewport_cached(node, width, height, epoch_now_ms, &mut DrawableCache::default())
+}
+
+/// [`from_canvas_node_in_viewport_mapped`] replaying the unchanged drawables `cache` kept ([`from_props_cached`]).
+pub fn from_canvas_node_in_viewport_cached(
+    node: &Value,
+    width: f32,
+    height: f32,
+    epoch_now_ms: f64,
+    cache: &mut DrawableCache,
+) -> Result<(GameRenderPacket, Gathered), CanvasSceneError> {
+    from_props_cached(&prepare_canvas_node(node)?, Some((width, height)), epoch_now_ms, cache)
 }
 
 /// A canvas node's props as the walk reads them (theme references resolved, children as drawables): prepare once,
@@ -386,6 +444,18 @@ pub fn from_prepared_at(
     epoch_now_ms: f64,
 ) -> Result<GameRenderPacket, CanvasSceneError> {
     from_props_sized(prepared, viewport, epoch_now_ms).map(|(packet, _)| packet)
+}
+
+/// [`from_prepared_at`] for a scene whose animations have all settled: its drawables do not move with the clock, so
+/// each one unchanged since the last settled mapping `cache` kept is replayed.
+pub fn from_prepared_settled(
+    prepared: &Value,
+    viewport: Option<(f32, f32)>,
+    epoch_now_ms: f64,
+    cache: &mut DrawableCache,
+) -> Result<GameRenderPacket, CanvasSceneError> {
+    let generations = (orbital_canvas_paint::asset::generation(), orbital_canvas_paint::vector::font_generation());
+    from_props_cached_at(prepared, viewport, epoch_now_ms, true, generations, cache).map(|(packet, _)| packet)
 }
 
 fn canvas_node_props(node: &Value) -> Result<serde_json::Map<String, Value>, CanvasSceneError> {
@@ -919,6 +989,8 @@ pub fn get_string(props: &Value, key: &str) -> Option<String> {
 }
 
 mod animation;
+mod drawable_cache;
+pub use self::drawable_cache::DrawableCache;
 mod editing;
 mod group;
 mod paragraph;
