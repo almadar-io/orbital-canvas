@@ -184,21 +184,24 @@ pub(super) fn paint_sprite(
             h: h as f32,
         };
         match node.get("fit").and_then(Value::as_str) {
-            Some("cover") => cover_crop(
-                whole,
-                get_f32(node, "width", 0.0),
-                get_f32(node, "height", 0.0),
-            ),
+            Some("cover") => {
+                whole.cover_crop(get_f32(node, "width", 0.0), get_f32(node, "height", 0.0))
+            }
             _ => whole,
         }
     };
 
     // `spriteRect` (lib/drawable/contract.ts): an omitted width/height is one
     // cell on tile grids and the source's native px on world-pixel `free` boards.
+    let boxed = sprite_dst(node, position, projector, to_screen, zoom, src);
     out.push(DrawCommand::Sprite {
         texture: url.to_string(),
         src,
-        dst: sprite_dst(node, position, projector, to_screen, zoom, src),
+        dst: if node.get("fit").and_then(Value::as_str) == Some("contain") {
+            src.contained_in(boxed)
+        } else {
+            boxed
+        },
         rotation: get_f32(node, "rotation", 0.0),
         opacity: get_f32(node, "opacity", 1.0),
         flip_x: node.get("flipX").and_then(Value::as_bool).unwrap_or(false),
@@ -217,29 +220,6 @@ fn sprite_tint(node: &Value) -> Result<Option<[f32; 4]>, CanvasSceneError> {
             .and_then(parse_css_color)
             .map(Some)
             .ok_or_else(|| invalid("tint", "a css colour or a theme palette name")),
-    }
-}
-
-/// The centred part of `whole` with the `width : height` aspect, so the image fills its rect without stretching.
-fn cover_crop(whole: Rect, width: f32, height: f32) -> Rect {
-    if width <= 0.0 || height <= 0.0 || whole.w <= 0.0 || whole.h <= 0.0 {
-        return whole;
-    }
-    let aspect = width / height;
-    if whole.w / whole.h > aspect {
-        let w = whole.h * aspect;
-        Rect {
-            x: whole.x + (whole.w - w) / 2.0,
-            w,
-            ..whole
-        }
-    } else {
-        let h = whole.w / aspect;
-        Rect {
-            y: whole.y + (whole.h - h) / 2.0,
-            h,
-            ..whole
-        }
     }
 }
 
@@ -379,4 +359,78 @@ pub(crate) fn background_sprites(
         y += image_h;
     }
     sprites
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::super::from_props;
+    use orbital_canvas_base::packet::{DrawCommand, Rect};
+    use serde_json::{json, Value};
+
+    fn wide_image(url: &str) {
+        let mut bytes = Vec::new();
+        image::RgbaImage::new(400, 200)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        orbital_canvas_paint::asset::register_asset(url, bytes.into(), Some("image/png"));
+    }
+
+    fn drawn(fit: Option<&str>, url: &str, w: f64, h: f64) -> (Rect, Rect) {
+        let mut sprite: Value = json!({ "type": "draw-sprite", "id": "photo", "asset": { "url": url }, "position": { "x": 0, "y": 0 }, "width": w, "height": h, "anchor": "top-left" });
+        if let Some(fit) = fit {
+            sprite["fit"] = json!(fit);
+        }
+        from_props(&json!({ "width": 800, "height": 600, "scale": 1.0, "projection": "free", "drawables": [sprite] }))
+            .unwrap()
+            .draw_commands
+            .into_iter()
+            .find_map(|c| match c {
+                DrawCommand::Sprite { src, dst, .. } => Some((src, dst)),
+                _ => None,
+            })
+            .expect("drawn")
+    }
+
+    #[test]
+    fn a_contain_sprite_draws_the_whole_image_scaled_into_its_box_centred() {
+        let url = "test://images/contain-400x200.png";
+        wide_image(url);
+        let (src, dst) = drawn(Some("contain"), url, 100.0, 100.0);
+        assert_eq!(
+            src,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 400.0,
+                h: 200.0
+            },
+            "nothing is cut"
+        );
+        assert_eq!((dst.w, dst.h), (100.0, 50.0));
+        assert_eq!(
+            dst.y - drawn(None, url, 100.0, 100.0).1.y,
+            25.0,
+            "centred in the box"
+        );
+    }
+
+    #[test]
+    fn control_a_plain_sprite_stretches_the_whole_image_over_its_box() {
+        let url = "test://images/plain-400x200.png";
+        wide_image(url);
+        let (src, dst) = drawn(None, url, 100.0, 100.0);
+        assert_eq!(
+            src,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 400.0,
+                h: 200.0
+            }
+        );
+        assert_eq!((dst.w, dst.h), (100.0, 100.0));
+    }
 }

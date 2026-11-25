@@ -313,7 +313,6 @@ fn map_drawables<D: SharedDrawable>(
         projector_scale,
         base_offset_x,
         projection,
-        clock: (!settled).then_some(epoch_now_ms),
         asset_generation: generations.0,
         font_generation: generations.1,
     });
@@ -331,6 +330,7 @@ fn map_drawables<D: SharedDrawable>(
             &to_screen,
             zoom,
             epoch_now_ms,
+            settled,
             &mut gathered,
             &mut draw_commands,
         )?;

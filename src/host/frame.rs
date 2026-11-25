@@ -171,13 +171,14 @@ impl SceneHost {
                     .ok();
                 }
                 let remapped = prepared.as_ref().map(|props| {
+                    let mut drawables = self
+                        .settled_drawables
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if live {
-                        mappers::game_canvas_2d::from_prepared_doc_at(props, viewport, self.epoch_clock_ms)
+                        mappers::game_canvas_2d::from_prepared_doc_cached(props, viewport, self.epoch_clock_ms, &mut drawables)
+                            .map(|(packet, _)| packet)
                     } else {
-                        let mut drawables = self
-                            .settled_drawables
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         mappers::game_canvas_2d::from_prepared_doc_settled(props, viewport, self.epoch_clock_ms, &mut drawables)
                     }
                 });
@@ -372,19 +373,7 @@ impl SceneHost {
 impl Liveness {
     /// The fx, emitter, reveal and `startMs` animation clocks under `node`, its materials aside.
     fn scan(node: &serde_json::Value) -> Self {
-        let until = [
-            mappers::game_canvas_2d::active_fx_until(node),
-            mappers::emitter::live_until(node),
-            mappers::text_reveal::live_until(node),
-            mappers::game_canvas_2d::started_animation_until(node),
-        ]
-        .into_iter()
-        .flatten()
-        .reduce(f64::max);
-        let timed = mappers::game_canvas_2d::has_active_fx(node)
-            || mappers::emitter::has_emitter(node)
-            || mappers::text_reveal::has_reveal(node)
-            || mappers::game_canvas_2d::has_started_animation(node);
+        let (timed, until) = mappers::game_canvas_2d::clocked_span(node);
         Self { until, timed, materials: Vec::new() }
     }
 

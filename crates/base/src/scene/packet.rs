@@ -190,6 +190,46 @@ pub struct Rect {
     pub h: f32,
 }
 
+impl Rect {
+    /// The centred part of this source with the `width : height` aspect, so an image fills its box without stretching.
+    pub fn cover_crop(self, width: f32, height: f32) -> Rect {
+        if width <= 0.0 || height <= 0.0 || self.w <= 0.0 || self.h <= 0.0 {
+            return self;
+        }
+        let aspect = width / height;
+        if self.w / self.h > aspect {
+            let w = self.h * aspect;
+            Rect {
+                x: self.x + (self.w - w) / 2.0,
+                w,
+                ..self
+            }
+        } else {
+            let h = self.w / aspect;
+            Rect {
+                y: self.y + (self.h - h) / 2.0,
+                h,
+                ..self
+            }
+        }
+    }
+
+    /// Where this whole source lands scaled to fit inside `area`, centred, so nothing is cut and nothing stretches.
+    pub fn contained_in(self, area: Rect) -> Rect {
+        if self.w <= 0.0 || self.h <= 0.0 || area.w <= 0.0 || area.h <= 0.0 {
+            return area;
+        }
+        let k = (area.w / self.w).min(area.h / self.h);
+        let (w, h) = (self.w * k, self.h * k);
+        Rect {
+            x: area.x + (area.w - w) / 2.0,
+            y: area.y + (area.h - h) / 2.0,
+            w,
+            h,
+        }
+    }
+}
+
 /// 2D vector.
 #[derive(Debug, Copy, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Vec2 {
@@ -668,4 +708,105 @@ pub enum DrawCommand {
     Scissor { rect: Rect },
     /// Remove the scissor rectangle.
     ResetScissor,
+}
+
+#[cfg(test)]
+mod rect_fit_tests {
+    use super::Rect;
+
+    const WIDE: Rect = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 400.0,
+        h: 200.0,
+    };
+
+    #[test]
+    fn contain_scales_the_whole_source_to_fit_the_box_centred() {
+        let square = Rect {
+            x: 10.0,
+            y: 20.0,
+            w: 100.0,
+            h: 100.0,
+        };
+        assert_eq!(
+            WIDE.contained_in(square),
+            Rect {
+                x: 10.0,
+                y: 45.0,
+                w: 100.0,
+                h: 50.0
+            }
+        );
+        let tall = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 50.0,
+            h: 100.0,
+        };
+        assert_eq!(
+            WIDE.contained_in(tall),
+            Rect {
+                x: 0.0,
+                y: 37.5,
+                w: 50.0,
+                h: 25.0
+            }
+        );
+        let wider = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 400.0,
+            h: 50.0,
+        };
+        assert_eq!(
+            WIDE.contained_in(wider),
+            Rect {
+                x: 150.0,
+                y: 0.0,
+                w: 100.0,
+                h: 50.0
+            }
+        );
+    }
+
+    #[test]
+    fn edge_contain_of_an_empty_source_or_box_keeps_the_box() {
+        let boxed = Rect {
+            x: 5.0,
+            y: 5.0,
+            w: 100.0,
+            h: 100.0,
+        };
+        assert_eq!(Rect::default().contained_in(boxed), boxed);
+        assert_eq!(WIDE.contained_in(Rect::default()), Rect::default());
+    }
+
+    #[test]
+    fn cover_crops_the_source_centred_to_the_box_aspect() {
+        assert_eq!(
+            WIDE.cover_crop(100.0, 100.0),
+            Rect {
+                x: 100.0,
+                y: 0.0,
+                w: 200.0,
+                h: 200.0
+            }
+        );
+        assert_eq!(
+            WIDE.cover_crop(400.0, 50.0),
+            Rect {
+                x: 0.0,
+                y: 75.0,
+                w: 400.0,
+                h: 50.0
+            }
+        );
+    }
+
+    #[test]
+    fn control_cover_of_a_source_already_at_the_box_aspect_takes_it_all() {
+        assert_eq!(WIDE.cover_crop(200.0, 100.0), WIDE);
+        assert_eq!(WIDE.cover_crop(0.0, 100.0), WIDE);
+    }
 }

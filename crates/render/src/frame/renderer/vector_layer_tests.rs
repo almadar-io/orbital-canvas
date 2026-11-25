@@ -621,6 +621,34 @@ fn arabic_through_the_atlas_is_drawn_and_joined() {
     );
 }
 
+#[test]
+fn a_second_frame_of_the_same_text_makes_no_new_instance_buffer() {
+    let Some(mut r) = renderer() else { return };
+    let command = word("Cache", 8.0, 40.0, 20.0);
+    let Some(first) = gpu_alpha(&mut r, &command) else {
+        return;
+    };
+    let made = r.glyph_buffers_made();
+    assert!(made > 0, "control: the first frame makes its buffer");
+    for _ in 0..3 {
+        let Some(again) = gpu_alpha(&mut r, &command) else {
+            return;
+        };
+        assert_eq!(first, again, "the same pixels");
+    }
+    assert_eq!(
+        r.glyph_buffers_made(),
+        made,
+        "later frames write into the buffer the first one made"
+    );
+    let long = "The quick brown fox jumps over the lazy dog and then does it again";
+    let _ = gpu_alpha(&mut r, &word(long, 0.0, 40.0, 6.0));
+    assert!(
+        r.glyph_buffers_made() > made,
+        "control: a run that does not fit a held buffer makes a larger one"
+    );
+}
+
 fn rasterized(r: &SharedDeviceRenderer) -> u64 {
     r.glyphs.as_ref().map_or(0, |g| g.rasterized())
 }

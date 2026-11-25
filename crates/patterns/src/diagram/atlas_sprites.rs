@@ -111,46 +111,16 @@ pub fn image(props: &Value, viewport: Option<(f32, f32)>) -> Result<MappedScene,
     let mut pen = Pen::new(&theme, xf);
     pen.clear([0.0, 0.0, 0.0, 0.0]);
     if let Some(r) = src.rect {
-        let (k_contain, k_cover) = ((bw / r.w).min(bh / r.h), (bw / r.w).max(bh / r.h));
+        let whole = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: bw,
+            h: bh,
+        };
         let (s_rect, d_rect) = match props_str(props, "fit").unwrap_or("contain") {
-            "fill" => (
-                r,
-                Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    w: bw,
-                    h: bh,
-                },
-            ),
-            "cover" => {
-                let (vw, vh) = (bw / k_cover, bh / k_cover);
-                (
-                    Rect {
-                        x: r.x + (r.w - vw) / 2.0,
-                        y: r.y + (r.h - vh) / 2.0,
-                        w: vw,
-                        h: vh,
-                    },
-                    Rect {
-                        x: 0.0,
-                        y: 0.0,
-                        w: bw,
-                        h: bh,
-                    },
-                )
-            }
-            _ => {
-                let (dw, dh) = (r.w * k_contain, r.h * k_contain);
-                (
-                    r,
-                    Rect {
-                        x: (bw - dw) / 2.0,
-                        y: (bh - dh) / 2.0,
-                        w: dw,
-                        h: dh,
-                    },
-                )
-            }
+            "fill" => (r, whole),
+            "cover" => (r.cover_crop(bw, bh), whole),
+            _ => (r, r.contained_in(whole)),
         };
         let cmd = place(&pen, &src.url, s_rect, d_rect);
         pen.push(cmd);

@@ -28,7 +28,8 @@ pub struct SceneHost {
     /// The current scene's props prepared for timed re-maps ([`mappers::game_canvas_2d::prepare_canvas_node`]), made
     /// on the first one and dropped with the scene.
     pub(crate) prepared: std::sync::Mutex<Option<mappers::game_canvas_2d::PreparedDoc>>,
-    /// Each drawable of the settled timed re-maps, replayed while it is unchanged ([`mappers::game_canvas_2d::from_prepared_settled`]).
+    /// Each drawable of the timed re-maps, replayed while it is unchanged and no longer moves with the clock
+    /// ([`mappers::game_canvas_2d::from_prepared_settled`], and the live re-maps since 2026-11-25).
     pub(crate) settled_drawables: std::sync::Mutex<mappers::game_canvas_2d::DrawableCache>,
     /// Timed mappings made for frames (observability for tests).
     #[cfg(test)]
@@ -93,6 +94,15 @@ pub struct SceneHost {
     /// The sizes of the measured texts at the latest layout, and the list last sent as `measureEvent`.
     pub(crate) measured: Vec<mappers::scene::Measured>,
     pub(crate) measure_reported: Vec<(String, f32, f32, u32)>,
+    /// How many times the semantic nodes were replaced, and the (replacements, scroll offset) pair last named by
+    /// [`Self::semantic_revision`] with the revision it was given.
+    pub(crate) semantic_installs: u64,
+    pub(crate) semantic_seen: std::sync::Mutex<((u64, u32), u32)>,
+    /// The JSON of the semantic tree at the revision it was written for ([`Self::semantic_tree_json`]).
+    pub(crate) semantic_json: std::sync::Mutex<Option<(u32, String)>>,
+    /// Times the semantic tree was written as JSON (observability for tests).
+    #[cfg(test)]
+    pub(crate) semantic_json_builds: std::sync::atomic::AtomicUsize,
     /// The resolved page offset of every frame origin the last `originsEvent` reported.
     pub(crate) origins_reported: Vec<(String, f32, f32)>,
     /// The semantic tree of the latest layout, and the size last sent as `resizeEvent`.
@@ -168,6 +178,11 @@ impl SceneHost {
             text_hits: Vec::new(),
             measured: Vec::new(),
             measure_reported: Vec::new(),
+            semantic_installs: 0,
+            semantic_seen: std::sync::Mutex::new(((0, 0), 0)),
+            semantic_json: Default::default(),
+            #[cfg(test)]
+            semantic_json_builds: Default::default(),
             origins_reported: Vec::new(),
             semantic: Vec::new(),
             resize_reported: None,
@@ -365,6 +380,7 @@ impl SceneHost {
         self.text_hits = mapped.text_hits;
         self.measured = mapped.measured;
         self.semantic = mapped.semantic_nodes;
+        self.semantic_installs += 1;
         self.live_scenes3d = mapped.live_scenes3d;
         match self.scroll_max() {
             Some(max) => {
@@ -401,6 +417,20 @@ impl SceneHost {
                 self.install(mapped);
             }
         }
+    }
+
+    /// The host surface in physical pixels with its scale, given together: the scene is laid out once, in
+    /// `size / scale` points, and that is the one size it reports.
+    pub fn set_surface(&mut self, width: u32, height: u32, scale: f32) -> std::result::Result<(), String> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(format!(
+                "scale must be a finite positive number, got {scale}"
+            ));
+        }
+        self.viewport = Some((width.max(1), height.max(1)));
+        self.density = scale;
+        self.relayout();
+        Ok(())
     }
 
     /// The host surface in physical pixels; the scene is laid out in `size / density` points.

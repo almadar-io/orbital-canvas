@@ -657,6 +657,31 @@ fn resize_is_sent_once_per_size_in_css_pixels() {
 }
 
 #[test]
+fn a_surface_given_its_size_and_scale_together_reports_one_size_in_points() {
+    let mut r = host_with(serde_json::json!({"resizeEvent": "RESIZED"}));
+    r.take_scene_events();
+    r.set_surface(1074, 2436, 3.0).unwrap();
+    let sent = r.take_scene_events();
+    assert_eq!(sent.len(), 1, "one size, never the physical one first: {sent:?}");
+    assert_eq!(
+        sent[0].payload,
+        serde_json::json!({"width": 358.0, "height": 812.0})
+    );
+    r.set_surface(1074, 2436, 3.0).unwrap();
+    assert!(events(&mut r).is_empty(), "the same surface: nothing");
+    assert!(r.set_surface(10, 10, 0.0).is_err(), "edge: a scale of zero is refused");
+    let mut apart = host_with(serde_json::json!({"resizeEvent": "RESIZED"}));
+    apart.take_scene_events();
+    apart.set_viewport(1074, 2436);
+    apart.set_scale(3.0).unwrap();
+    assert_eq!(
+        events(&mut apart),
+        vec!["RESIZED", "RESIZED"],
+        "control: given apart, the size in physical pixels is reported before the scale arrives"
+    );
+}
+
+#[test]
 fn the_declared_direction_is_reported_once_and_on_change() {
     let mut r = host_with(serde_json::json!({"directionEvent": "DIR", "direction": "rtl"}));
     let sent = r.take_scene_events();
@@ -3429,6 +3454,48 @@ fn scroll_to_page(to: Option<serde_json::Value>) -> serde_json::Value {
         scene["scroll"]["to"] = to;
     }
     scene
+}
+
+fn semantic_page() -> serde_json::Value {
+    let mut scene = scroll_to_page(None);
+    scene["drawables"][0]["semantic"] = serde_json::json!({"role": "button", "name": "art"});
+    scene
+}
+
+#[test]
+fn the_semantic_revision_moves_exactly_when_the_tree_it_names_would_answer_differently() {
+    let mut host = SceneHost::new();
+    host.set_scene(semantic_page()).unwrap();
+    let first = host.semantic_revision();
+    let tree = host.semantic_tree();
+    assert_eq!(tree.len(), 1);
+    assert_eq!(host.semantic_revision(), first, "asking again without a change keeps the number");
+    host.scroll_by(50.0);
+    let scrolled = host.semantic_revision();
+    assert_ne!(scrolled, first, "a scroll moves the nodes, so the number moves");
+    assert_ne!(host.semantic_tree()[0].rect.y, tree[0].rect.y, "control: the tree did answer differently");
+    host.scroll_by(0.0);
+    assert_eq!(host.semantic_revision(), scrolled, "control: a scroll by nothing changes nothing");
+    host.set_scene(semantic_page()).unwrap();
+    assert_ne!(host.semantic_revision(), scrolled, "a new scene replaces the nodes");
+}
+
+#[test]
+fn the_semantic_tree_is_written_as_json_once_per_change_and_handed_back_until_the_next() {
+    let builds = |host: &SceneHost| host.semantic_json_builds.load(std::sync::atomic::Ordering::Relaxed);
+    let mut host = SceneHost::new();
+    host.set_scene(semantic_page()).unwrap();
+    let first = host.semantic_tree_json();
+    let written = builds(&host);
+    assert!(first.contains("\"role\":\"button\""), "control: the tree is in the JSON: {first}");
+    for _ in 0..3 {
+        assert_eq!(host.semantic_tree_json(), first);
+    }
+    assert_eq!(builds(&host), written, "an unchanged tree is handed back, not written again");
+    host.scroll_by(50.0);
+    let scrolled = host.semantic_tree_json();
+    assert_ne!(scrolled, first, "a scroll moves the rects in the JSON");
+    assert_eq!(builds(&host), written + 1, "control: a change is written once");
 }
 
 #[test]

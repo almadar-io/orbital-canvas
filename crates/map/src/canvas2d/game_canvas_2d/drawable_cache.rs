@@ -48,8 +48,6 @@ pub(super) struct WalkContext {
     pub projector_scale: f32,
     pub base_offset_x: f32,
     pub projection: Projection,
-    /// The clock the walk reads, `None` once the scene has settled and no drawable moves with it.
-    pub clock: Option<f64>,
     /// Sprite sizes and text layout read the assets and fonts loaded so far.
     pub asset_generation: u64,
     pub font_generation: u64,
@@ -74,6 +72,10 @@ struct Segment {
     paint_ordered_at: Option<usize>,
     /// The resolved offset of the origin it was walked at.
     offset: Option<(f32, f32)>,
+    /// The clock it was walked at (infinite when the scene had settled), and the instant it stops moving with the
+    /// clock (`None` when it never does): walked before that instant, its output is that clock's alone.
+    walked_at: f64,
+    moves_until: Option<f64>,
 }
 
 /// The drawables of the scene last mapped, by `id` (or index when a drawable has none).
@@ -122,12 +124,18 @@ impl DrawableCache {
         gathered: &mut Gathered,
         out: &mut Vec<DrawCommand>,
     ) -> bool {
-        let Some(segment) = self.segments.get(&key(node.value(), index)) else {
+        let Some(segment) = self.segments.get_mut(&key(node.value(), index)) else {
             return false;
         };
         let (out_start, semantic_start) = (out.len(), gathered.semantic.len());
-        let same = node.shared().is_some_and(|shared| Arc::ptr_eq(shared, &segment.node)) || *segment.node == *node.value();
-        if !same || segment.offset != offset || segment.paint_ordered_at.is_some_and(|at| at != semantic_start) {
+        let identical = node.shared().is_some_and(|shared| Arc::ptr_eq(shared, &segment.node));
+        let same = identical || *segment.node == *node.value();
+        if same && !identical && node.shared().is_some() {
+            // Hold the copy just shown: the next mapping of it matches by identity, not by a deep comparison.
+            segment.node = node.to_shared();
+        }
+        let moved = segment.moves_until.is_some_and(|until| segment.walked_at < until);
+        if !same || moved || segment.offset != offset || segment.paint_ordered_at.is_some_and(|at| at != semantic_start) {
             return false;
         }
         out.extend(segment.commands.iter().cloned());
@@ -159,9 +167,15 @@ impl DrawableCache {
         to_screen: &dyn Fn(f32, f32) -> (f32, f32),
         zoom: f32,
         epoch_now_ms: f64,
+        settled: bool,
         gathered: &mut Gathered,
         out: &mut Vec<DrawCommand>,
     ) -> Result<(), CanvasSceneError> {
+        let walked_at = if settled { f64::INFINITY } else { epoch_now_ms };
+        let moves_until = match super::animation::clocked_span(node.value()) {
+            (true, until) => Some(until.unwrap_or(f64::INFINITY)),
+            (false, _) => None,
+        };
         let out_start = out.len();
         let (region_start, measured_start) = (gathered.regions.len(), gathered.measured.len());
         let (hit_start, semantic_start) = (gathered.text_hits.len(), gathered.semantic.len());
@@ -217,6 +231,8 @@ impl DrawableCache {
                 live_scenes3d: gathered.live_scenes3d[live_start..].to_vec(),
                 paint_ordered_at: paint_ordered.then_some(semantic_start),
                 offset,
+                walked_at,
+                moves_until,
             },
         );
         Ok(())

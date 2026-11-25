@@ -4624,11 +4624,33 @@ fn a_settled_scene_reuses_its_drawables_at_any_clock_and_a_live_one_does_not() {
     assert_eq!(live.reused, 5, "its one animation ended at 400, so a live mapping after it reuses them too");
 }
 
+#[test]
+fn a_drawable_replayed_from_an_equal_copy_is_held_as_that_copy_so_the_next_frame_matches_it_by_identity() {
+    let node = || {
+        json!({"type": "canvas", "mode": "2d", "projection": "free", "scale": 1, "width": 200, "height": 100,
+            "drawables": [
+                {"id": "box", "type": "draw-shape", "shape": "rect", "position": {"x": 1, "y": 2}, "width": 10, "height": 5, "fill": "#112233"},
+                {"id": "label", "type": "draw-text", "text": "one", "font": "12px sans-serif", "position": {"x": 5, "y": 5}}
+            ]})
+    };
+    let first = prepare_doc(&SceneDoc::split(node()), &mut ThemeMemo::default()).unwrap();
+    let again = prepare_doc(&SceneDoc::split(node()), &mut ThemeMemo::default()).unwrap();
+    let (old, new) = (first.drawables.as_ref().unwrap(), again.drawables.as_ref().unwrap());
+    assert!(!std::sync::Arc::ptr_eq(&old[0], &new[0]), "control: the second scene carries its own copies");
+    let mut cache = DrawableCache::default();
+    let _ = from_prepared_doc_cached(&first, Some((200.0, 100.0)), 0.0, &mut cache).unwrap();
+    let held_before = std::sync::Arc::strong_count(&old[0]);
+    let _ = from_prepared_doc_cached(&again, Some((200.0, 100.0)), 0.0, &mut cache).unwrap();
+    assert_eq!(cache.reused, 2, "equal drawables are replayed");
+    assert_eq!(std::sync::Arc::strong_count(&new[0]), 2, "the cache now holds the copy it was just shown");
+    assert_eq!(std::sync::Arc::strong_count(&old[0]), held_before - 1, "and let the old one go");
+}
+
 fn clocked_scene(looping: bool) -> Value {
     free_props(json!([
         rect_shape(json!({"id": "still"})),
         rect_shape(json!({"id": "moving",
-            "animation": {"durationMs": 400, "startMs": 1000, "loop": looping, "keyframes": [{"at": 0, "opacity": 0}, {"at": 1, "opacity": 1}]}})),
+            "animation": {"durationMs": 400, "startMs": 1000, "loop": looping, "keyframes": [{"at": 0, "scale": 0.5}, {"at": 1, "scale": 1}]}})),
         {"type": "draw-text", "id": "label", "text": "Name", "position": {"x": 5, "y": 5}}
     ]))
 }

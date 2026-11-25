@@ -132,6 +132,10 @@ pub struct SharedDeviceRenderer {
     frame_count: u64,
     /// Buffers made for one frame's draws; destroyed after that frame's submit (wgpu's web backend never frees on drop).
     transient: std::sync::Mutex<Vec<wgpu::Buffer>>,
+    /// Glyph instance buffers made so far (observability for tests).
+    glyph_buffers_made: std::sync::atomic::AtomicU64,
+    /// Glyph instance buffers kept across frames: a later frame writes into one no draw of that frame uses yet.
+    glyph_buffers: std::sync::Mutex<Vec<glyphs::GlyphBuffer>>,
 }
 
 impl SharedDeviceRenderer {
@@ -217,6 +221,8 @@ impl SharedDeviceRenderer {
             clip_masks: std::collections::HashMap::new(),
             frame_count: 0,
             transient: Default::default(),
+            glyph_buffers_made: Default::default(),
+            glyph_buffers: Default::default(),
         }
     }
 
@@ -317,6 +323,7 @@ impl SharedDeviceRenderer {
             self.frame_epoch = self.use_clock;
             self.frame_count += 1;
             self.prune_clip_surfaces();
+            self.prune_glyph_buffers();
             if let Some(glyphs) = self.glyphs.as_mut() {
                 glyphs.begin_frame();
             }

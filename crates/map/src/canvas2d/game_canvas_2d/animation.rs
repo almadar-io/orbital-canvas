@@ -288,6 +288,25 @@ pub(super) fn epoch_rest_node(node: &Value) -> Value {
     rest
 }
 
+/// Whether anything under `node` moves with the epoch clock (an fx, an emitter, a text reveal, a `startMs`
+/// animation), and the instant all of it has ended by (infinite when one runs on, `None` when none says).
+pub fn clocked_span(node: &Value) -> (bool, Option<f64>) {
+    let until = [
+        active_fx_until(node),
+        crate::emitter::live_until(node),
+        crate::text_reveal::live_until(node),
+        started_animation_until(node),
+    ]
+    .into_iter()
+    .flatten()
+    .reduce(f64::max);
+    let timed = has_active_fx(node)
+        || crate::emitter::has_emitter(node)
+        || crate::text_reveal::has_reveal(node)
+        || has_started_animation(node);
+    (timed, until)
+}
+
 /// Whether any drawable under `node` declares an animation with a `startMs`.
 pub fn has_started_animation(node: &Value) -> bool {
     let mut found = false;

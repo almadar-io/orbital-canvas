@@ -475,16 +475,4 @@ impl GlyphPass {
         }
         Some(runs)
     }
-
-    /// A vertex buffer of `instances` for one draw.
-    pub(crate) fn instance_buffer(
-        device: &wgpu::Device,
-        instances: &[GlyphInstance],
-    ) -> wgpu::Buffer {
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("glyph instances"),
-            contents: bytemuck::cast_slice(instances),
-            usage: wgpu::BufferUsages::VERTEX,
-        })
-    }
 }

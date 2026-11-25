@@ -19,8 +19,9 @@ pub struct WebSceneCanvas {
 impl WebSceneCanvas {
     pub async fn new(canvas: web_sys::HtmlCanvasElement) -> Result<Self, String> {
         let (opened, config) = open_canvas(canvas).await?;
-        let mut host = SceneHost::new();
-        host.set_viewport(config.width, config.height);
+        // No viewport yet: the element's size until the page lays it out is the browser's default, not the
+        // surface's. `resize` gives the measured one with its scale.
+        let host = SceneHost::new();
         Ok(Self {
             renderer: SharedDeviceRenderer::new(
                 opened.device.clone(),
@@ -56,8 +57,7 @@ impl WebSceneCanvas {
         self.config.height = (css_height.max(1.0) * pixel_ratio).round().max(1.0) as u32;
         self.surface.configure(&self.device, &self.config);
         self.host
-            .set_viewport(self.config.width, self.config.height);
-        self.host.set_scale(pixel_ratio)
+            .set_surface(self.config.width, self.config.height, pixel_ratio)
     }
 
     pub fn set_motion(&mut self, enabled: bool) {
@@ -117,56 +117,7 @@ impl WebSceneCanvas {
 
     /// The semantic tree as a JSON array in reading order, each node's rect in CSS pixels.
     pub fn semantic_tree(&self) -> String {
-        let nodes: Vec<serde_json::Value> = self
-            .host
-            .semantic_tree()
-            .iter()
-            .map(|n| {
-                let mut o = serde_json::Map::new();
-                o.insert("id".into(), n.id.clone().into());
-                o.insert("role".into(), n.role.clone().into());
-                o.insert("name".into(), n.name.clone().into());
-                if let Some(v) = &n.value {
-                    o.insert("value".into(), v.clone().into());
-                }
-                if let Some(c) = n.checked {
-                    o.insert("checked".into(), c.into());
-                }
-                o.insert("disabled".into(), n.disabled.into());
-                o.insert("focused".into(), n.focused.into());
-                if let Some(c) = n.caret {
-                    o.insert("caret".into(), c.into());
-                }
-                if let Some(c) = n.selection_start {
-                    o.insert("selectionStart".into(), c.into());
-                }
-                if let Some(c) = n.selection_end {
-                    o.insert("selectionEnd".into(), c.into());
-                }
-                o.insert("multiline".into(), n.multiline.into());
-                if let Some(l) = n.level {
-                    o.insert("level".into(), l.into());
-                }
-                if let Some(h) = &n.href {
-                    o.insert("href".into(), h.clone().into());
-                }
-                if let Some(e) = n.expanded {
-                    o.insert("expanded".into(), e.into());
-                }
-                if let Some(w) = &n.owner {
-                    o.insert("owner".into(), w.clone().into());
-                }
-                o.insert("order".into(), serde_json::json!(n.order));
-                o.insert(
-                    "rect".into(),
-                    serde_json::json!({
-                        "x": n.rect.x, "y": n.rect.y, "w": n.rect.w, "h": n.rect.h
-                    }),
-                );
-                serde_json::Value::Object(o)
-            })
-            .collect();
-        serde_json::Value::Array(nodes).to_string()
+        self.host.semantic_tree_json()
     }
 
     /// A contrast audit of the drawn frame, taken now and run later: it owns everything it needs, so the canvas keeps

@@ -173,34 +173,261 @@ pub fn hash_commands_from<'a>(
         1.0,
     );
     for command in &moved {
-        hash_rounded(&serde_json::to_value(command)?, state);
+        serde::Serialize::serialize(command, &mut RoundedHash(state))?;
     }
     Ok(())
 }
 
-fn hash_rounded(value: &serde_json::Value, state: &mut impl Hasher) {
-    use serde_json::Value;
-    match value {
-        Value::Null => 0u8.hash(state),
-        Value::Bool(b) => (1u8, b).hash(state),
-        Value::Number(n) => match n.as_f64() {
-            Some(f) => (2u8, (f * HASH_STEPS_PER_UNIT).round() as i64).hash(state),
-            None => (3u8, n.to_string()).hash(state),
-        },
-        Value::String(s) => (4u8, s).hash(state),
-        Value::Array(items) => {
-            (5u8, items.len()).hash(state);
-            for item in items {
-                hash_rounded(item, state);
-            }
-        }
-        Value::Object(fields) => {
-            (6u8, fields.len()).hash(state);
-            for (key, item) in fields {
-                key.hash(state);
-                hash_rounded(item, state);
-            }
-        }
+/// A serializer that feeds what it is given into a hasher, every number rounded to 1/[`HASH_STEPS_PER_UNIT`]: the
+/// content of a command without building it as a value first.
+struct RoundedHash<'a, H: Hasher>(&'a mut H);
+
+const HASH_NULL: u8 = 0;
+const HASH_BOOL: u8 = 1;
+const HASH_NUMBER: u8 = 2;
+const HASH_TEXT: u8 = 4;
+const HASH_LIST: u8 = 5;
+const HASH_FIELDS: u8 = 6;
+const HASH_END: u8 = 7;
+
+impl<H: Hasher> RoundedHash<'_, H> {
+    fn number(&mut self, n: f64) {
+        (HASH_NUMBER, (n * HASH_STEPS_PER_UNIT).round() as i64).hash(self.0);
+    }
+}
+
+type HashResult = Result<(), serde_json::Error>;
+
+impl<'a, 'b, H: Hasher> serde::Serializer for &'a mut RoundedHash<'b, H> {
+    type Ok = ();
+    type Error = serde_json::Error;
+    type SerializeSeq = Self;
+    type SerializeTuple = Self;
+    type SerializeTupleStruct = Self;
+    type SerializeTupleVariant = Self;
+    type SerializeMap = Self;
+    type SerializeStruct = Self;
+    type SerializeStructVariant = Self;
+
+    fn serialize_bool(self, v: bool) -> HashResult {
+        (HASH_BOOL, v).hash(self.0);
+        Ok(())
+    }
+    fn serialize_i8(self, v: i8) -> HashResult {
+        self.number(v as f64);
+        Ok(())
+    }
+    fn serialize_i16(self, v: i16) -> HashResult {
+        self.number(v as f64);
+        Ok(())
+    }
+    fn serialize_i32(self, v: i32) -> HashResult {
+        self.number(v as f64);
+        Ok(())
+    }
+    fn serialize_i64(self, v: i64) -> HashResult {
+        self.number(v as f64);
+        Ok(())
+    }
+    fn serialize_u8(self, v: u8) -> HashResult {
+        self.number(v as f64);
+        Ok(())
+    }
+    fn serialize_u16(self, v: u16) -> HashResult {
+        self.number(v as f64);
+        Ok(())
+    }
+    fn serialize_u32(self, v: u32) -> HashResult {
+        self.number(v as f64);
+        Ok(())
+    }
+    fn serialize_u64(self, v: u64) -> HashResult {
+        self.number(v as f64);
+        Ok(())
+    }
+    fn serialize_f32(self, v: f32) -> HashResult {
+        self.number(v as f64);
+        Ok(())
+    }
+    fn serialize_f64(self, v: f64) -> HashResult {
+        self.number(v);
+        Ok(())
+    }
+    fn serialize_char(self, v: char) -> HashResult {
+        (HASH_TEXT, v).hash(self.0);
+        Ok(())
+    }
+    fn serialize_str(self, v: &str) -> HashResult {
+        (HASH_TEXT, v).hash(self.0);
+        Ok(())
+    }
+    fn serialize_bytes(self, v: &[u8]) -> HashResult {
+        (HASH_LIST, v).hash(self.0);
+        HASH_END.hash(self.0);
+        Ok(())
+    }
+    fn serialize_none(self) -> HashResult {
+        HASH_NULL.hash(self.0);
+        Ok(())
+    }
+    fn serialize_some<T: ?Sized + serde::Serialize>(self, value: &T) -> HashResult {
+        value.serialize(self)
+    }
+    fn serialize_unit(self) -> HashResult {
+        HASH_NULL.hash(self.0);
+        Ok(())
+    }
+    fn serialize_unit_struct(self, _name: &'static str) -> HashResult {
+        HASH_NULL.hash(self.0);
+        Ok(())
+    }
+    fn serialize_unit_variant(self, _name: &'static str, _index: u32, variant: &'static str) -> HashResult {
+        (HASH_TEXT, variant).hash(self.0);
+        Ok(())
+    }
+    fn serialize_newtype_struct<T: ?Sized + serde::Serialize>(self, _name: &'static str, value: &T) -> HashResult {
+        value.serialize(self)
+    }
+    fn serialize_newtype_variant<T: ?Sized + serde::Serialize>(
+        self,
+        _name: &'static str,
+        _index: u32,
+        variant: &'static str,
+        value: &T,
+    ) -> HashResult {
+        (HASH_FIELDS, variant).hash(self.0);
+        value.serialize(&mut *self)?;
+        HASH_END.hash(self.0);
+        Ok(())
+    }
+    fn serialize_seq(self, _len: Option<usize>) -> Result<Self, serde_json::Error> {
+        HASH_LIST.hash(self.0);
+        Ok(self)
+    }
+    fn serialize_tuple(self, _len: usize) -> Result<Self, serde_json::Error> {
+        HASH_LIST.hash(self.0);
+        Ok(self)
+    }
+    fn serialize_tuple_struct(self, _name: &'static str, _len: usize) -> Result<Self, serde_json::Error> {
+        HASH_LIST.hash(self.0);
+        Ok(self)
+    }
+    fn serialize_tuple_variant(
+        self,
+        _name: &'static str,
+        _index: u32,
+        variant: &'static str,
+        _len: usize,
+    ) -> Result<Self, serde_json::Error> {
+        (HASH_FIELDS, variant, HASH_LIST).hash(self.0);
+        Ok(self)
+    }
+    fn serialize_map(self, _len: Option<usize>) -> Result<Self, serde_json::Error> {
+        HASH_FIELDS.hash(self.0);
+        Ok(self)
+    }
+    fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<Self, serde_json::Error> {
+        HASH_FIELDS.hash(self.0);
+        Ok(self)
+    }
+    fn serialize_struct_variant(
+        self,
+        _name: &'static str,
+        _index: u32,
+        variant: &'static str,
+        _len: usize,
+    ) -> Result<Self, serde_json::Error> {
+        (HASH_FIELDS, variant, HASH_FIELDS).hash(self.0);
+        Ok(self)
+    }
+}
+
+impl<H: Hasher> serde::ser::SerializeSeq for &mut RoundedHash<'_, H> {
+    type Ok = ();
+    type Error = serde_json::Error;
+    fn serialize_element<T: ?Sized + serde::Serialize>(&mut self, value: &T) -> HashResult {
+        value.serialize(&mut **self)
+    }
+    fn end(self) -> HashResult {
+        HASH_END.hash(self.0);
+        Ok(())
+    }
+}
+
+impl<H: Hasher> serde::ser::SerializeTuple for &mut RoundedHash<'_, H> {
+    type Ok = ();
+    type Error = serde_json::Error;
+    fn serialize_element<T: ?Sized + serde::Serialize>(&mut self, value: &T) -> HashResult {
+        value.serialize(&mut **self)
+    }
+    fn end(self) -> HashResult {
+        HASH_END.hash(self.0);
+        Ok(())
+    }
+}
+
+impl<H: Hasher> serde::ser::SerializeTupleStruct for &mut RoundedHash<'_, H> {
+    type Ok = ();
+    type Error = serde_json::Error;
+    fn serialize_field<T: ?Sized + serde::Serialize>(&mut self, value: &T) -> HashResult {
+        value.serialize(&mut **self)
+    }
+    fn end(self) -> HashResult {
+        HASH_END.hash(self.0);
+        Ok(())
+    }
+}
+
+impl<H: Hasher> serde::ser::SerializeTupleVariant for &mut RoundedHash<'_, H> {
+    type Ok = ();
+    type Error = serde_json::Error;
+    fn serialize_field<T: ?Sized + serde::Serialize>(&mut self, value: &T) -> HashResult {
+        value.serialize(&mut **self)
+    }
+    fn end(self) -> HashResult {
+        (HASH_END, HASH_END).hash(self.0);
+        Ok(())
+    }
+}
+
+impl<H: Hasher> serde::ser::SerializeMap for &mut RoundedHash<'_, H> {
+    type Ok = ();
+    type Error = serde_json::Error;
+    fn serialize_key<T: ?Sized + serde::Serialize>(&mut self, key: &T) -> HashResult {
+        key.serialize(&mut **self)
+    }
+    fn serialize_value<T: ?Sized + serde::Serialize>(&mut self, value: &T) -> HashResult {
+        value.serialize(&mut **self)
+    }
+    fn end(self) -> HashResult {
+        HASH_END.hash(self.0);
+        Ok(())
+    }
+}
+
+impl<H: Hasher> serde::ser::SerializeStruct for &mut RoundedHash<'_, H> {
+    type Ok = ();
+    type Error = serde_json::Error;
+    fn serialize_field<T: ?Sized + serde::Serialize>(&mut self, key: &'static str, value: &T) -> HashResult {
+        key.hash(self.0);
+        value.serialize(&mut **self)
+    }
+    fn end(self) -> HashResult {
+        HASH_END.hash(self.0);
+        Ok(())
+    }
+}
+
+impl<H: Hasher> serde::ser::SerializeStructVariant for &mut RoundedHash<'_, H> {
+    type Ok = ();
+    type Error = serde_json::Error;
+    fn serialize_field<T: ?Sized + serde::Serialize>(&mut self, key: &'static str, value: &T) -> HashResult {
+        key.hash(self.0);
+        value.serialize(&mut **self)
+    }
+    fn end(self) -> HashResult {
+        (HASH_END, HASH_END).hash(self.0);
+        Ok(())
     }
 }
 
@@ -375,6 +602,59 @@ mod tests {
             key(path(100.25, 10.3, 1.0), 100.0, 10.0),
             key(path(100.25, 10.3, 0.5), 100.0, 10.0),
             "control: another colour"
+        );
+    }
+
+    #[test]
+    fn commands_hashed_from_their_origin_round_numbers_and_tell_structure_apart() {
+        use crate::packet::{PathSegment, Vec2};
+        let line = |x: f32, segments: usize| DrawCommand::Path {
+            segments: std::iter::once(PathSegment::MoveTo { x, y: 0.0 })
+                .chain((0..segments).map(|i| PathSegment::LineTo {
+                    x: x + 1.0 + i as f32,
+                    y: 2.0,
+                }))
+                .collect(),
+            fill: None,
+            stroke: None,
+        };
+        let key = |commands: &[DrawCommand]| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hash_commands_from(commands, Vec2::default(), &mut hasher).expect("serializable");
+            hasher.finish()
+        };
+        assert_eq!(
+            key(&[line(1.0, 2)]),
+            key(&[line(1.00005, 2)]),
+            "a difference below a 4096th of a unit is the same run"
+        );
+        assert_ne!(
+            key(&[line(1.0, 2)]),
+            key(&[line(1.001, 2)]),
+            "control: a difference above it is another run"
+        );
+        assert_ne!(
+            key(&[line(1.0, 2)]),
+            key(&[line(1.0, 3)]),
+            "one more segment is another run"
+        );
+        assert_ne!(
+            key(&[line(1.0, 1), line(1.0, 1)]),
+            key(&[line(1.0, 1)]),
+            "one more command is another run"
+        );
+        assert_ne!(
+            key(&[DrawCommand::Path {
+                segments: vec![PathSegment::MoveTo { x: 1.0, y: 0.0 }],
+                fill: Some([0.0, 0.0, 0.0, 1.0]),
+                stroke: None,
+            }]),
+            key(&[DrawCommand::Path {
+                segments: vec![PathSegment::MoveTo { x: 1.0, y: 0.0 }],
+                fill: None,
+                stroke: None,
+            }]),
+            "a fill that is given is not a fill that is absent"
         );
     }
 

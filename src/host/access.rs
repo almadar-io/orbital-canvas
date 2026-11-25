@@ -32,6 +32,86 @@ impl AccessAction {
 }
 
 impl SceneHost {
+    /// A number that moves whenever [`Self::semantic_tree`] would answer differently (the nodes were replaced, or the
+    /// page scrolled) and stays while it would not: a host reads the tree again only when this moves.
+    pub fn semantic_revision(&self) -> u32 {
+        let now = (self.semantic_installs, self.page_scroll.offset.to_bits());
+        let mut seen = self
+            .semantic_seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seen.0 != now {
+            *seen = (now, seen.1.wrapping_add(1));
+        }
+        seen.1
+    }
+
+    /// [`Self::semantic_tree`] as a JSON array in reading order, each node's rect in CSS pixels.
+    pub fn semantic_tree_json(&self) -> String {
+        let revision = self.semantic_revision();
+        let mut kept = self
+            .semantic_json
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, json)) = kept.as_ref().filter(|(at, _)| *at == revision) {
+            return json.clone();
+        }
+        #[cfg(test)]
+        self.semantic_json_builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nodes: Vec<serde_json::Value> = self
+            .semantic_tree()
+            .iter()
+            .map(|n| {
+                let mut o = serde_json::Map::new();
+                o.insert("id".into(), n.id.clone().into());
+                o.insert("role".into(), n.role.clone().into());
+                o.insert("name".into(), n.name.clone().into());
+                if let Some(v) = &n.value {
+                    o.insert("value".into(), v.clone().into());
+                }
+                if let Some(c) = n.checked {
+                    o.insert("checked".into(), c.into());
+                }
+                o.insert("disabled".into(), n.disabled.into());
+                o.insert("focused".into(), n.focused.into());
+                if let Some(c) = n.caret {
+                    o.insert("caret".into(), c.into());
+                }
+                if let Some(c) = n.selection_start {
+                    o.insert("selectionStart".into(), c.into());
+                }
+                if let Some(c) = n.selection_end {
+                    o.insert("selectionEnd".into(), c.into());
+                }
+                o.insert("multiline".into(), n.multiline.into());
+                if let Some(l) = n.level {
+                    o.insert("level".into(), l.into());
+                }
+                if let Some(h) = &n.href {
+                    o.insert("href".into(), h.clone().into());
+                }
+                if let Some(e) = n.expanded {
+                    o.insert("expanded".into(), e.into());
+                }
+                if let Some(w) = &n.owner {
+                    o.insert("owner".into(), w.clone().into());
+                }
+                o.insert("order".into(), serde_json::json!(n.order));
+                o.insert(
+                    "rect".into(),
+                    serde_json::json!({
+                        "x": n.rect.x, "y": n.rect.y, "w": n.rect.w, "h": n.rect.h
+                    }),
+                );
+                serde_json::Value::Object(o)
+            })
+            .collect();
+        let json = serde_json::Value::Array(nodes).to_string();
+        *kept = Some((revision, json.clone()));
+        json
+    }
+
     /// The semantic tree of the current scene, in reading order.
     pub fn semantic_tree(&self) -> Vec<mappers::scene::SemanticNode> {
         let offset = self.page_scroll.offset;
