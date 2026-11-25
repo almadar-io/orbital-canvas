@@ -45,6 +45,12 @@ impl WebSceneCanvas {
         self.host.set_scene(node).map_err(|e| e.to_string())
     }
 
+    /// [`Self::set_scene`] of the node `text` holds; a drawable whose text did not change since the last scene is
+    /// not read again.
+    pub fn set_scene_text(&mut self, text: &str) -> Result<(), String> {
+        self.host.set_scene_text(text)
+    }
+
     /// The element's CSS size and the device pixel ratio: the scene lays out in CSS pixels on a surface of
     /// their product.
     pub fn resize(

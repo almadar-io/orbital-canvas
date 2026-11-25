@@ -97,6 +97,8 @@ pub struct SceneHost {
     /// How many times the semantic nodes were replaced, and the (replacements, scroll offset) pair last named by
     /// [`Self::semantic_revision`] with the revision it was given.
     pub(crate) semantic_installs: u64,
+    /// What the scene's text was last read as ([`Self::set_scene_text`]).
+    pub(crate) scene_text: orbital_canvas_base::scene_doc::SceneTextMemo,
     pub(crate) semantic_seen: std::sync::Mutex<((u64, u32), u32)>,
     /// The JSON of the semantic tree at the revision it was written for ([`Self::semantic_tree_json`]).
     pub(crate) semantic_json: std::sync::Mutex<Option<(u32, String)>>,
@@ -179,6 +181,7 @@ impl SceneHost {
             measured: Vec::new(),
             measure_reported: Vec::new(),
             semantic_installs: 0,
+            scene_text: Default::default(),
             semantic_seen: std::sync::Mutex::new(((0, 0), 0)),
             semantic_json: Default::default(),
             #[cfg(test)]
@@ -279,6 +282,20 @@ impl SceneHost {
             orbital_canvas_base::scene_doc::SceneDoc::whole(node)
         };
         self.set_scene_doc(doc)
+    }
+
+    /// [`Self::set_scene`] of the node `text` holds, for a host that has the scene as text (the web): the frame and
+    /// each top-level drawable whose text is the one last read are the values already held, so a scene sent again
+    /// costs the drawables that changed.
+    pub fn set_scene_text(&mut self, text: &str) -> std::result::Result<(), String> {
+        let doc = orbital_canvas_base::scene_doc::SceneDoc::split_text(text, &mut self.scene_text)
+            .map_err(|e| format!("node_json: {e}"))?;
+        let doc = if mappers::scene::walks_drawables(&doc.frame) {
+            doc
+        } else {
+            orbital_canvas_base::scene_doc::SceneDoc::whole(doc.node())
+        };
+        self.set_scene_doc(doc).map_err(|e| e.to_string())
     }
 
     /// [`Self::set_scene`] of a scene whose drawables the caller already holds apart: a drawable shared with the

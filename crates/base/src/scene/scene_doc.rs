@@ -72,10 +72,276 @@ impl SceneDoc {
     }
 }
 
+/// What a scene's text was last read as, piece by piece: its frame and each top-level drawable, by their text.
+#[derive(Debug, Default)]
+pub struct SceneTextMemo {
+    /// Drawables of the last scene read whose text was parsed, the rest having been handed back (observability).
+    pub parsed: usize,
+    /// The text before and after the drawables list, and the frame it parsed to.
+    frame: Option<(String, String, Arc<Value>)>,
+    /// Each drawable of the last scene by its text.
+    drawables: std::collections::HashMap<Box<str>, Arc<Value>>,
+}
+
+impl SceneDoc {
+    /// [`Self::split`] of the node `text` holds. A frame or a top-level drawable whose text is the one `memo` last
+    /// read is handed back as the value it was read to, shared, so a scene sent again as text costs its changed
+    /// drawables, not all of them.
+    pub fn split_text(text: &str, memo: &mut SceneTextMemo) -> serde_json::Result<SceneDoc> {
+        let Some((list, items)) = text_drawables(text) else {
+            *memo = SceneTextMemo::default();
+            let doc = Self::split(serde_json::from_str(text)?);
+            memo.parsed = doc.drawables.as_ref().map_or(0, |listed| listed.len());
+            return Ok(doc);
+        };
+        let (before, after) = (&text[..list.0], &text[list.1..]);
+        let frame = match memo.frame.as_ref().filter(|(b, a, _)| b == before && a == after) {
+            Some((_, _, frame)) => Arc::clone(frame),
+            None => {
+                let mut node: Value = serde_json::from_str(&[before, "[]", after].concat())?;
+                let root = if node.get("props").is_some_and(Value::is_object) { &mut node["props"] } else { &mut node };
+                if let Some(fields) = root.as_object_mut() {
+                    fields.remove("drawables");
+                }
+                let frame = Arc::new(node);
+                memo.frame = Some((before.to_owned(), after.to_owned(), Arc::clone(&frame)));
+                frame
+            }
+        };
+        let mut held = std::collections::HashMap::with_capacity(items.len());
+        let mut listed = Vec::with_capacity(items.len());
+        let mut parsed = 0;
+        for (start, end) in items {
+            let piece = &text[start..end];
+            let drawable = match memo.drawables.remove_entry(piece) {
+                Some((key, drawable)) => {
+                    held.insert(key, Arc::clone(&drawable));
+                    drawable
+                }
+                None => match held.get(piece) {
+                    Some(drawable) => Arc::clone(drawable),
+                    None => {
+                        parsed += 1;
+                        let drawable: Arc<Value> = Arc::new(serde_json::from_str(piece)?);
+                        held.insert(piece.into(), Arc::clone(&drawable));
+                        drawable
+                    }
+                },
+            };
+            listed.push(drawable);
+        }
+        memo.drawables = held;
+        memo.parsed = parsed;
+        Ok(Self { frame, drawables: Some(Arc::new(listed)) })
+    }
+}
+
+/// Where a piece of text starts and ends.
+type Span = (usize, usize);
+
+/// An object member as written: its key and where its value sits.
+type Member<'a> = (&'a str, Span);
+
+/// Where the list [`SceneDoc::split`] moves out sits in a node's text, and where each of its items does; `None`
+/// when the text is not plainly an object with one such list (the caller then parses it whole).
+fn text_drawables(text: &str) -> Option<(Span, Vec<Span>)> {
+    let bytes = text.as_bytes();
+    let (root, end) = text_members(text, skip_space(bytes, 0))?;
+    if skip_space(bytes, end) != bytes.len() {
+        return None;
+    }
+    let only = |members: &[Member], key: &str| {
+        let mut found = members.iter().filter(|(k, _)| *k == key);
+        match (found.next(), found.next()) {
+            (first, None) => Some(first.map(|(_, span)| *span)),
+            _ => None,
+        }
+    };
+    let props = only(&root, "props")?.filter(|span| bytes[span.0] == b'{');
+    let list = match props {
+        Some(span) => only(&text_members(text, span.0)?.0, "drawables")?,
+        None => only(&root, "drawables")?,
+    }?;
+    if bytes[list.0] != b'[' {
+        return None;
+    }
+    let mut items = Vec::new();
+    let mut at = skip_space(bytes, list.0 + 1);
+    if bytes.get(at) != Some(&b']') {
+        loop {
+            let end = skip_value(bytes, at)?;
+            items.push((at, end));
+            at = skip_space(bytes, end);
+            match bytes.get(at)? {
+                b',' => at = skip_space(bytes, at + 1),
+                b']' => break,
+                _ => return None,
+            }
+        }
+    }
+    Some((list, items))
+}
+
+/// The members of the object that opens at `at`, each key (as written, never one with an escape) with the span of
+/// its value, and where the object ends.
+fn text_members(text: &str, at: usize) -> Option<(Vec<Member<'_>>, usize)> {
+    let bytes = text.as_bytes();
+    if bytes.get(at) != Some(&b'{') {
+        return None;
+    }
+    let mut members = Vec::new();
+    let mut at = skip_space(bytes, at + 1);
+    if bytes.get(at) == Some(&b'}') {
+        return Some((members, at + 1));
+    }
+    loop {
+        let key_end = skip_string(bytes, at)?;
+        let key = text.get(at + 1..key_end - 1)?;
+        if key.contains('\\') {
+            return None;
+        }
+        at = skip_space(bytes, key_end);
+        if bytes.get(at) != Some(&b':') {
+            return None;
+        }
+        at = skip_space(bytes, at + 1);
+        let end = skip_value(bytes, at)?;
+        members.push((key, (at, end)));
+        at = skip_space(bytes, end);
+        match bytes.get(at)? {
+            b',' => at = skip_space(bytes, at + 1),
+            b'}' => return Some((members, at + 1)),
+            _ => return None,
+        }
+    }
+}
+
+fn skip_space(bytes: &[u8], mut at: usize) -> usize {
+    while matches!(bytes.get(at), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+        at += 1;
+    }
+    at
+}
+
+/// Past the string that opens at `at`.
+fn skip_string(bytes: &[u8], at: usize) -> Option<usize> {
+    if bytes.get(at) != Some(&b'"') {
+        return None;
+    }
+    let mut at = at + 1;
+    loop {
+        match bytes.get(at)? {
+            b'"' => return Some(at + 1),
+            b'\\' => at += 2,
+            _ => at += 1,
+        }
+    }
+}
+
+/// Past the value that starts at `at`: a string, an object or a list with everything inside it, or a bare word.
+fn skip_value(bytes: &[u8], at: usize) -> Option<usize> {
+    match bytes.get(at)? {
+        b'"' => skip_string(bytes, at),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut at = at;
+            loop {
+                match bytes.get(at)? {
+                    b'"' => {
+                        at = skip_string(bytes, at)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(at + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                at += 1;
+            }
+        }
+        b',' | b'}' | b']' | b':' => None,
+        _ => {
+            let mut end = at;
+            while !matches!(bytes.get(end), None | Some(b',' | b'}' | b']' | b' ' | b'\n' | b'\r' | b'\t')) {
+                end += 1;
+            }
+            Some(end)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SceneDoc;
+    use super::{SceneDoc, SceneTextMemo};
     use serde_json::json;
+
+    fn scene_text(label: &str, extra: &str) -> String {
+        format!(
+            r#"{{"type":"canvas","width":3,"drawables":[{{"id":"a","text":"br[ack]et {{ \" , ]"}},{{"id":"b","text":"{label}","items":[[1,2],[3,{{"k":"]"}}]]}}{extra}],"children":[{{"id":"c"}}]}}"#
+        )
+    }
+
+    #[test]
+    fn a_scene_read_from_text_is_the_scene_split_from_its_parsed_node() {
+        let texts = [
+            scene_text("one", ""),
+            scene_text("one", r#",{"id":"d"}"#),
+            r#"{"type":"canvas","props":{"width":3,"drawables":[{"id":"a"},  {"id":"b"} ]},"drawables":"kept"}"#.to_owned(),
+            " {\n \"type\" : \"canvas\" ,\n \"drawables\" : [ ] , \"z\" : [1, 2] }\n".to_owned(),
+            r#"{"type":"canvas","drawables":[1,"two",null,[3],{"id":"e"}]}"#.to_owned(),
+            r#"{"type":"canvas","children":[{"id":"c"}]}"#.to_owned(),
+            r#"{"type":"canvas","drawables":{"not":"a list"}}"#.to_owned(),
+            r#"{"type":"canvas","drawables":[{"id":"a"}],"drawables":[{"id":"z"}]}"#.to_owned(),
+            r#"{"type":"canvas","props":"flat","drawables":[{"id":"a"}]}"#.to_owned(),
+            r#"["not","an","object"]"#.to_owned(),
+        ];
+        let mut memo = SceneTextMemo::default();
+        for text in &texts {
+            let node: serde_json::Value = serde_json::from_str(text).unwrap();
+            let expected = SceneDoc::split(node);
+            assert_eq!(SceneDoc::split_text(text, &mut memo).unwrap(), expected, "{text}");
+            assert_eq!(SceneDoc::split_text(text, &mut memo).unwrap(), expected, "read again from the memo: {text}");
+        }
+        assert!(SceneDoc::split_text(r#"{"type":"canvas","drawables":[{"id":"a"},]}"#, &mut memo).is_err(), "edge: malformed text is refused");
+        assert!(SceneDoc::split_text("", &mut memo).is_err(), "edge: empty text is refused");
+    }
+
+    #[test]
+    fn a_scene_read_again_shares_every_piece_whose_text_did_not_change() {
+        let mut memo = SceneTextMemo::default();
+        let first = SceneDoc::split_text(&scene_text("one", ""), &mut memo).unwrap();
+        assert_eq!(memo.parsed, 2, "control: a first read parses every drawable");
+        let again = SceneDoc::split_text(&scene_text("two", ""), &mut memo).unwrap();
+        let (before, after) = (first.drawables.as_ref().unwrap(), again.drawables.as_ref().unwrap());
+        assert_eq!(memo.parsed, 1, "only the drawable whose text changed is parsed");
+        assert!(std::sync::Arc::ptr_eq(&before[0], &after[0]), "the unchanged drawable is the one already held");
+        assert!(!std::sync::Arc::ptr_eq(&before[1], &after[1]), "control: the changed one is new");
+        assert_eq!(after[1]["text"], json!("two"));
+        assert!(std::sync::Arc::ptr_eq(&first.frame, &again.frame), "the frame around them did not change either");
+        let grown = SceneDoc::split_text(&scene_text("two", r#",{"id":"d"}"#), &mut memo).unwrap();
+        let later = grown.drawables.as_ref().unwrap();
+        assert_eq!(memo.parsed, 1, "an added drawable is the only one parsed");
+        assert!(std::sync::Arc::ptr_eq(&after[1], &later[1]));
+        let moved = SceneDoc::split_text(
+            r#"{"type":"canvas","width":3,"drawables":[{"id":"d"},{"id":"a","text":"br[ack]et { \" , ]"}],"children":[{"id":"c"}]}"#,
+            &mut memo,
+        )
+        .unwrap();
+        assert_eq!(memo.parsed, 0, "a drawable at another place in the list is still the one held");
+        assert!(std::sync::Arc::ptr_eq(&later[2], &moved.drawables.as_ref().unwrap()[0]));
+        assert!(std::sync::Arc::ptr_eq(&later[0], &moved.drawables.as_ref().unwrap()[1]));
+        let resized = SceneDoc::split_text(
+            r#"{"type":"canvas","width":9,"drawables":[{"id":"d"}],"children":[{"id":"c"}]}"#,
+            &mut memo,
+        )
+        .unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&moved.frame, &resized.frame), "control: a changed frame is read again");
+        assert_eq!(resized.frame["width"], json!(9));
+    }
 
     #[test]
     fn a_split_scene_is_the_same_scene_and_visits_its_drawables_in_the_same_order() {

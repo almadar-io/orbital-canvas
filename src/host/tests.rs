@@ -656,6 +656,51 @@ fn resize_is_sent_once_per_size_in_css_pixels() {
     assert_eq!(events(&mut r), vec!["RESIZED"], "new size: sent again");
 }
 
+fn text_scene(label: &str) -> String {
+    format!(
+        r##"{{"type":"canvas","mode":"2d","projection":"free","scale":1.0,"drawables":[{{"type":"draw-shape","id":"box","shape":"rect","position":{{"x":0,"y":0}},"width":10,"height":10,"fill":"#ff0000"}},{{"type":"draw-text","id":"label","text":"{label}","position":{{"x":5,"y":5}}}}]}}"##
+    )
+}
+
+#[test]
+fn a_scene_set_from_text_draws_what_its_parsed_node_draws_and_keeps_the_drawables_that_did_not_change() {
+    let mut from_text = SceneHost::new();
+    let mut from_node = SceneHost::new();
+    from_text.set_scene_text(&text_scene("one")).unwrap();
+    from_node.set_scene(serde_json::from_str::<serde_json::Value>(&text_scene("one")).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(from_text.frame_packet().unwrap()).unwrap(),
+        serde_json::to_value(from_node.frame_packet().unwrap()).unwrap(),
+        "the same frame either way"
+    );
+    let first = from_text.scene.clone().unwrap();
+    from_text.set_scene_text(&text_scene("two")).unwrap();
+    from_node.set_scene(serde_json::from_str::<serde_json::Value>(&text_scene("two")).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(from_text.frame_packet().unwrap()).unwrap(),
+        serde_json::to_value(from_node.frame_packet().unwrap()).unwrap(),
+        "and after a change"
+    );
+    let second = from_text.scene.clone().unwrap();
+    let (before, after) = (first.drawables.as_ref().unwrap(), second.drawables.as_ref().unwrap());
+    assert!(std::sync::Arc::ptr_eq(&before[0], &after[0]), "the drawable whose text did not change is the one held");
+    assert!(!std::sync::Arc::ptr_eq(&before[1], &after[1]), "control: the changed one is read again");
+    assert_eq!(from_text.scene_text.parsed, 1);
+    assert!(from_text.set_scene_text("{").is_err(), "edge: text that is not a node is refused");
+    assert_eq!(
+        serde_json::to_value(from_text.frame_packet().unwrap()).unwrap(),
+        serde_json::to_value(from_node.frame_packet().unwrap()).unwrap(),
+        "edge: a refused scene leaves the one before it drawn"
+    );
+    let graph = r#"{"type":"graph-canvas","drawables":[{"id":"n"}]}"#;
+    let mut whole = SceneHost::new();
+    let _ = whole.set_scene_text(graph);
+    assert!(
+        whole.scene.as_ref().is_none_or(|doc| doc.drawables.is_none()),
+        "control: a pattern that does not walk drawables keeps its node whole, as from a parsed node"
+    );
+}
+
 #[test]
 fn a_surface_given_its_size_and_scale_together_reports_one_size_in_points() {
     let mut r = host_with(serde_json::json!({"resizeEvent": "RESIZED"}));
