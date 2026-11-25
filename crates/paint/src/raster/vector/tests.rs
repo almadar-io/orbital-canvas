@@ -190,12 +190,18 @@ fn every_painting_command_has_a_box_and_only_state_and_whole_surface_ones_span_a
     );
     let faded = DrawCommand::Faded {
         opacity: 0.5,
+        scale: 1.0,
+        origin: Vec2::default(),
+        offset: Vec2::default(),
         commands: vec![sprite.clone()],
     };
     assert_eq!(command_bounds(&faded), command_bounds(&sprite));
     assert_eq!(
         command_bounds(&DrawCommand::Faded {
             opacity: 0.5,
+            scale: 1.0,
+            origin: Vec2::default(),
+            offset: Vec2::default(),
             commands: Vec::new()
         }),
         RunBounds::Empty
@@ -1477,4 +1483,38 @@ fn control_a_blur_of_no_spread_leaves_the_shape_sharp() {
     let sharp = rasterize(&[&none], 40, 40, 1.0, 1.0).unwrap();
     let plain = rasterize(&[&square], 40, 40, 1.0, 1.0).unwrap();
     assert_eq!(sharp, plain);
+}
+
+#[test]
+fn a_scaled_layer_is_bounded_where_its_scale_and_offset_put_it() {
+    let layer = |scale: f32| DrawCommand::Faded {
+        opacity: 1.0,
+        scale,
+        origin: Vec2 { x: 10.0, y: 20.0 },
+        offset: Vec2 { x: 3.0, y: 0.0 },
+        commands: vec![DrawCommand::Path {
+            segments: rect(10.0, 20.0, 30.0, 5.0),
+            fill: Some(RED),
+            stroke: None,
+        }],
+    };
+    assert_eq!(
+        command_bounds(&layer(2.0)),
+        RunBounds::Box {
+            x0: 13.0,
+            y0: 20.0,
+            x1: 73.0,
+            y1: 30.0
+        }
+    );
+    assert_eq!(
+        command_bounds(&layer(1.0)),
+        RunBounds::Box {
+            x0: 13.0,
+            y0: 20.0,
+            x1: 43.0,
+            y1: 25.0
+        },
+        "control: at scale 1 only the offset moves it"
+    );
 }

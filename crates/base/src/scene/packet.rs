@@ -408,6 +408,10 @@ fn default_saturate() -> f32 {
     1.0
 }
 
+fn default_layer_scale() -> f32 {
+    1.0
+}
+
 /// One path operation. Angles are radians in screen convention (0 = +x,
 /// increasing clockwise because y points down); an `Arc` sweeps from `start`
 /// to `end` in the direction of the difference, a full ellipse when it spans
@@ -623,8 +627,15 @@ pub enum DrawCommand {
     /// Composite one shape's vector operations with canvas `lighter` blending.
     AdditiveGroup { commands: Vec<DrawCommand> },
     /// Vector commands rasterized once and composited at `opacity`: the fade stays outside the cached content.
+    /// So does a scale: the commands are drawn `scale` times their size about `origin`, then moved by `offset`.
     Faded {
         opacity: f32,
+        #[serde(default = "default_layer_scale")]
+        scale: f32,
+        #[serde(default)]
+        origin: Vec2,
+        #[serde(default)]
+        offset: Vec2,
         commands: Vec<DrawCommand>,
     },
     /// Scope mixed child commands to an authored SVG path in packet pixels.

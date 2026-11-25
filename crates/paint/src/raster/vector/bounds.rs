@@ -247,9 +247,32 @@ pub fn command_bounds(command: &DrawCommand) -> RunBounds {
             .union(command_bounds(second))
             .grow(*radius),
         DrawCommand::SdfBackdrop { shape, .. } => command_bounds(shape),
-        DrawCommand::AdditiveGroup { commands } | DrawCommand::Faded { commands, .. } => commands
+        DrawCommand::AdditiveGroup { commands } => commands
             .iter()
             .fold(RunBounds::Empty, |acc, c| acc.union(command_bounds(c))),
+        DrawCommand::Faded {
+            scale,
+            origin,
+            offset,
+            commands,
+            ..
+        } => match commands
+            .iter()
+            .fold(RunBounds::Empty, |acc, c| acc.union(command_bounds(c)))
+        {
+            RunBounds::Box { x0, y0, x1, y1 } => {
+                let at = |v: f32, o: f32, t: f32| o + (v - o) * scale + t;
+                let (ax, bx) = (at(x0, origin.x, offset.x), at(x1, origin.x, offset.x));
+                let (ay, by) = (at(y0, origin.y, offset.y), at(y1, origin.y, offset.y));
+                RunBounds::Box {
+                    x0: ax.min(bx),
+                    y0: ay.min(by),
+                    x1: ax.max(bx),
+                    y1: ay.max(by),
+                }
+            }
+            other => other,
+        },
         DrawCommand::ClipGroup { clip, .. } => path_bounds(clip, None),
         DrawCommand::Clear { .. }
         | DrawCommand::Particles { .. }

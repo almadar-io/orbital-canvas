@@ -7,7 +7,7 @@ Every open gap this repo owns lives here. This file is the source of truth; the 
 - **Codes:** new gaps use this repo's prefix `G-ORBITAL-GAME-RENDERER-`. Take the "Next code" below, then bump it in the same edit. Codes are never reused or renamed.
 - **Close by deleting.** Remove the entry in the same commit as the fix.
 
-Next code: `G-ORBITAL-GAME-RENDERER-038`
+Next code: `G-ORBITAL-GAME-RENDERER-039`
 
 - **G-ORBITAL-GAME-RENDERER-037** [mechanical] — `host::tests::an_anchored_material_out_of_view_asks_for_no_frames` fails on main (2026-11-23): an `anchor`ed material whose drawable sits at y 300 on a 100-tall scrolled page still answers `wants_frames()` true, so an off-view anchored material keeps the host painting every frame. Found in the full `cargo test -p orbital-canvas` run of the native GPU verification; the test builds its scene through `SceneHost::set_scene` directly, so it is independent of that night's scene-entry change (`exact_ints`), and sits in the 2026-11-22 scroll-performance work (cull off-view commands, liveness read once per scene). Reproduce: `cargo test -p orbital-canvas an_anchored_material_out_of_view`. Prevention rung: (3) the verifiers (this unit test already catches it). Severity: medium. Root cause: one-off.
 

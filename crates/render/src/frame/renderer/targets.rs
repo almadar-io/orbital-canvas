@@ -40,7 +40,9 @@ impl SharedDeviceRenderer {
         if self.targets.keep(id, size, hash) {
             return;
         }
-        let slot = self.targets.writer(&self.device, self.format, id, size, points);
+        let slot = self
+            .targets
+            .writer(&self.device, self.format, id, size, points);
         let child = GameRenderPacket {
             pattern: packet.pattern.clone(),
             width: points.0 as f32,

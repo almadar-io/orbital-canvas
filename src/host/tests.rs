@@ -542,7 +542,9 @@ fn measured(id: &str, width: f32) -> mappers::scene::Measured {
 #[test]
 fn a_changed_measurement_is_reported_once_and_an_unchanged_one_is_not_repeated() {
     let mut r = SceneHost::new();
-    r.scene = Some(orbital_canvas_base::scene_doc::SceneDoc::whole(serde_json::json!({"type": "canvas", "measureEvent": "MEASURED"})));
+    r.scene = Some(orbital_canvas_base::scene_doc::SceneDoc::whole(
+        serde_json::json!({"type": "canvas", "measureEvent": "MEASURED"}),
+    ));
     r.measured = vec![measured("t", 80.0)];
     r.report_measured();
     let sent = r.take_scene_events();
@@ -562,7 +564,9 @@ fn a_changed_measurement_is_reported_once_and_an_unchanged_one_is_not_repeated()
 #[test]
 fn measurements_without_a_measure_event_send_nothing() {
     let mut r = SceneHost::new();
-    r.scene = Some(orbital_canvas_base::scene_doc::SceneDoc::whole(serde_json::json!({"type": "canvas"})));
+    r.scene = Some(orbital_canvas_base::scene_doc::SceneDoc::whole(
+        serde_json::json!({"type": "canvas"}),
+    ));
     r.measured = vec![measured("t", 80.0)];
     r.report_measured();
     assert!(events(&mut r).is_empty());
@@ -1466,7 +1470,9 @@ fn pulse_scene() -> serde_json::Value {
 
 fn ring_alpha(p: &GameRenderPacket) -> f32 {
     let (fade, ring) = match &p.draw_commands[1] {
-        packet::DrawCommand::Faded { opacity, commands } => (*opacity, &commands[0]),
+        packet::DrawCommand::Faded {
+            opacity, commands, ..
+        } => (*opacity, &commands[0]),
         other => (1.0, other),
     };
     match ring {
@@ -2688,9 +2694,15 @@ fn a_timed_frame_maps_the_props_the_scene_mapping_prepared_without_preparing_aga
     typing.set_epoch_clock(5200.0);
     let _ = typing.frame_packet();
     let _ = typing.frame_packet();
-    assert_eq!(typing.timed_maps(), 2, "control: the live reveal still maps every frame");
     assert_eq!(
-        typing.timed_prepares.load(std::sync::atomic::Ordering::Relaxed),
+        typing.timed_maps(),
+        2,
+        "control: the live reveal still maps every frame"
+    );
+    assert_eq!(
+        typing
+            .timed_prepares
+            .load(std::sync::atomic::Ordering::Relaxed),
         0,
         "no frame prepares the scene again"
     );
@@ -3252,9 +3264,9 @@ fn faded_glow(renderer: &Canvas) -> (f32, serde_json::Value) {
         .draw_commands
         .iter()
         .find_map(|c| match c {
-            packet::DrawCommand::Faded { opacity, commands } => {
-                Some((*opacity, serde_json::to_value(commands).unwrap()))
-            }
+            packet::DrawCommand::Faded {
+                opacity, commands, ..
+            } => Some((*opacity, serde_json::to_value(commands).unwrap())),
             _ => None,
         })
         .expect("the glow plays as a Faded layer")
@@ -3465,19 +3477,43 @@ fn a_split_scene_reads_the_liveness_of_the_whole_one_and_only_its_new_drawables(
     let mut host = SceneHost::new();
     let first = orbital_canvas_base::scene_doc::SceneDoc::split(scene("hello"));
     let read = host.read_liveness(&first);
-    assert_eq!(read, frame::Liveness::read(&scene("hello")), "the split scene is as live as the whole one");
+    assert_eq!(
+        read,
+        frame::Liveness::read(&scene("hello")),
+        "the split scene is as live as the whole one"
+    );
     assert_eq!(host.liveness_parts.len(), 2);
     let mut next = orbital_canvas_base::scene_doc::SceneDoc::split(scene("hello there"));
-    std::sync::Arc::make_mut(next.drawables.as_mut().unwrap())[1] = std::sync::Arc::clone(&first.drawables.as_ref().unwrap()[1]);
-    let kept = host.liveness_parts.get(&(std::sync::Arc::as_ptr(&first.drawables.as_ref().unwrap()[1]) as usize)).cloned();
-    assert_eq!(host.read_liveness(&next), frame::Liveness::read(&scene("hello there")), "and stays so after a change");
-    let now = host.liveness_parts.get(&(std::sync::Arc::as_ptr(&first.drawables.as_ref().unwrap()[1]) as usize)).cloned();
-    assert_eq!(kept.map(|k| k.1), now.map(|n| n.1), "the shared drawable's part is carried over");
-    assert_eq!(host.liveness_parts.len(), 2, "control: parts of drawables that left are dropped");
+    std::sync::Arc::make_mut(next.drawables.as_mut().unwrap())[1] =
+        std::sync::Arc::clone(&first.drawables.as_ref().unwrap()[1]);
+    let kept = host
+        .liveness_parts
+        .get(&(std::sync::Arc::as_ptr(&first.drawables.as_ref().unwrap()[1]) as usize))
+        .cloned();
+    assert_eq!(
+        host.read_liveness(&next),
+        frame::Liveness::read(&scene("hello there")),
+        "and stays so after a change"
+    );
+    let now = host
+        .liveness_parts
+        .get(&(std::sync::Arc::as_ptr(&first.drawables.as_ref().unwrap()[1]) as usize))
+        .cloned();
+    assert_eq!(
+        kept.map(|k| k.1),
+        now.map(|n| n.1),
+        "the shared drawable's part is carried over"
+    );
+    assert_eq!(
+        host.liveness_parts.len(),
+        2,
+        "control: parts of drawables that left are dropped"
+    );
 }
 
 #[test]
-fn a_press_on_a_drawable_in_an_origin_reports_that_origins_offset_and_a_page_drawable_reports_none() {
+fn a_press_on_a_drawable_in_an_origin_reports_that_origins_offset_and_a_page_drawable_reports_none()
+{
     let mut r = SceneHost::new();
     r.set_scene(serde_json::json!({
         "type": "canvas", "mode": "2d", "projection": "free", "camera": {"zoom": 1}, "pointerDownEvent": "DOWN",
@@ -3492,17 +3528,27 @@ fn a_press_on_a_drawable_in_an_origin_reports_that_origins_offset_and_a_page_dra
     r.input("touch-down", 110.0, 55.0, 0, None);
     let down = r.take_scene_events();
     assert_eq!(down[0].payload["target"], "in");
-    assert_eq!((down[0].payload["originX"].clone(), down[0].payload["originY"].clone()), (serde_json::json!(100.0), serde_json::json!(50.0)));
+    assert_eq!(
+        (
+            down[0].payload["originX"].clone(),
+            down[0].payload["originY"].clone()
+        ),
+        (serde_json::json!(100.0), serde_json::json!(50.0))
+    );
     r.input("touch-up", 110.0, 55.0, 0, None);
     r.take_scene_events();
     r.input("touch-down", 10.0, 205.0, 0, None);
     let down = r.take_scene_events();
     assert_eq!(down[0].payload["target"], "page");
-    assert!(down[0].payload.get("originX").is_none(), "control: a page drawable's press names no origin");
+    assert!(
+        down[0].payload.get("originX").is_none(),
+        "control: a page drawable's press names no origin"
+    );
 }
 
 #[test]
-fn a_canvas_reports_its_resolved_origins_once_per_change_and_a_canvas_without_the_event_reports_none() {
+fn a_canvas_reports_its_resolved_origins_once_per_change_and_a_canvas_without_the_event_reports_none(
+) {
     let scene = |card_x: f64, event: bool| {
         let mut s = serde_json::json!({
             "type": "canvas", "mode": "2d", "projection": "free", "camera": {"zoom": 1},
@@ -3517,18 +3563,38 @@ fn a_canvas_reports_its_resolved_origins_once_per_change_and_a_canvas_without_th
     };
     let mut r = SceneHost::new();
     r.set_scene(scene(100.0, true)).unwrap();
-    let sent: Vec<_> = r.take_scene_events().into_iter().filter(|e| e.event == "ORIGINS").collect();
+    let sent: Vec<_> = r
+        .take_scene_events()
+        .into_iter()
+        .filter(|e| e.event == "ORIGINS")
+        .collect();
     assert_eq!(sent.len(), 1);
     assert_eq!(
         sent[0].payload,
         serde_json::json!({"offsets": {"card": {"x": 100.0, "y": 10.0}, "inner": {"x": 105.0, "y": 15.0}}})
     );
     r.set_scene(scene(100.0, true)).unwrap();
-    assert!(r.take_scene_events().iter().all(|e| e.event != "ORIGINS"), "unchanged origins are not reported again");
+    assert!(
+        r.take_scene_events().iter().all(|e| e.event != "ORIGINS"),
+        "unchanged origins are not reported again"
+    );
     r.set_scene(scene(140.0, true)).unwrap();
-    let moved: Vec<_> = r.take_scene_events().into_iter().filter(|e| e.event == "ORIGINS").collect();
-    assert_eq!(moved[0].payload["offsets"]["inner"], serde_json::json!({"x": 145.0, "y": 15.0}));
+    let moved: Vec<_> = r
+        .take_scene_events()
+        .into_iter()
+        .filter(|e| e.event == "ORIGINS")
+        .collect();
+    assert_eq!(
+        moved[0].payload["offsets"]["inner"],
+        serde_json::json!({"x": 145.0, "y": 15.0})
+    );
     let mut quiet = SceneHost::new();
     quiet.set_scene(scene(100.0, false)).unwrap();
-    assert!(quiet.take_scene_events().iter().all(|e| e.event != "ORIGINS"), "control: no originsEvent, no report");
+    assert!(
+        quiet
+            .take_scene_events()
+            .iter()
+            .all(|e| e.event != "ORIGINS"),
+        "control: no originsEvent, no report"
+    );
 }

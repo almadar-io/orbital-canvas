@@ -216,6 +216,188 @@ impl SharedDeviceRenderer {
         });
     }
 
+    /// A layer drawn `scale` times its size about `origin`, then moved by `offset` ([`DrawCommand::Faded`]'s
+    /// placement). It is rasterized at the top of its scale step (a factor of the square root of two wide) and drawn
+    /// at its scale on the GPU, so every scale inside a step shares one layer. A layer too large to hold whole is
+    /// rasterized over what the step's lowest scale shows of it; one this cannot serve is drawn baked, as a run.
+    pub(super) fn flush_placed_layer(
+        &mut self,
+        layer: &[&DrawCommand],
+        packet: &GameRenderPacket,
+        target: &wgpu::Texture,
+        draws: &mut Vec<Draw>,
+        opacity: f32,
+        (scale, origin, offset): (f32, Vec2, Vec2),
+    ) {
+        if layer.is_empty() {
+            return;
+        }
+        let (tw, th) = (target.width(), target.height());
+        let max_dim = self.device.limits().max_texture_dimension_2d as i64;
+        let width = packet.width.max(1.0);
+        let height = packet.height.max(1.0);
+        let (sx, sy) = (tw as f32 / width, th as f32 / height);
+        let bounds = orbital_canvas_paint::vector::run_bounds(layer);
+        let region = match bounds {
+            orbital_canvas_paint::vector::RunBounds::Box { x0, y0, x1, y1 }
+                if scale > 0.0
+                    && scale.is_finite()
+                    && tw as i64 <= max_dim
+                    && th as i64 <= max_dim
+                    && !layer
+                        .iter()
+                        .any(|c| orbital_canvas_paint::vector::is_blur(c)) =>
+            {
+                Some((x0, y0, x1, y1))
+            }
+            orbital_canvas_paint::vector::RunBounds::Empty => return,
+            _ => None,
+        };
+        let step = (scale.log2() * 2.0).floor();
+        let low = 2.0_f32.powf(step / 2.0);
+        let (rx_scale, ry_scale) = (
+            sx * low * std::f32::consts::SQRT_2,
+            sy * low * std::f32::consts::SQRT_2,
+        );
+        // Where a point of the layer lands at scale `q`: p * q + shift(q).
+        let shift = |q: f32| {
+            (
+                origin.x * (1.0 - q) + offset.x,
+                origin.y * (1.0 - q) + offset.y,
+            )
+        };
+        let shown = |q: f32, (x0, y0, x1, y1): (f32, f32, f32, f32)| {
+            let (tx, ty) = shift(q);
+            (
+                x0.max(-tx / q),
+                y0.max(-ty / q),
+                x1.min((width - tx) / q),
+                y1.min((height - ty) / q),
+            )
+        };
+        let held = region.and_then(|whole| {
+            let need = shown(scale, whole);
+            if need.2 <= need.0 || need.3 <= need.1 {
+                return Some(None);
+            }
+            let px = |(x0, y0, x1, y1): (f32, f32, f32, f32)| {
+                (
+                    (x0 * rx_scale).floor() as i64,
+                    (y0 * ry_scale).floor() as i64,
+                    (x1 * rx_scale).ceil() as i64,
+                    (y1 * ry_scale).ceil() as i64,
+                )
+            };
+            let allocatable = |(x0, y0, x1, y1): (i64, i64, i64, i64)| {
+                let (w, h) = (x1 - x0, y1 - y0);
+                w > 0 && h > 0 && w <= max_dim && h <= max_dim
+            };
+            let all = px(whole);
+            if allocatable(all)
+                && ((all.2 - all.0) as u64) * ((all.3 - all.1) as u64)
+                    <= WHOLE_RUN_TARGETS * tw as u64 * th as u64
+            {
+                return Some(Some(all));
+            }
+            // What the step's lowest scale shows, at the step's top resolution: two targets in area by construction.
+            let part = shown(low, whole);
+            let covers =
+                part.0 <= need.0 && part.1 <= need.1 && part.2 >= need.2 && part.3 >= need.3;
+            (covers && allocatable(px(part))).then(|| Some(px(part)))
+        });
+        let (px0, py0, px1, py1) = match held {
+            Some(Some(held)) => held,
+            Some(None) => return,
+            None => {
+                let baked = orbital_canvas_base::animate::placed_commands(
+                    layer.iter().copied(),
+                    scale,
+                    origin,
+                    offset,
+                );
+                let mut run: Vec<&DrawCommand> = baked.iter().collect();
+                self.flush_vector_run_faded(&mut run, packet, target, draws, false, opacity);
+                return;
+            }
+        };
+        let (lw, lh) = ((px1 - px0) as u32, (py1 - py0) as u32);
+        let (rx, ry) = (px0 as f32 / rx_scale, py0 as f32 / ry_scale);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&(rx_scale.to_bits(), ry_scale.to_bits()), &mut hasher);
+        if layer
+            .iter()
+            .any(|command| orbital_canvas_paint::vector::uses_text(command))
+        {
+            std::hash::Hash::hash(
+                &orbital_canvas_paint::vector::font_generation(),
+                &mut hasher,
+            );
+        }
+        if layer
+            .iter()
+            .any(|command| orbital_canvas_paint::vector::uses_image_pattern(command))
+        {
+            std::hash::Hash::hash(&orbital_canvas_paint::asset::generation(), &mut hasher);
+        }
+        if let Err(err) = orbital_canvas_base::targets::hash_commands_from(
+            layer.iter().copied(),
+            Vec2 { x: rx, y: ry },
+            &mut hasher,
+        ) {
+            tracing::warn!(target: "almadar::game_renderer", error = %err, "vector command not serializable — skipped");
+            return;
+        }
+        let key = SpriteKey {
+            url: format!(
+                "{VECTOR_LAYER_PREFIX}{:016x}",
+                std::hash::Hasher::finish(&hasher)
+            ),
+            raster: Some((lw, lh)),
+        };
+        self.use_clock += 1;
+        let now = self.use_clock;
+        if let Some(sprite) = self.sprites.get_mut(&key) {
+            sprite.last_used = now;
+        } else {
+            let Some(sprite) = orbital_canvas_paint::vector::rasterize_box(
+                layer, lw, lh, rx_scale, ry_scale, rx, ry,
+            )
+            .map(|rgba| self.upload_rgba(&rgba, lw, lh, now)) else {
+                tracing::warn!(target: "almadar::game_renderer", lw, lh, "vector layer surface not allocatable — skipped");
+                return;
+            };
+            self.sprites.insert(key.clone(), sprite);
+            self.evict_stale_vector_layers(VECTOR_LAYER_TARGETS * tw as usize * th as usize * 4);
+        }
+        let (tx, ty) = shift(scale);
+        let verts = sprite_vertices(
+            &Rect {
+                x: 0.0,
+                y: 0.0,
+                w: lw as f32,
+                h: lh as f32,
+            },
+            &Rect {
+                x: rx * scale + tx,
+                y: ry * scale + ty,
+                w: lw as f32 / rx_scale * scale,
+                h: lh as f32 / ry_scale * scale,
+            },
+            (lw, lh),
+            0.0,
+            opacity,
+            (false, false),
+            None,
+            (width as u32, height as u32),
+        );
+        draws.push(Draw::Sprite {
+            key,
+            verts: verts.to_vec(),
+            additive: false,
+            tinted: false,
+        });
+    }
+
     /// Evict vector layers the current frame has not drawn, least recently used first, until the layers held fit in
     /// `budget` bytes; their textures are destroyed (the web backend frees nothing on drop).
     pub(super) fn evict_stale_vector_layers(&mut self, budget: usize) {
@@ -252,6 +434,16 @@ impl SharedDeviceRenderer {
             .keys()
             .filter(|k| k.url.starts_with(VECTOR_LAYER_PREFIX))
             .filter_map(|k| k.raster)
+            .collect()
+    }
+
+    /// The cache keys of the vector layers held (cache observability for tests).
+    #[cfg(test)]
+    pub(super) fn vector_layer_keys(&self) -> std::collections::BTreeSet<String> {
+        self.sprites
+            .keys()
+            .filter(|k| k.url.starts_with(VECTOR_LAYER_PREFIX))
+            .map(|k| k.url.clone())
             .collect()
     }
 

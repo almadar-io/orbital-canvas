@@ -1019,7 +1019,13 @@ fn quantized_placement_stays_within_an_eighth_of_a_pixel() {
 }
 
 fn faded(opacity: f32, commands: Vec<DrawCommand>) -> DrawCommand {
-    DrawCommand::Faded { opacity, commands }
+    DrawCommand::Faded {
+        opacity,
+        scale: 1.0,
+        origin: Vec2::default(),
+        offset: Vec2::default(),
+        commands,
+    }
 }
 
 fn glow(x: f32) -> DrawCommand {
@@ -1267,5 +1273,123 @@ fn a_shadow_keeps_its_z_order_between_paths_in_one_run() {
         px(&under, 16, 8, 8)[1],
         255,
         "control: the glow is over the path"
+    );
+}
+
+fn scaled(scale: f32, commands: Vec<DrawCommand>) -> DrawCommand {
+    DrawCommand::Faded {
+        opacity: 1.0,
+        scale,
+        origin: Vec2 { x: 8.0, y: 8.0 },
+        offset: Vec2::default(),
+        commands,
+    }
+}
+
+#[test]
+fn a_scaled_layer_is_rasterized_once_per_scale_step() {
+    let Some(mut r) = renderer() else { return };
+    let _font = orbital_canvas_paint::vector::FONT_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for scale in [1.05, 1.1, 1.2, 1.3, 1.4] {
+        let _ = draw(
+            &mut r,
+            &packet(vec![scaled(scale, vec![filled(4.0, RED)])]),
+            16,
+        );
+    }
+    assert_eq!(
+        r.vector_layer_count(),
+        1,
+        "one layer serves every scale inside its step"
+    );
+    let _ = draw(
+        &mut r,
+        &packet(vec![scaled(1.5, vec![filled(4.0, RED)])]),
+        16,
+    );
+    assert_eq!(
+        r.vector_layer_count(),
+        2,
+        "control: the next step is rasterized once more"
+    );
+}
+
+#[test]
+fn a_scaled_layer_lands_where_its_scale_puts_it() {
+    let Some(mut r) = renderer() else { return };
+    let _font = orbital_canvas_paint::vector::FONT_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(grown) = draw(
+        &mut r,
+        &packet(vec![scaled(1.25, vec![filled(4.0, RED)])]),
+        16,
+    ) else {
+        return;
+    };
+    assert_eq!(px(&grown, 16, 8, 8), [255, 0, 0, 255], "the middle");
+    assert!(
+        px(&grown, 16, 3, 8)[3] > 150,
+        "the left edge moved out from 4 to 3: {:?}",
+        px(&grown, 16, 3, 8)
+    );
+    assert_eq!(
+        px(&grown, 16, 4, 8),
+        [255, 0, 0, 255],
+        "full just inside it"
+    );
+    assert!(px(&grown, 16, 12, 8)[3] > 150, "the right edge reaches 13");
+    assert_eq!(px(&grown, 16, 1, 8)[3], 0, "nothing past the scaled edge");
+    assert_eq!(px(&grown, 16, 14, 8)[3], 0, "nor on the other side");
+    let Some(rest) = draw(
+        &mut r,
+        &packet(vec![scaled(1.0, vec![filled(4.0, RED)])]),
+        16,
+    ) else {
+        return;
+    };
+    assert_eq!(
+        px(&rest, 16, 3, 8)[3],
+        0,
+        "control: at scale 1 the edge stays at 4"
+    );
+    assert_eq!(px(&rest, 16, 4, 8), [255, 0, 0, 255]);
+}
+
+#[test]
+fn a_scaled_layer_larger_than_the_target_is_still_rasterized_once_per_step() {
+    let Some(mut r) = renderer() else { return };
+    let _font = orbital_canvas_paint::vector::FONT_GENERATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let wide = || DrawCommand::Path {
+        segments: rect(-40.0, -40.0, 96.0, 96.0),
+        fill: Some(RED),
+        stroke: None,
+    };
+    let mut last = draw(&mut r, &packet(vec![scaled(2.1, vec![wide()])]), 16);
+    let held = r.vector_layer_keys();
+    for scale in [2.3, 2.6, 2.8] {
+        last = draw(&mut r, &packet(vec![scaled(scale, vec![wide()])]), 16);
+    }
+    assert_eq!(held.len(), 1);
+    assert_eq!(
+        r.vector_layer_keys(),
+        held,
+        "what the step's lowest scale shows serves every scale inside it"
+    );
+    let Some(rgba) = last else { return };
+    assert_eq!(
+        px(&rgba, 16, 0, 0),
+        [255, 0, 0, 255],
+        "it covers the corner"
+    );
+    assert_eq!(px(&rgba, 16, 15, 15), [255, 0, 0, 255], "and the far one");
+    let _ = draw(&mut r, &packet(vec![scaled(3.0, vec![wide()])]), 16);
+    assert!(
+        r.vector_layer_keys().iter().any(|k| !held.contains(k)),
+        "control: the next step is rasterized anew"
     );
 }

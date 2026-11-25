@@ -4621,7 +4621,50 @@ fn a_settled_scene_reuses_its_drawables_at_any_clock_and_a_live_one_does_not() {
     let mut live = DrawableCache::default();
     from_props_cached_at(&props, None, 1000.0, false, (0, 0), &mut live).unwrap();
     from_props_cached_at(&props, None, 2000.0, false, (0, 0), &mut live).unwrap();
-    assert_eq!(live.reused, 0, "control: while animations play, a new clock is a new walk");
+    assert_eq!(live.reused, 5, "its one animation ended at 400, so a live mapping after it reuses them too");
+}
+
+fn clocked_scene(looping: bool) -> Value {
+    free_props(json!([
+        rect_shape(json!({"id": "still"})),
+        rect_shape(json!({"id": "moving",
+            "animation": {"durationMs": 400, "startMs": 1000, "loop": looping, "keyframes": [{"at": 0, "opacity": 0}, {"at": 1, "opacity": 1}]}})),
+        {"type": "draw-text", "id": "label", "text": "Name", "position": {"x": 5, "y": 5}}
+    ]))
+}
+
+#[test]
+fn a_live_mapping_walks_only_the_drawables_that_still_move_with_the_clock() {
+    let props = clocked_scene(false);
+    let mut cache = DrawableCache::default();
+    from_props_cached_at(&props, None, 1100.0, false, (0, 0), &mut cache).unwrap();
+    assert_eq!(cache.reused, 0, "control: a first mapping walks every drawable");
+    let during = from_props_cached_at(&props, None, 1200.0, false, (0, 0), &mut cache).unwrap();
+    assert_eq!(cache.reused, 2, "the two that do not move with the clock are replayed while the third plays");
+    same_mapping(&during, &from_props_mapped(&props, 1200.0).unwrap());
+    let ended = from_props_cached_at(&props, None, 1500.0, false, (0, 0), &mut cache).unwrap();
+    assert_eq!(cache.reused, 2, "what was walked while it played is walked once more at its end");
+    same_mapping(&ended, &from_props_mapped(&props, 1500.0).unwrap());
+    let after = from_props_cached_at(&props, None, 1600.0, false, (0, 0), &mut cache).unwrap();
+    assert_eq!(cache.reused, 3, "walked after its end, it no longer moves");
+    same_mapping(&after, &from_props_mapped(&props, 1600.0).unwrap());
+}
+
+#[test]
+fn a_drawable_that_runs_on_is_walked_at_every_clock_and_a_settled_walk_serves_a_later_live_one() {
+    let looping = clocked_scene(true);
+    let mut cache = DrawableCache::default();
+    from_props_cached_at(&looping, None, 1100.0, false, (0, 0), &mut cache).unwrap();
+    from_props_cached_at(&looping, None, 9000.0, false, (0, 0), &mut cache).unwrap();
+    assert_eq!(cache.reused, 2, "control: a looping animation never stops moving");
+    let props = clocked_scene(false);
+    let mut cache = DrawableCache::default();
+    from_props_cached_at(&props, None, 1200.0, false, (0, 0), &mut cache).unwrap();
+    from_props_cached_at(&props, None, 1500.0, true, (0, 0), &mut cache).unwrap();
+    assert_eq!(cache.reused, 2, "a settled mapping still walks what was last walked mid-play");
+    let live = from_props_cached_at(&props, None, 1600.0, false, (0, 0), &mut cache).unwrap();
+    assert_eq!(cache.reused, 3, "and what it walked serves the next live mapping");
+    same_mapping(&live, &from_props_mapped(&props, 1600.0).unwrap());
 }
 
 #[test]

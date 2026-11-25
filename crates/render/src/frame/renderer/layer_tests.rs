@@ -109,7 +109,7 @@ fn material(wgsl: &str, targets: &[&str]) -> SdfMaterial {
         params: vec![],
         live: false,
         since: 0.0,
-            anchor_ms: None,
+        anchor_ms: None,
         targets: targets.iter().map(|t| (*t).to_owned()).collect(),
     }
 }
@@ -480,16 +480,28 @@ fn a_target_is_allocated_at_the_density_of_the_pass_that_paints_it() {
         return;
     };
     let dense = r.targets.read("t").expect("the target was painted");
-    assert_eq!((dense.width, dense.height), (32, 32), "a 16-point target on a 2x pass holds 32 device pixels");
+    assert_eq!(
+        (dense.width, dense.height),
+        (32, 32),
+        "a 16-point target on a 2x pass holds 32 device pixels"
+    );
     let Some(shown) = draw(&mut r, &frame(vec![target("t", GREEN), reader("t")]), 128) else {
         return;
     };
-    assert_eq!(px(&shown, 128, 32, 32), [0, 255, 0, 255], "the sprite still paints the whole target at logical size");
+    assert_eq!(
+        px(&shown, 128, 32, 32),
+        [0, 255, 0, 255],
+        "the sprite still paints the whole target at logical size"
+    );
     let Some(_) = draw(&mut r, &frame(vec![target("u", GREEN), reader("u")]), 64) else {
         return;
     };
     let plain = r.targets.read("u").expect("the target was painted");
-    assert_eq!((plain.width, plain.height), (16, 16), "control: at 1x the target holds its logical size");
+    assert_eq!(
+        (plain.width, plain.height),
+        (16, 16),
+        "control: at 1x the target holds its logical size"
+    );
 }
 fn split_target(id: &str) -> DrawCommand {
     DrawCommand::Target {
@@ -497,15 +509,25 @@ fn split_target(id: &str) -> DrawCommand {
         width: 16,
         height: 16,
         live: false,
-        commands: vec![quad(0.0, 0.0, 8.0, 16.0, GREEN), quad(8.0, 0.0, 8.0, 16.0, WHITE)],
+        commands: vec![
+            quad(0.0, 0.0, 8.0, 16.0, GREEN),
+            quad(8.0, 0.0, 8.0, 16.0, WHITE),
+        ],
     }
 }
 
 fn right_half_reader(id: &str) -> DrawCommand {
-    let DrawCommand::Sprite { texture, dst, .. } = reader(id) else { unreachable!() };
+    let DrawCommand::Sprite { texture, dst, .. } = reader(id) else {
+        unreachable!()
+    };
     DrawCommand::Sprite {
         texture,
-        src: Rect { x: 8.0, y: 0.0, w: 8.0, h: 16.0 },
+        src: Rect {
+            x: 8.0,
+            y: 0.0,
+            w: 8.0,
+            h: 16.0,
+        },
         dst,
         rotation: 0.0,
         opacity: 1.0,
@@ -519,8 +541,20 @@ fn right_half_reader(id: &str) -> DrawCommand {
 fn a_sprite_frame_on_a_target_is_read_in_the_targets_own_units_at_any_density() {
     let Some(mut r) = renderer() else { return };
     let packet = frame(vec![split_target("t"), right_half_reader("t")]);
-    let Some(plain) = draw(&mut r, &packet, 64) else { return };
-    assert_eq!(at(&plain, 12, 16), [255, 255, 255, 255], "control: at 1x the frame shows the right half");
-    let Some(dense) = draw(&mut r, &packet, 128) else { return };
-    assert_eq!(px(&dense, 128, 24, 32), [255, 255, 255, 255], "at 2x the same frame shows the same right half");
+    let Some(plain) = draw(&mut r, &packet, 64) else {
+        return;
+    };
+    assert_eq!(
+        at(&plain, 12, 16),
+        [255, 255, 255, 255],
+        "control: at 1x the frame shows the right half"
+    );
+    let Some(dense) = draw(&mut r, &packet, 128) else {
+        return;
+    };
+    assert_eq!(
+        px(&dense, 128, 24, 32),
+        [255, 255, 255, 255],
+        "at 2x the same frame shows the same right half"
+    );
 }

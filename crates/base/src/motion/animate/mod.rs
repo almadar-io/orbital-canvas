@@ -344,6 +344,8 @@ struct Xform {
     opacity: f32,
     dash_offset: f32,
     scale_strokes: bool,
+    /// Whether a scale may stay outside a vector drawing ([`DrawCommand::Faded`]'s placement) instead of being baked.
+    scale_layers: bool,
 }
 
 impl Xform {
@@ -363,6 +365,7 @@ impl Xform {
             opacity: s.opacity,
             dash_offset: s.dash_offset,
             scale_strokes: true,
+            scale_layers: true,
         }
     }
 
@@ -379,7 +382,23 @@ impl Xform {
             opacity,
             dash_offset: 0.0,
             scale_strokes: false,
+            scale_layers: false,
         }
+    }
+
+    /// Whether this transform leaves `cmd`'s geometry alone and rides outside it as a layer's placement.
+    fn places(&self, cmd: &DrawCommand) -> bool {
+        self.scale_layers
+            && self.scale > 0.0
+            && self.scale != 1.0
+            && !self.rotated
+            && self.dash_offset == 0.0
+            && is_scaled_layer(cmd)
+    }
+
+    /// Whether this transform only moves what it is applied to.
+    fn moves_only(&self) -> bool {
+        self.scale == 1.0 && !self.rotated && self.dash_offset == 0.0
     }
 
     fn point(&self, p: Vec2) -> Vec2 {
@@ -529,14 +548,62 @@ impl Xform {
     }
 
     fn command(&self, cmd: &DrawCommand) -> DrawCommand {
-        if let DrawCommand::Faded { opacity, commands } = cmd {
+        if let DrawCommand::Faded {
+            opacity,
+            scale,
+            origin,
+            offset,
+            commands,
+        } = cmd
+        {
+            let opacity = (*opacity * self.opacity).clamp(0.0, 1.0);
+            let placed = *scale != 1.0 || *offset != Vec2::default();
+            if placed && self.moves_only() {
+                return DrawCommand::Faded {
+                    opacity,
+                    scale: *scale,
+                    origin: *origin,
+                    offset: Vec2 {
+                        x: offset.x + self.translation.x,
+                        y: offset.y + self.translation.y,
+                    },
+                    commands: commands.clone(),
+                };
+            }
+            if !placed && commands.iter().all(|c| self.places(c)) {
+                return DrawCommand::Faded {
+                    opacity,
+                    scale: self.scale,
+                    origin: self.origin,
+                    offset: self.translation,
+                    commands: commands.clone(),
+                };
+            }
             let inner = Self {
                 opacity: 1.0,
+                scale_layers: false,
                 ..*self
             };
+            let rest = if placed {
+                placed_commands(commands, *scale, *origin, *offset)
+            } else {
+                commands.clone()
+            };
             return DrawCommand::Faded {
-                opacity: (*opacity * self.opacity).clamp(0.0, 1.0),
-                commands: commands.iter().map(|c| inner.command(c)).collect(),
+                opacity,
+                scale: 1.0,
+                origin: Vec2::default(),
+                offset: Vec2::default(),
+                commands: rest.iter().map(|c| inner.command(c)).collect(),
+            };
+        }
+        if self.places(cmd) {
+            return DrawCommand::Faded {
+                opacity: self.opacity.clamp(0.0, 1.0),
+                scale: self.scale,
+                origin: self.origin,
+                offset: self.translation,
+                commands: vec![cmd.clone()],
             };
         }
         if self.fade_layers && self.opacity != 1.0 && is_layer(cmd) {
@@ -546,6 +613,9 @@ impl Xform {
             };
             return DrawCommand::Faded {
                 opacity: self.opacity.clamp(0.0, 1.0),
+                scale: 1.0,
+                origin: Vec2::default(),
+                offset: Vec2::default(),
                 commands: vec![inner.command(cmd)],
             };
         }
@@ -603,7 +673,13 @@ impl Xform {
                 }
             }
             DrawCommand::Blurred { command, radius } => DrawCommand::Blurred {
-                command: Box::new(self.command(command)),
+                command: Box::new(
+                    Self {
+                        scale_layers: false,
+                        ..*self
+                    }
+                    .command(command),
+                ),
                 radius: *radius,
             },
             DrawCommand::Shadow {
@@ -613,7 +689,13 @@ impl Xform {
             } => DrawCommand::Shadow {
                 commands: commands
                     .iter()
-                    .map(|command| self.command(command))
+                    .map(|command| {
+                        Self {
+                            scale_layers: false,
+                            ..*self
+                        }
+                        .command(command)
+                    })
                     .collect(),
                 color: *color,
                 sigma: *sigma * self.scale.abs(),
@@ -624,6 +706,7 @@ impl Xform {
                     .map(|command| {
                         Self {
                             fade_layers: false,
+                            scale_layers: false,
                             ..*self
                         }
                         .command(command)
@@ -879,6 +962,29 @@ fn is_layer(cmd: &DrawCommand) -> bool {
         DrawCommand::Text { halo, .. } => halo.is_some(),
         _ => false,
     }
+}
+
+/// `commands` as a scaled layer draws them: `scale` times their size about `origin`, strokes with them, then moved
+/// by `offset` ([`DrawCommand::Faded`]'s placement, baked into the geometry).
+pub fn placed_commands<'a>(
+    commands: impl IntoIterator<Item = &'a DrawCommand>,
+    scale: f32,
+    origin: Vec2,
+    offset: Vec2,
+) -> Vec<DrawCommand> {
+    let placed = Xform {
+        scale_strokes: true,
+        ..Xform::group(origin, offset, scale, 0.0, 1.0)
+    };
+    commands.into_iter().map(|c| placed.command(c)).collect()
+}
+
+/// Commands a scale can stay outside of: the vector layer draws them, and their look scales with their geometry.
+fn is_scaled_layer(cmd: &DrawCommand) -> bool {
+    matches!(
+        cmd,
+        DrawCommand::Path { .. } | DrawCommand::GradientPath { .. } | DrawCommand::Line { .. }
+    )
 }
 
 /// Apply one 2D group transform to the range a drawable group just emitted.

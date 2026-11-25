@@ -381,7 +381,13 @@ impl SharedDeviceRenderer {
         let mut pending = packet.draw_commands.iter().peekable();
         while let Some(command) = pending.next() {
             match command {
-                DrawCommand::Faded { opacity, commands } => {
+                DrawCommand::Faded {
+                    opacity,
+                    scale,
+                    origin,
+                    offset,
+                    commands,
+                } => {
                     self.flush_vector_run(&mut vector_run, packet, target, &mut draws);
                     if !quad_batch.is_empty() {
                         draws.push(Draw::Quads(std::mem::take(&mut quad_batch)));
@@ -389,19 +395,37 @@ impl SharedDeviceRenderer {
                     let mut layer: Vec<&DrawCommand> = commands.iter().collect();
                     while let Some(DrawCommand::Faded {
                         opacity: next,
+                        scale: next_scale,
+                        origin: next_origin,
+                        offset: next_offset,
                         commands,
                     }) = pending.peek()
                     {
-                        if next != opacity {
+                        if next != opacity
+                            || next_scale != scale
+                            || next_origin != origin
+                            || next_offset != offset
+                        {
                             break;
                         }
                         layer.extend(commands.iter());
                         pending.next();
                     }
                     if *opacity > 0.0 {
-                        self.flush_vector_run_faded(
-                            &mut layer, packet, target, &mut draws, false, *opacity,
-                        );
+                        if *scale == 1.0 && *offset == Vec2::default() {
+                            self.flush_vector_run_faded(
+                                &mut layer, packet, target, &mut draws, false, *opacity,
+                            );
+                        } else {
+                            self.flush_placed_layer(
+                                &layer,
+                                packet,
+                                target,
+                                &mut draws,
+                                *opacity,
+                                (*scale, *origin, *offset),
+                            );
+                        }
                     }
                 }
                 DrawCommand::Clear { color } => {

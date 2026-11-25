@@ -65,11 +65,20 @@ fn packet(cmds: Vec<DrawCommand>, animations: Vec<Animation>) -> GameRenderPacke
     }
 }
 
-/// The command a fade wraps and the opacity it carries.
-fn unfaded(c: &DrawCommand) -> (f32, &DrawCommand) {
+/// The command a fade wraps, placed as its layer draws it, and the opacity it carries.
+fn unfaded(c: &DrawCommand) -> (f32, DrawCommand) {
     match c {
-        DrawCommand::Faded { opacity, commands } => (*opacity, &commands[0]),
-        other => (1.0, other),
+        DrawCommand::Faded {
+            opacity,
+            scale,
+            origin,
+            offset,
+            commands,
+        } => (
+            *opacity,
+            placed_commands(&commands[..1], *scale, *origin, *offset).remove(0),
+        ),
+        other => (1.0, other.clone()),
     }
 }
 
@@ -1114,7 +1123,9 @@ fn shadow_of(inner: DrawCommand) -> DrawCommand {
 fn a_faded_shadow_keeps_its_colours_and_carries_the_opacity_outside() {
     let shadow = shadow_of(circle(10.0));
     match fade(std::slice::from_ref(&shadow), 0.5).as_slice() {
-        [DrawCommand::Faded { opacity, commands }] => {
+        [DrawCommand::Faded {
+            opacity, commands, ..
+        }] => {
             assert_eq!(*opacity, 0.5);
             assert_eq!(json(commands), json(std::slice::from_ref(&shadow)));
         }
@@ -1127,7 +1138,9 @@ fn faded_commands_nest_by_multiplying_and_unit_opacity_wraps_nothing() {
     let shadow = shadow_of(circle(10.0));
     let once = fade(std::slice::from_ref(&shadow), 0.5);
     match fade(&once, 0.5).as_slice() {
-        [DrawCommand::Faded { opacity, commands }] => {
+        [DrawCommand::Faded {
+            opacity, commands, ..
+        }] => {
             assert_eq!(*opacity, 0.25);
             assert_eq!(json(commands), json(std::slice::from_ref(&shadow)));
         }
@@ -1202,7 +1215,9 @@ fn a_faded_path_translates_inside_and_keeps_its_opacity() {
         0.5,
     );
     match out.as_slice() {
-        [DrawCommand::Faded { opacity, commands }] => {
+        [DrawCommand::Faded {
+            opacity, commands, ..
+        }] => {
             assert_eq!(*opacity, 0.5);
             assert!(matches!(
                 commands.as_slice(),
@@ -1211,5 +1226,97 @@ fn a_faded_path_translates_inside_and_keeps_its_opacity() {
             ));
         }
         other => panic!("{other:?}"),
+    }
+}
+
+fn layer_of(c: &DrawCommand) -> (f32, Vec2, Vec2, &[DrawCommand]) {
+    match c {
+        DrawCommand::Faded {
+            scale,
+            origin,
+            offset,
+            commands,
+            ..
+        } => (*scale, *origin, *offset, commands),
+        other => panic!("expected a layer: {other:?}"),
+    }
+}
+
+#[test]
+fn a_scale_track_stays_outside_the_drawing_as_a_fade_does() {
+    let p = packet(vec![circle(10.0)], vec![pulse()]);
+    let frame = p.resolved(1600.0, true);
+    let (scale, origin, offset, commands) = layer_of(&frame.draw_commands[0]);
+    assert!(scale > 0.3 && scale < 1.0, "mid-cycle scale {scale}");
+    assert_eq!(origin, Vec2 { x: 70.0, y: 70.0 });
+    assert_eq!(offset, Vec2::default());
+    assert_eq!(
+        json(commands),
+        json(&[circle(10.0)]),
+        "the drawing is carried at rest, so every frame of the scale shares it"
+    );
+    let start = p.resolved(600.0, true);
+    assert!(
+        (radius(&start, 0) - 3.0).abs() < 1e-4,
+        "control: the placed drawing is still the scaled one"
+    );
+}
+
+#[test]
+fn moving_a_scaled_layer_keeps_it_whole_and_rotating_it_bakes_it() {
+    let p = packet(vec![circle(10.0)], vec![pulse()]);
+    let frame = p.resolved(1600.0, true).into_owned();
+    let (scale, _, _, _) = layer_of(&frame.draw_commands[0]);
+    let moved = frame.clone().scrolled(20.0);
+    let (moved_scale, origin, offset, commands) = layer_of(&moved.draw_commands[0]);
+    assert_eq!(moved_scale, scale);
+    assert_eq!(origin, Vec2 { x: 70.0, y: 70.0 });
+    assert_eq!(offset, Vec2 { x: 0.0, y: -20.0 });
+    assert_eq!(json(commands), json(&[circle(10.0)]));
+    let mut turned = frame.draw_commands.clone();
+    transform_group_commands(
+        &mut turned,
+        Vec2 { x: 70.0, y: 70.0 },
+        Vec2::default(),
+        1.0,
+        std::f32::consts::FRAC_PI_2,
+        1.0,
+    );
+    let (turned_scale, _, turned_offset, baked) = layer_of(&turned[0]);
+    assert_eq!(turned_scale, 1.0, "control: a rotation cannot ride outside");
+    assert_eq!(turned_offset, Vec2::default());
+    match &baked[0] {
+        DrawCommand::Path { segments, .. } => match segments[0] {
+            PathSegment::Arc { rx, .. } => assert!((rx - 10.0 * scale).abs() < 1e-4),
+            ref other => panic!("not an arc: {other:?}"),
+        },
+        other => panic!("not a path: {other:?}"),
+    }
+}
+
+#[test]
+fn placed_commands_bake_a_layer_scale_into_geometry_and_strokes() {
+    let placed = placed_commands(
+        &[circle(10.0)],
+        0.5,
+        Vec2 { x: 70.0, y: 70.0 },
+        Vec2 { x: 4.0, y: 0.0 },
+    );
+    match &placed[0] {
+        DrawCommand::Path {
+            segments,
+            stroke: Some(stroke),
+            ..
+        } => {
+            match segments[0] {
+                PathSegment::Arc { cx, rx, .. } => {
+                    assert_eq!(rx, 5.0);
+                    assert_eq!(cx, 74.0);
+                }
+                ref other => panic!("not an arc: {other:?}"),
+            }
+            assert_eq!(stroke.width, 1.0);
+        }
+        other => panic!("not a stroked path: {other:?}"),
     }
 }
