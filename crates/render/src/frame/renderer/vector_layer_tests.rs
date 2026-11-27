@@ -1421,3 +1421,36 @@ fn a_scaled_layer_larger_than_the_target_is_still_rasterized_once_per_step() {
         "control: the next step is rasterized anew"
     );
 }
+
+#[test]
+fn a_text_with_an_emoji_goes_to_the_cpu_layer_and_paints_its_colours() {
+    let Some(mut r) = renderer() else { return };
+    let Some(drawn) = draw(
+        &mut r,
+        &text_packet(vec![word("a😀", 4.0, 30.0, 24.0)]),
+        SIDE,
+    ) else {
+        return;
+    };
+    assert_eq!(
+        rasterized(&r),
+        0,
+        "no glyph of a text with a colour glyph enters the atlas"
+    );
+    let mut colours: Vec<[u8; 3]> = drawn
+        .chunks_exact(4)
+        .filter(|p| p[3] == 255)
+        .map(|p| [p[0] & 0xf0, p[1] & 0xf0, p[2] & 0xf0])
+        .collect();
+    colours.sort_unstable();
+    colours.dedup();
+    assert!(
+        colours.len() >= 3,
+        "the emoji paints its own colours: {colours:?}"
+    );
+    let _ = gpu_alpha(&mut r, &word("abc", 4.0, 30.0, 24.0));
+    assert!(
+        rasterized(&r) > 0,
+        "control: plain text still goes through the atlas"
+    );
+}

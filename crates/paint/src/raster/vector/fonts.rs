@@ -33,6 +33,8 @@ pub(super) static BODY_REGULAR_BYTES: &[u8] =
 
 pub(super) static BODY_BOLD_BYTES: &[u8] = include_bytes!("../../../assets/fonts/Cairo-Bold.ttf");
 
+pub(super) static EMOJI_BYTES: &[u8] = include_bytes!("../../../assets/fonts/Twemoji.Mozilla.ttf");
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum FontId {
     Latin,
@@ -51,6 +53,8 @@ pub enum FontId {
     /// Cairo Regular: the family `Body` (Latin and Arabic).
     Body,
     BodyBold,
+    /// Twemoji (COLR): emoji no other face covers, painted in colour layers.
+    Emoji,
     /// A face the host supplied for a script no bundled face covers (`add_font_face`).
     Host(u16),
     /// A theme family's font file (`orbital_canvas_base::faces`), by its index in the loaded files.
@@ -75,12 +79,13 @@ impl FontId {
                 | FontId::DisplayBold
                 | FontId::Body
                 | FontId::BodyBold
+                | FontId::Emoji
         )
     }
 }
 
 pub(super) fn font_for(id: FontId) -> Option<&'static rustybuzz::Face<'static>> {
-    static FACES: OnceLock<[Option<rustybuzz::Face<'static>>; 11]> = OnceLock::new();
+    static FACES: OnceLock<[Option<rustybuzz::Face<'static>>; 12]> = OnceLock::new();
     let faces = FACES.get_or_init(|| {
         [
             rustybuzz::Face::from_slice(LATIN_BYTES, 0),
@@ -94,6 +99,7 @@ pub(super) fn font_for(id: FontId) -> Option<&'static rustybuzz::Face<'static>> 
             rustybuzz::Face::from_slice(BODY_REGULAR_BYTES, 0),
             rustybuzz::Face::from_slice(BODY_BOLD_BYTES, 0),
             rustybuzz::Face::from_slice(MONO_BOLD_BYTES, 0),
+            rustybuzz::Face::from_slice(EMOJI_BYTES, 0),
         ]
     });
     match id {
@@ -108,6 +114,7 @@ pub(super) fn font_for(id: FontId) -> Option<&'static rustybuzz::Face<'static>> 
         FontId::DisplayBold => faces[7].as_ref(),
         FontId::Body => faces[8].as_ref(),
         FontId::BodyBold => faces[9].as_ref(),
+        FontId::Emoji => faces[11].as_ref(),
         FontId::Host(i) => host_fonts().read().ok()?.get(i as usize).map(|(_, f)| *f),
         FontId::Url(i) => url_faces()
             .read()

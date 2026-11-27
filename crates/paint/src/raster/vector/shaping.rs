@@ -32,7 +32,7 @@ pub struct ShapedCluster {
 }
 
 /// The face for `c` in `script`: the mono face when asked and it covers `c`, bundled Arabic, the bundled face when its cmap covers the
-/// char, a host face for the script, else the bundled face (`.notdef`) with the script noted.
+/// char, the emoji face when it covers the char, a host face for the script, else the bundled face (`.notdef`) with the script noted.
 pub(super) fn char_font(c: char, script: Script, bold: bool, family: Family) -> FontId {
     let family = match family {
         Family::Face(id) => {
@@ -83,6 +83,9 @@ pub(super) fn char_font(c: char, script: Script, bold: bool, family: Family) -> 
     if face().is_some_and(|f| f.glyph_index(c).is_some()) {
         return FontId::Latin;
     }
+    if emoji_covers(c) {
+        return FontId::Emoji;
+    }
     if let Some(i) = host_fonts()
         .read()
         .ok()
@@ -96,22 +99,47 @@ pub(super) fn char_font(c: char, script: Script, bold: bool, family: Family) -> 
     FontId::Latin
 }
 
+fn emoji_covers(c: char) -> bool {
+    font_for(FontId::Emoji).is_some_and(|f| f.glyph_index(c).is_some())
+}
+
+/// The characters that continue an emoji sequence (UTS #51): the joiner, the emoji presentation selector, the keycap
+/// mark, the skin tone modifiers and the tag characters of a subdivision flag.
+fn continues_emoji(c: char) -> bool {
+    matches!(c, '\u{200D}' | '\u{FE0F}' | '\u{20E3}' | '\u{1F3FB}'..='\u{1F3FF}' | '\u{E0020}'..='\u{E007F}')
+}
+
 /// Face per char; Common/Inherited chars take the preceding script (the
-/// following one when the text opens with them).
+/// following one when the text opens with them). A char the emoji face covers takes it when the emoji presentation
+/// selector follows, and an emoji sequence stays in one face so its ligature (a family, a skin tone) shapes whole.
 pub(super) fn char_fonts(text: &str, bold: bool, family: Family) -> Vec<FontId> {
-    let scripts: Vec<Script> = text.chars().map(|c| c.script()).collect();
+    let chars: Vec<char> = text.chars().collect();
+    let scripts: Vec<Script> = chars.iter().map(|c| c.script()).collect();
     let neutral = |s: Script| matches!(s, Script::Common | Script::Inherited);
     let first = scripts.iter().copied().find(|s| !neutral(*s));
     let mut current = first.unwrap_or(Script::Latin);
-    text.chars()
+    let mut fonts: Vec<FontId> = chars
+        .iter()
         .zip(&scripts)
         .map(|(c, s)| {
             if !neutral(*s) {
                 current = *s;
             }
-            char_font(c, current, bold, family)
+            char_font(*c, current, bold, family)
         })
-        .collect()
+        .collect();
+    for i in 0..chars.len() {
+        if chars.get(i + 1) == Some(&'\u{FE0F}') && emoji_covers(chars[i]) {
+            fonts[i] = FontId::Emoji;
+        }
+        if i > 0
+            && fonts[i - 1] == FontId::Emoji
+            && (continues_emoji(chars[i]) || (chars[i - 1] == '\u{200D}' && emoji_covers(chars[i])))
+        {
+            fonts[i] = FontId::Emoji;
+        }
+    }
+    fonts
 }
 
 /// Shape `text` at `size` into glyphs laid out left to right in visual order.

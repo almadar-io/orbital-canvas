@@ -140,10 +140,9 @@ pub(super) fn text_ink_bounds(
     if let Some(bounds) = cached {
         return bounds;
     }
-    let bounds = text_path(text, pos, size, align, bold, family).map(|paths| {
-        let b = paths.all.bounds();
-        [b.left(), b.top(), b.right(), b.bottom()]
-    });
+    let bounds = text_path(text, pos, size, align, bold, family)
+        .and_then(|paths| paths.bounds())
+        .map(|b| [b.left(), b.top(), b.right(), b.bottom()]);
     text_bounds_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -8,8 +8,10 @@
 //! runs (unicode-script) that pick a face, and every run is shaped with
 //! rustybuzz, so Arabic joins, ligates and runs right to left. Latin and
 //! Greek use a DejaVu Sans subset, Arabic a Noto Sans Arabic subset (real
-//! Regular and Bold). Scripts with no bundled face (CJK, Hebrew, Indic) draw
-//! the DejaVu `.notdef` box.
+//! Regular and Bold). Emoji no other face covers use the bundled Twemoji COLR
+//! face, painted from its colour layers (a text holding one skips the GPU glyph
+//! atlas). Scripts with no bundled face (CJK, Hebrew, Indic) draw the DejaVu
+//! `.notdef` box.
 
 use orbital_canvas_base::packet::{
     ColorRun, DrawCommand, FillPattern, Gradient, GradientStop, LineCap, LineJoin, PathSegment,
@@ -168,8 +170,7 @@ fn draw_command(pixmap: &mut Pixmap, command: &DrawCommand, ts: Transform) {
             let Some(paths) = text_path(text, *pos, *size, *align, bold, *family) else {
                 return;
             };
-            let path = &paths.all;
-            if let Some(h) = halo {
+            if let (Some(h), Some(path)) = (halo, &paths.all) {
                 let stroke = Stroke {
                     color: h.color,
                     width: h.width,

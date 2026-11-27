@@ -297,10 +297,9 @@ fn text_bounds_are_the_same_from_the_cache_as_outlined_afresh() {
     let second = command_bounds(&cmd);
     assert_eq!(first, second);
     let pos = Vec2 { x: 12.0, y: 30.0 };
-    let direct = text_path(word, pos, 18.0, TextAlign::Left, false, Family::Sans).map(|p| {
-        let b = p.all.bounds();
-        [b.left(), b.top(), b.right(), b.bottom()]
-    });
+    let direct = text_path(word, pos, 18.0, TextAlign::Left, false, Family::Sans)
+        .and_then(|p| p.bounds())
+        .map(|b| [b.left(), b.top(), b.right(), b.bottom()]);
     assert!(direct.is_some());
     assert_eq!(
         text_ink_bounds(word, pos, 18.0, TextAlign::Left, false, Family::Sans),
@@ -1516,5 +1515,135 @@ fn a_scaled_layer_is_bounded_where_its_scale_and_offset_put_it() {
             y1: 25.0
         },
         "control: at scale 1 only the offset moves it"
+    );
+}
+
+fn emoji_text(s: &str, color: [f32; 4]) -> DrawCommand {
+    DrawCommand::Text {
+        color_runs: Vec::new(),
+        rotation: 0.0,
+        text: s.into(),
+        pos: Vec2 { x: 4.0, y: 24.0 },
+        size: 32.0,
+        color,
+        align: TextAlign::Left,
+        weight: 400,
+        halo: None,
+        family: Family::Sans,
+    }
+}
+
+fn distinct_colours(data: &[u8]) -> usize {
+    let mut seen: Vec<[u8; 3]> = data
+        .chunks_exact(4)
+        .filter(|px| px[3] == 255)
+        .map(|px| [px[0] & 0xf0, px[1] & 0xf0, px[2] & 0xf0])
+        .collect();
+    seen.sort_unstable();
+    seen.dedup();
+    seen.len()
+}
+
+#[test]
+fn an_emoji_shapes_in_the_emoji_face_and_paints_in_colour() {
+    let shaped = shape("😀", 32.0, false, Family::Sans);
+    assert_eq!(shaped.glyphs.len(), 1);
+    assert_eq!(shaped.glyphs[0].font, FontId::Emoji);
+    assert!(is_color_glyph(shaped.glyphs[0].font, shaped.glyphs[0].gid));
+    assert!(shaped.width > 0.0);
+    let black = [0.0, 0.0, 0.0, 1.0];
+    let data = rasterize(&[&emoji_text("😀", black)], 48, 48, 1.0, 1.0).unwrap();
+    assert!(
+        distinct_colours(&data) >= 2,
+        "an emoji in black text still paints its own colours"
+    );
+}
+
+#[test]
+fn control_latin_text_stays_in_the_latin_face_and_its_one_colour() {
+    let shaped = shape("abc", 32.0, false, Family::Sans);
+    assert!(shaped.glyphs.iter().all(|g| g.font == FontId::Latin));
+    assert!(shaped.glyphs.iter().all(|g| !is_color_glyph(g.font, g.gid)));
+    let data = rasterize(&[&emoji_text("abc", RED)], 80, 48, 1.0, 1.0).unwrap();
+    assert_eq!(distinct_colours(&data), 1);
+}
+
+#[test]
+fn a_family_sequence_shapes_to_one_emoji_glyph() {
+    let shaped = shape("👨\u{200D}👩\u{200D}👧", 32.0, false, Family::Sans);
+    assert_eq!(shaped.glyphs.len(), 1, "{:?}", shaped.glyphs);
+    assert_eq!(shaped.glyphs[0].font, FontId::Emoji);
+    assert_eq!(shaped.clusters.len(), 1);
+}
+
+#[test]
+fn control_two_emoji_with_a_space_shape_to_three_glyphs() {
+    let shaped = shape("👨 👩", 32.0, false, Family::Sans);
+    assert_eq!(shaped.glyphs.len(), 3);
+    assert_eq!(shaped.glyphs[0].font, FontId::Emoji);
+    assert_eq!(shaped.glyphs[2].font, FontId::Emoji);
+}
+
+#[test]
+fn a_skin_tone_and_a_presentation_selector_stay_with_their_emoji() {
+    let thumbs = shape("👍🏽", 32.0, false, Family::Sans);
+    assert_eq!(thumbs.glyphs.len(), 1, "{:?}", thumbs.glyphs);
+    assert_eq!(thumbs.glyphs[0].font, FontId::Emoji);
+    let heart = char_fonts("❤\u{FE0F}", false, Family::Sans);
+    assert_eq!(heart, vec![FontId::Emoji, FontId::Emoji]);
+}
+
+#[test]
+fn edge_emoji_in_a_sentence_keeps_the_letters_latin() {
+    let fonts = char_fonts("hi 😀 there", false, Family::Sans);
+    assert_eq!(fonts[0], FontId::Latin);
+    assert_eq!(fonts[3], FontId::Emoji);
+    assert_eq!(fonts[5], FontId::Latin);
+}
+
+#[test]
+fn edge_an_emoji_only_text_has_ink_bounds_and_a_halo_does_not_hide_it() {
+    let pos = Vec2 { x: 4.0, y: 24.0 };
+    let b = text_ink_bounds("😀", pos, 32.0, TextAlign::Left, false, Family::Sans)
+        .expect("an emoji has bounds");
+    assert!(b[2] > b[0] && b[3] > b[1]);
+    let mut haloed = emoji_text("😀", RED);
+    if let DrawCommand::Text { halo, .. } = &mut haloed {
+        *halo = Some(orbital_canvas_base::packet::Halo {
+            color: [1.0; 4],
+            width: 3.0,
+        });
+    }
+    let data = rasterize(&[&haloed], 48, 48, 1.0, 1.0).unwrap();
+    assert!(distinct_colours(&data) >= 2);
+}
+
+#[test]
+fn edge_a_faded_emoji_paints_at_the_text_alpha() {
+    let data = rasterize(&[&emoji_text("😀", [0.0, 0.0, 0.0, 0.5])], 48, 48, 1.0, 1.0).unwrap();
+    assert!(
+        data.chunks_exact(4).all(|px| px[3] <= 130),
+        "no pixel is more opaque than the text"
+    );
+    assert!(data.chunks_exact(4).any(|px| px[3] > 0));
+}
+
+#[test]
+fn an_emoji_draws_within_its_advance_so_a_following_space_shows() {
+    let pos = Vec2 { x: 0.0, y: 24.0 };
+    let shaped = shape("😀", 32.0, false, Family::Sans);
+    let ink = text_ink_bounds("😀", pos, 32.0, TextAlign::Left, false, Family::Sans).unwrap();
+    assert!(
+        ink[0] >= -1.0 && ink[2] <= shaped.width + 1.0,
+        "ink {ink:?} advance {}",
+        shaped.width
+    );
+    let spaced = shape("😀 a", 32.0, false, Family::Sans);
+    let a = spaced.glyphs.last().unwrap();
+    assert!(
+        a.x >= ink[2] + 4.0,
+        "the letter after the space starts past the emoji's ink: {} vs {}",
+        a.x,
+        ink[2]
     );
 }

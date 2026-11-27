@@ -424,6 +424,14 @@ impl GlyphPass {
         };
         let bold = *weight >= 600;
         let layout = vector::text_layout(text, *pos, *size, *align, bold, *family)?;
+        if layout
+            .shaped
+            .glyphs
+            .iter()
+            .any(|g| vector::is_color_glyph(g.font, g.gid))
+        {
+            return None;
+        }
         let px = *size * (scale.0 + scale.1) / 2.0;
         if px > self.page_size as f32 {
             return None;

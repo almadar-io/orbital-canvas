@@ -95,8 +95,206 @@ impl ttf_parser::OutlineBuilder for GlyphOutline<'_> {
 }
 
 pub(super) struct TextPaths {
-    pub(super) all: tiny_skia::Path,
+    pub(super) all: Option<tiny_skia::Path>,
     pub(super) faux_bold: Option<tiny_skia::Path>,
+    /// Glyphs painted from colour layers (COLR) rather than filled in the text colour.
+    pub(super) color: Vec<ColorGlyph>,
+}
+
+/// A colour glyph placed in a text: its face, glyph id, origin (pen and baseline) and scale from font units.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ColorGlyph {
+    pub(super) font: FontId,
+    pub(super) gid: u16,
+    pub(super) x: f32,
+    pub(super) y: f32,
+    pub(super) scale: f32,
+}
+
+/// Whether glyph `gid` of `font` is painted from colour layers, so it cannot be drawn as one-colour coverage.
+pub fn is_color_glyph(font: FontId, gid: u16) -> bool {
+    font_for(font).is_some_and(|f| f.is_color_glyph(ttf_parser::GlyphId(gid)))
+}
+
+impl TextPaths {
+    /// The box the text paints into: its outlines and its colour glyphs' layers.
+    pub(super) fn bounds(&self) -> Option<tiny_skia::Rect> {
+        let mut boxes: Vec<tiny_skia::Rect> = self.all.iter().map(|p| p.bounds()).collect();
+        boxes.extend(self.color.iter().filter_map(color_glyph_bounds));
+        let first = *boxes.first()?;
+        boxes.iter().skip(1).try_fold(first, |acc, b| {
+            tiny_skia::Rect::from_ltrb(
+                acc.left().min(b.left()),
+                acc.top().min(b.top()),
+                acc.right().max(b.right()),
+                acc.bottom().max(b.bottom()),
+            )
+        })
+    }
+}
+
+/// Paints a COLR glyph's layers: a solid paint fills the layer outline just read (COLRv0), else the innermost clip
+/// (COLRv1). Gradient paints paint nothing; the bundled emoji face is COLRv0, solid layers only.
+struct LayerPainter<'p> {
+    pixmap: &'p mut Pixmap,
+    ts: Vec<Transform>,
+    outline: Option<tiny_skia::Path>,
+    clips: Vec<tiny_skia::Path>,
+    alpha: f32,
+    bounds: Option<tiny_skia::Rect>,
+}
+
+impl LayerPainter<'_> {
+    fn current(&self) -> Transform {
+        self.ts.last().copied().unwrap_or_default()
+    }
+}
+
+impl<'a> ttf_parser::colr::Painter<'a> for LayerPainter<'_> {
+    fn outline_glyph(&mut self, glyph_id: ttf_parser::GlyphId) {
+        self.outline = None;
+        let Some(face) = font_for(FontId::Emoji) else {
+            return;
+        };
+        let mut builder = PathBuilder::new();
+        if face
+            .outline_glyph(
+                glyph_id,
+                &mut GlyphOutline::new(&mut builder, 0.0, 0.0, 1.0),
+            )
+            .is_some()
+        {
+            self.outline = builder.finish();
+        }
+    }
+    fn paint(&mut self, paint_with: ttf_parser::colr::Paint<'a>) {
+        let ttf_parser::colr::Paint::Solid(c) = paint_with else {
+            return;
+        };
+        let Some(clip) = self.outline.as_ref().or(self.clips.last()) else {
+            return;
+        };
+        let ts = self.current();
+        if let Some(b) = clip.clone().transform(ts).map(|p| p.bounds()) {
+            self.bounds = Some(match self.bounds {
+                None => b,
+                Some(acc) => tiny_skia::Rect::from_ltrb(
+                    acc.left().min(b.left()),
+                    acc.top().min(b.top()),
+                    acc.right().max(b.right()),
+                    acc.bottom().max(b.bottom()),
+                )
+                .unwrap_or(acc),
+            });
+        }
+        let color = [
+            c.red as f32 / 255.0,
+            c.green as f32 / 255.0,
+            c.blue as f32 / 255.0,
+            c.alpha as f32 / 255.0 * self.alpha,
+        ];
+        let clip = clip.clone();
+        self.pixmap
+            .fill_path(&clip, &paint(color), FillRule::Winding, ts, None);
+    }
+    fn push_clip(&mut self) {
+        if let Some(outline) = self.outline.take() {
+            self.clips.push(outline);
+        }
+    }
+    fn push_clip_box(&mut self, _clipbox: ttf_parser::colr::ClipBox) {}
+    fn pop_clip(&mut self) {
+        self.clips.pop();
+    }
+    fn push_layer(&mut self, _mode: ttf_parser::colr::CompositeMode) {}
+    fn pop_layer(&mut self) {}
+    fn push_transform(&mut self, t: ttf_parser::Transform) {
+        // Outlines are read with y flipped (GlyphOutline), so a font-space transform is conjugated by that flip.
+        let flipped = Transform::from_row(t.a, -t.b, -t.c, t.d, t.e, -t.f);
+        let next = self.current().pre_concat(flipped);
+        self.ts.push(next);
+    }
+    fn pop_transform(&mut self) {
+        if self.ts.len() > 1 {
+            self.ts.pop();
+        }
+    }
+}
+
+fn layer_painter<'p>(
+    pixmap: &'p mut Pixmap,
+    glyph: &ColorGlyph,
+    ts: Transform,
+    alpha: f32,
+) -> LayerPainter<'p> {
+    let place = ts
+        .pre_translate(glyph.x, glyph.y)
+        .pre_scale(glyph.scale, glyph.scale);
+    LayerPainter {
+        pixmap,
+        ts: vec![place],
+        outline: None,
+        clips: Vec::new(),
+        alpha,
+        bounds: None,
+    }
+}
+
+/// Paints one colour glyph's layers onto `pixmap` under `ts`: a layer in the foreground colour takes the text's
+/// `color`, and every layer's alpha is scaled by the text's.
+pub(super) fn paint_color_glyph(
+    pixmap: &mut Pixmap,
+    glyph: &ColorGlyph,
+    ts: Transform,
+    color: [f32; 4],
+) {
+    let Some(face) = font_for(glyph.font) else {
+        return;
+    };
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let foreground =
+        ttf_parser::RgbaColor::new(byte(color[0]), byte(color[1]), byte(color[2]), 255);
+    let id = ttf_parser::GlyphId(glyph.gid);
+    if color[3] >= 1.0 {
+        let mut painter = layer_painter(pixmap, glyph, ts, 1.0);
+        face.paint_color_glyph(id, 0, foreground, &mut painter);
+        return;
+    }
+    // Overlapping layers would compound a partial alpha: the glyph is painted whole, then composited at it.
+    let Some(device) = color_glyph_bounds(glyph).and_then(|b| b.transform(ts)) else {
+        return;
+    };
+    let (left, top) = (device.left().floor(), device.top().floor());
+    let (w, h) = (
+        (device.right().ceil() - left) as u32,
+        (device.bottom().ceil() - top) as u32,
+    );
+    let Some(mut layer) = Pixmap::new(w.max(1), h.max(1)) else {
+        return;
+    };
+    let mut painter = layer_painter(&mut layer, glyph, ts.post_translate(-left, -top), 1.0);
+    face.paint_color_glyph(id, 0, foreground, &mut painter);
+    let opacity = tiny_skia::PixmapPaint {
+        opacity: color[3].clamp(0.0, 1.0),
+        ..Default::default()
+    };
+    pixmap.draw_pixmap(
+        left as i32,
+        top as i32,
+        layer.as_ref(),
+        &opacity,
+        Transform::identity(),
+        None,
+    );
+}
+
+fn color_glyph_bounds(glyph: &ColorGlyph) -> Option<tiny_skia::Rect> {
+    let face = font_for(glyph.font)?;
+    let mut scratch = Pixmap::new(1, 1)?;
+    let mut painter = layer_painter(&mut scratch, glyph, Transform::identity(), 1.0);
+    let black = ttf_parser::RgbaColor::new(0, 0, 0, 255);
+    face.paint_color_glyph(ttf_parser::GlyphId(glyph.gid), 0, black, &mut painter)?;
+    painter.bounds
 }
 
 /// Shaped `text` with its anchor placed per `align`: the left pen `x0` and the baseline, `pos.y` at the em box
@@ -148,12 +346,23 @@ pub(super) fn text_path(
     } = text_layout(text, pos, size, align, bold, family)?;
     let mut all = PathBuilder::new();
     let mut faux = PathBuilder::new();
+    let mut color = Vec::new();
     for g in &shaped.glyphs {
         let Some(face) = font_for(g.font) else {
             continue;
         };
         let scale = size / face.units_per_em() as f32;
         let id = ttf_parser::GlyphId(g.gid);
+        if face.is_color_glyph(id) {
+            color.push(ColorGlyph {
+                font: g.font,
+                gid: g.gid,
+                x: x0 + g.x,
+                y: baseline + g.y,
+                scale,
+            });
+            continue;
+        }
         face.outline_glyph(
             id,
             &mut GlyphOutline::new(&mut all, x0 + g.x, baseline + g.y, scale),
@@ -165,9 +374,14 @@ pub(super) fn text_path(
             );
         }
     }
+    let all = all.finish();
+    if all.is_none() && color.is_empty() {
+        return None;
+    }
     Some(TextPaths {
-        all: all.finish()?,
+        all,
         faux_bold: faux.finish(),
+        color,
     })
 }
 
@@ -212,20 +426,30 @@ pub(super) fn text_paths_by_color(
         baseline,
     } = text_layout(text, pos, size, align, bold, family)?;
     let colors = glyph_colors(text, &shaped, base, runs);
-    let mut groups: Vec<([f32; 4], PathBuilder, PathBuilder)> = Vec::new();
+    let mut groups: Vec<([f32; 4], PathBuilder, PathBuilder, Vec<ColorGlyph>)> = Vec::new();
     for (g, color) in shaped.glyphs.iter().zip(colors) {
         let Some(face) = font_for(g.font) else {
             continue;
         };
-        let at = match groups.iter().position(|(c, _, _)| *c == color) {
+        let at = match groups.iter().position(|(c, _, _, _)| *c == color) {
             Some(at) => at,
             None => {
-                groups.push((color, PathBuilder::new(), PathBuilder::new()));
+                groups.push((color, PathBuilder::new(), PathBuilder::new(), Vec::new()));
                 groups.len() - 1
             }
         };
         let scale = size / face.units_per_em() as f32;
         let id = ttf_parser::GlyphId(g.gid);
+        if face.is_color_glyph(id) {
+            groups[at].3.push(ColorGlyph {
+                font: g.font,
+                gid: g.gid,
+                x: x0 + g.x,
+                y: baseline + g.y,
+                scale,
+            });
+            continue;
+        }
         face.outline_glyph(
             id,
             &mut GlyphOutline::new(&mut groups[at].1, x0 + g.x, baseline + g.y, scale),
@@ -240,12 +464,17 @@ pub(super) fn text_paths_by_color(
     Some(
         groups
             .into_iter()
-            .filter_map(|(color, all, faux)| {
+            .filter_map(|(color, all, faux, glyphs)| {
+                let all = all.finish();
+                if all.is_none() && glyphs.is_empty() {
+                    return None;
+                }
                 Some((
                     color,
                     TextPaths {
-                        all: all.finish()?,
+                        all,
                         faux_bold: faux.finish(),
+                        color: glyphs,
                     },
                 ))
             })
@@ -320,7 +549,12 @@ pub(super) fn fill_text(
     size: f32,
     ts: Transform,
 ) {
-    pixmap.fill_path(&paths.all, &paint(color), FillRule::Winding, ts, None);
+    if let Some(all) = &paths.all {
+        pixmap.fill_path(all, &paint(color), FillRule::Winding, ts, None);
+    }
+    for glyph in &paths.color {
+        paint_color_glyph(pixmap, glyph, ts, color);
+    }
     if let Some(faux) = &paths.faux_bold {
         let stroke = Stroke {
             color,
